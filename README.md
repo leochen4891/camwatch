@@ -79,16 +79,37 @@ A typical calibration plan: 20, 30, 40 mph in each direction, two passes each = 
 
 ## Architecture
 
+Two pipelines share most of the building blocks:
+
+**Headless** (`python -m camwatch`):
+```
+RTSP → detect → speed (crossing) → sink (events.jsonl + alert JPGs)
+```
+
+**Web UI** (`python -m camwatch serve`):
+```
+RTSP → detect → crossing → recorder (mp4 + thumb) → SQLite (passes)
+                       └→ preview buffer → FastAPI → browser
+```
+
+Modules:
+
 ```
 camwatch/
-├── capture.py    RTSP frame source with reconnect. Yields (frame, monotonic_ts).
-├── detect.py     YOLO + BotSORT wrapper. Returns Track records per frame.
-├── speed.py      Two-line crossing detector. Emits SpeedEvent on a full crossing.
-├── sink.py       Append to events.jsonl; save bbox-annotated JPG on alert.
-├── main.py       Wires capture → detect → speed → sink. Handles SIGINT.
-├── calibrate.py  Interactive calibration tool (subcommands below).
-├── config.py     Loads config.yaml + .env into a typed dataclass.
-└── __main__.py   Lets `python -m camwatch` work.
+├── capture.py         RTSP frame source with reconnect. Yields (frame, monotonic_ts).
+├── detect.py          YOLO + BotSORT wrapper. Returns Track records per frame.
+├── crossing.py        Two-line crossing state machine (web UI source of truth).
+├── speed.py           Parallel crossing detector retained for headless mode.
+├── sink.py            Headless: append events.jsonl, save annotated JPG on alert.
+├── main.py            Headless wiring; handles SIGINT.
+├── recorder.py        Rolling ring buffer; on trigger writes a .mp4 (+ overlay) and a .jpg thumb.
+├── preview.py         Latest-frame MJPEG buffer for the live preview.
+├── db.py              SQLite (WAL) pass storage; single writer + many readers.
+├── capture_worker.py  Web UI: long-running thread driving detect → crossing → recorder → DB.
+├── server.py          FastAPI app + Jinja2/HTMX rendering.
+├── calibrate.py       Interactive calibration CLI (subcommands below).
+├── config.py          Loads config.yaml + .env into a typed dataclass.
+└── __main__.py        Dispatches `python -m camwatch [serve]`.
 ```
 
 ### `capture.py`
@@ -185,7 +206,7 @@ uv run python -m camwatch.calibrate capture --secs 600
 ```
 
 Watches the live stream for 600 seconds. For every car that crosses both lines, the tool:
-1. Records a short mp4 clip into `recordings/cal_<timestamp>_id<id>_<dir>.mp4` (~3.5 sec, downscaled to 1280px wide), covering ~2 sec before line A through ~1.5 sec after line B. The clip is rendered with a debugging overlay:
+1. Records a short mp4 clip into `recordings/cal_<timestamp>_id<id>_<dir>.mp4` covering `clip.margin_s` seconds before the first line crossing through the same after the last. With the default sub stream (640×480) no downscaling is needed; from a higher-res source the recorder caps the saved frame width to keep file size sane. The clip is rendered with a debugging overlay:
    - both vertical lines (line A in green, line B in blue), drawn dim before the focus car has crossed them and bright after, with the crossing timestamp labelled next to each
    - the focus car's bounding box in red, with `id=N` label, plus a red dot at its `ground_point` (bbox bottom-center, the feature the speed math anchors to)
    - any other detected cars in the frame in gray (faint bbox + small dot), so you can see when the tracker confused two cars
@@ -291,8 +312,10 @@ Open `http://localhost:8000`. The page shows:
 
 - **Status panel**: live capture indicator, current per-direction calibration, # known points, alert threshold (editable inline).
 - **Filters**: by direction, alerts-only.
-- **Pass list**: each row has a thumbnail, timestamp, direction, speed (blank until calibration is set), and a `⋯` menu for play / set-known-mph / delete.
-- **Selection mode**: top-bar `Select…` toggles checkboxes for batch delete.
+- **Filters**: by direction, alerts-only, time range (from/to), and speed bucket via the histogram.
+- **Speed histogram**: 5-mph buckets summarising the filtered set. Click a bar to narrow the list to that bucket.
+- **Pass list**: each row has a thumbnail, timestamp, direction, speed (blank until calibration is set), inline ▶ play, ✕ delete (revertable), and a `⋯` menu for "Set known mph". Click anywhere on the row to toggle inline playback.
+- **Settings dialog**: alarm threshold, live-preview lines toggle, clip margin (pre/post-roll seconds), clip capture speed range (passes outside still get a thumbnail but no .mp4), and storage retention in days.
 
 Setting a known mph automatically recomputes per-direction calibration (writes `line_distance_m_north` / `line_distance_m_south` into `config/calibration.yaml`). All other passes in that direction immediately re-display computed mph on next render.
 
@@ -304,6 +327,16 @@ uv run python -m camwatch
 
 Foreground process, logs to stderr, appends events to `events/events.jsonl`, saves snapshots in `events/` for alerts. Ctrl-C to stop.
 
+### Remote access (outside your LAN)
+
+The web UI binds to `0.0.0.0:8000` by default, so it's reachable on any network interface the host has. To reach it from your phone away from home, you have two reasonable options:
+
+- **Tailscale** (recommended for personal use). Install Tailscale on the host Mac and on your phone/laptop. Both devices show up on a private mesh network with `*.ts.net` hostnames; the camwatch UI is reachable at `http://<host>.ts.net:8000` from any logged-in device. Nothing is exposed to the public internet, no port forwarding, no DNS to manage. Free for personal use.
+
+- **Cloudflare Tunnel** (use if you want a public URL). Run `cloudflared` on the host; it opens an outbound connection to Cloudflare's edge and routes a hostname like `camwatch.yourdomain.com` to `localhost:8000`. No inbound port opened on your router; HTTPS terminates at Cloudflare's edge. **The camwatch UI has no auth**, so you should layer Cloudflare Access (free, email/Google login) on top before exposing it publicly.
+
+For a single-user "check it from my phone" use case, Tailscale is simpler and more private. Use Cloudflare Tunnel only when you need to share a URL with someone whose device you don't control.
+
 ---
 
 ## Configuration
@@ -314,7 +347,8 @@ All defaults live in `config/config.yaml`:
 camera:
   host: 192.168.0.227
   port: 554
-  path: /h264Preview_01_main      # main stream (5MP). _sub is lower res.
+  path: /h264Preview_01_sub        # 640x480 sub stream — recommended for detection + clips.
+                                   # _main is full-res but pushes CPU and adds latency.
 
 model:
   weights: yolo11n.pt              # nano. Bump to yolo11s.pt for more accuracy.
@@ -332,7 +366,17 @@ paths:
 
 speed:
   max_track_age_s: 5.0
+
+retention:
+  days: 7                          # auto-delete passes older than this. 0 disables.
+
+clip:
+  margin_s: 0.5                    # pre/post-roll seconds around each crossing
+  capture_min_mph: 0               # passes outside [min, max] are logged with a thumb only
+  capture_max_mph: 999
 ```
+
+The `retention.*`, `clip.*`, and `alert.threshold_mph` keys are also editable in the in-app Settings dialog; saving there persists back to `config.yaml`.
 
 Camera credentials live in `.env`:
 
@@ -357,18 +401,33 @@ camwatch/
 │   └── calibration.example.yaml   ← calibration.yaml (gitignored) is the live one
 ├── camwatch/
 │   ├── __init__.py
-│   ├── __main__.py
-│   ├── capture.py
-│   ├── detect.py
-│   ├── speed.py
-│   ├── sink.py
-│   ├── main.py
-│   ├── calibrate.py
-│   └── config.py
+│   ├── __main__.py                # entrypoint: dispatches headless vs `serve`
+│   ├── config.py                  # YAML + .env loader, typed dataclasses
+│   ├── capture.py                 # RTSP frame source with reconnect
+│   ├── detect.py                  # YOLO + BotSORT wrapper
+│   ├── crossing.py                # Two-line crossing state machine (web UI source of truth)
+│   ├── speed.py                   # Crossing detector for headless mode (parallel to crossing.py)
+│   ├── sink.py                    # Headless: events.jsonl + alert JPGs
+│   ├── main.py                    # Headless wiring (capture → detect → speed → sink)
+│   ├── calibrate.py               # Interactive calibration CLI
+│   ├── recorder.py                # Rolling clip recorder + thumbnail writer
+│   ├── preview.py                 # Live preview MJPEG buffer
+│   ├── db.py                      # SQLite (WAL) pass storage
+│   ├── capture_worker.py          # Always-on capture thread for the web UI
+│   ├── server.py                  # FastAPI app + render helpers
+│   ├── static/style.css
+│   └── templates/                 # Jinja2 partials for the HTMX frontend
+│       ├── index.html
+│       ├── _status.html
+│       ├── _pass_list.html
+│       ├── _pass_row.html
+│       └── _histogram.html
 ├── scripts/
-│   └── test_stream.py             # quick RTSP smoke test
-├── events/                        # gitignored: events.jsonl + alert snapshots
-├── recordings/                    # gitignored: any future recordings
+│   ├── test_stream.py             # quick RTSP smoke test
+│   └── regen_thumbs.py            # rebuild thumbnail JPEGs from existing clips
+├── camwatch.db                    # gitignored: SQLite db (created on first run)
+├── events/                        # gitignored: events.jsonl + alert snapshots (headless mode)
+├── recordings/                    # gitignored: clip mp4s + thumbnail jpgs
 └── models/                        # gitignored: yolo11n.pt downloaded by ultralytics
 ```
 
@@ -386,5 +445,5 @@ camwatch/
 - Email alerts (SMTP / Gmail app password)
 - launchd daemon for unattended operation
 - Per-lane (not just per-direction) calibration
-- Live web preview / dashboard
-- Retention/rotation for events and snapshots
+- Persist filter/pagination state across reloads
+- SSE-based pass list updates (push instead of 10s poll)

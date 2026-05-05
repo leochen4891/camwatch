@@ -22,3 +22,11 @@ paths:
 
 speed:
   max_track_age_s: 5.0     # drop tracks idle this long without crossing both lines
+
+retention:
+  days: 7                  # auto-delete passes (and clips/thumbs) older than this. 0 disables.
+
+clip:
+  margin_s: 0.5            # seconds of pre-roll before the first crossing and post-roll after the last
+  capture_min_mph: 0       # passes below this speed are logged with a thumbnail but no .mp4
+  capture_max_mph: 999     # passes above this speed are logged with a thumbnail but no .mp4

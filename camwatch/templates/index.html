@@ -49,6 +49,27 @@
       </section>
 
       <section class="settings-section">
+        <h3>Clip margin</h3>
+        <p class="muted-text">Seconds of pre-roll before the first crossing and post-roll after the last. Larger values mean longer clips and more disk use.</p>
+        <div class="setting-row">
+          <input type="number" name="clip_margin_s" value="{{ '%.1f' % clip_margin_s }}" step="0.1" min="0" max="5">
+          <span>seconds</span>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Clip capture range</h3>
+        <p class="muted-text">Only record video for passes within this speed range. Passes outside are still logged in the list. Use a high upper bound (e.g. 999) to disable.</p>
+        <div class="setting-row">
+          <span>from</span>
+          <input type="number" name="clip_capture_min_mph" value="{{ '%g' % clip_capture_min_mph }}" step="1" min="0" max="999">
+          <span>to</span>
+          <input type="number" name="clip_capture_max_mph" value="{{ '%g' % clip_capture_max_mph }}" step="1" min="0" max="999">
+          <span>mph</span>
+        </div>
+      </section>
+
+      <section class="settings-section">
         <h3>Storage retention</h3>
         <p class="muted-text">Auto-delete passes (and their clips) older than this many days. <code>0</code> disables auto-deletion.</p>
         <div class="setting-row">
@@ -65,39 +86,43 @@
     </form>
   </dialog>
 
-  <section class="preview-section">
-    <div class="preview-header">
-      <h2>Live preview</h2>
-      <button type="button" class="muted-btn" id="preview-toggle" onclick="togglePreview()">hide</button>
-    </div>
-    <div class="preview-frame" id="preview-frame">
-      <img src="/preview/stream" alt="live preview" id="preview-img">
-    </div>
-  </section>
+  <div class="top-area">
+    <section class="preview-section">
+      <div class="preview-header">
+        <h2>Live preview</h2>
+        <button type="button" class="muted-btn" id="preview-toggle" onclick="togglePreview()">hide</button>
+      </div>
+      <div class="preview-frame" id="preview-frame">
+        <img src="/preview/stream" alt="live preview" id="preview-img">
+      </div>
+    </section>
 
-  <section class="controls">
-    <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram">
-      <label>direction
-        <select name="direction">
-          <option value="">all</option>
-          <option value="N">N</option>
-          <option value="S">S</option>
-        </select>
-      </label>
-      <label class="checkbox"><input type="checkbox" name="alerts_only" value="true"> alerts only</label>
-      <label>from <input type="datetime-local" name="from_ts"></label>
-      <label>to <input type="datetime-local" name="to_ts"></label>
-      <input type="hidden" name="page" value="{{ page }}" id="page-input">
-    </form>
-  </section>
+    <div class="top-right">
+      <section class="controls">
+        <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram">
+          <label>direction
+            <select name="direction">
+              <option value="">all</option>
+              <option value="N">N</option>
+              <option value="S">S</option>
+            </select>
+          </label>
+          <label class="checkbox"><input type="checkbox" name="alerts_only" value="true"> alerts only</label>
+          <label>from <input type="datetime-local" name="from_ts"></label>
+          <label>to <input type="datetime-local" name="to_ts"></label>
+          <input type="hidden" name="page" value="{{ page }}" id="page-input">
+        </form>
+      </section>
 
-  <section id="histogram" class="histogram-section"
-           hx-get="/passes"
-           hx-trigger="change"
-           hx-target="#pass-list"
-           hx-include="#filter-form, #histogram">
-    {% include "_histogram.html" %}
-  </section>
+      <section id="histogram" class="histogram-section"
+               hx-get="/passes"
+               hx-trigger="change"
+               hx-target="#pass-list"
+               hx-include="#filter-form, #histogram">
+        {% include "_histogram.html" %}
+      </section>
+    </div>
+  </div>
 
   <main>
     <div id="pass-list">

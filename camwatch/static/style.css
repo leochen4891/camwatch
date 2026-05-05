@@ -164,6 +164,41 @@ header {
 }
 .muted-btn:hover { border-color: var(--accent); }
 
+/* Side-by-side preview + (filters + histogram) on wide viewports.
+   Below 900px the children stack vertically (default flex-wrap). */
+.top-area {
+  display: flex;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.top-area > .preview-section {
+  flex: 0 0 auto;
+  border-bottom: 0;
+}
+.top-area > .top-right {
+  flex: 1 1 360px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+}
+.top-area > .top-right > .controls,
+.top-area > .top-right > .histogram-section {
+  background: var(--surface);
+}
+.top-area > .top-right > .histogram-section {
+  border-bottom: 0;
+  flex: 1 1 auto;
+}
+@media (max-width: 899px) {
+  .top-area > .top-right {
+    flex-basis: 100%;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+}
+
 .preview-section {
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
@@ -296,8 +331,11 @@ header {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-.controls form { display: flex; gap: 12px; align-items: center; }
-.controls label { display: flex; gap: 6px; align-items: center; font-size: 14px; color: var(--muted); }
+.controls form { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.controls label { display: flex; gap: 6px; align-items: center; font-size: 14px; color: var(--muted); white-space: nowrap; }
+/* Put each datetime-local filter on its own row so they don't overflow narrow columns. */
+.controls form label:has(> input[type="datetime-local"]) { flex-basis: 100%; }
+.controls form input[type="datetime-local"] { flex: 0 0 auto; width: auto; max-width: 220px; }
 .controls select {
   background: var(--surface-2);
   color: var(--text);
@@ -391,6 +429,9 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
 /* Make active rows feel clickable; the row-click toggles inline playback. */
 .pass-row:not(.deleted) { cursor: pointer; }
 .pass-row:not(.deleted):hover { border-color: var(--accent); }
+/* Rows without a clip aren't clickable — no playback to toggle. */
+.pass-row.no-clip:not(.deleted) { cursor: default; }
+.pass-row.no-clip:not(.deleted):hover { border-color: var(--border); }
 
 /* Deleted (soft) rows: minimized single-line view with a Revert button. */
 .pass-row.deleted {

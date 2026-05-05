@@ -20,10 +20,10 @@
             hx-swap="outerHTML">↩ Revert</button>
   </article>
 {% else %}
-  <article class="pass-row {% if p.alert %}alert{% endif %}" id="pass-{{ p.id }}"
-           onclick="rowClick(event, {{ p.id }})">
+  <article class="pass-row {% if p.alert %}alert{% endif %}{% if not p.has_clip %} no-clip{% endif %}" id="pass-{{ p.id }}"
+           {% if p.has_clip %}onclick="rowClick(event, {{ p.id }})"{% endif %}>
     <div class="thumb">
-      {% if p.has_clip %}
+      {% if p.has_thumb %}
         <img src="/passes/{{ p.id }}/thumb" alt="" loading="lazy">
       {% else %}
         <div class="thumb-placeholder">no thumb</div>
@@ -84,6 +84,8 @@
       </form>
     </div>
 
+    {% if p.has_clip %}
     <div class="video-wrap hidden" onclick="event.stopPropagation()"></div>
+    {% endif %}
   </article>
 {% endif %}

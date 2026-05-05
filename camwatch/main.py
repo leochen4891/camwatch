@@ -23,12 +23,12 @@ def main() -> None:
     if cal is None:
         raise SystemExit(
             f"calibration not found at {cfg.calibration_path}. "
-            f"Run `python -m camwatch.calibrate pick-lines` and `... annotate ...` first."
+            f"Run `python -m camwatch.calibrate pick-lines` first."
         )
     if cal.line_distance_m_north <= 0 and cal.line_distance_m_south <= 0:
         log.warning(
             "calibration has no per-direction distance set; speeds will be reported as 0 mph. "
-            "Run `python -m camwatch.calibrate annotate ...` to populate."
+            "Run `python -m camwatch.calibrate annotate` to populate."
         )
 
     cap = RtspStream(cfg.camera.rtsp_url)

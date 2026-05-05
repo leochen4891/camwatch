@@ -48,6 +48,7 @@ class _ActiveClip:
     t_a: float
     t_b: float
     speed_mph: float | None = None
+    record_video: bool = True  # if False, only the thumbnail JPEG is written
 
 
 _GRAY = (180, 180, 180)
@@ -111,16 +112,21 @@ class ClipRecorder:
         t_a: float,
         t_b: float,
         speed_mph: float | None = None,
+        record_video: bool = True,
     ) -> str:
         if self._size is None:
             raise RuntimeError("trigger() called before any frames were pushed")
 
-        # Default clip range: 1s before line A through 1s after line B.
-        desired_start = t_a - self._pre_a
-        desired_end = t_b + self._post_b
+        # Default clip range: pre_seconds before the FIRST line crossing through
+        # post_seconds after the LAST. For northbound t_a < t_b but for southbound
+        # the order flips, so use min/max rather than assuming line A came first.
+        first_t = min(t_a, t_b)
+        last_t = max(t_a, t_b)
+        desired_start = first_t - self._pre_a
+        desired_end = last_t + self._post_b
         # If that exceeds the cap, center the crossing window in a max-length clip.
         if desired_end - desired_start > self._max_clip:
-            midpoint = (t_a + t_b) / 2.0
+            midpoint = (first_t + last_t) / 2.0
             desired_start = midpoint - self._max_clip / 2.0
             desired_end = midpoint + self._max_clip / 2.0
 
@@ -136,6 +142,7 @@ class ClipRecorder:
             t_a=t_a,
             t_b=t_b,
             speed_mph=speed_mph,
+            record_video=record_video,
         )
         self._active.append(clip)
         return path
@@ -161,23 +168,29 @@ class ClipRecorder:
         return cv2.resize(frame, (new_w, new_h))
 
     def _finalize(self, clip: _ActiveClip) -> None:
-        # Try H.264 (avc1) first; modern browsers play it natively. Fall back to
-        # MPEG-4 Part 2 (mp4v) if the OpenCV build doesn't ship libx264 — Chrome
-        # won't play those, but at least the file is on disk for ffplay/VLC.
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
-        writer = cv2.VideoWriter(clip.path, fourcc, self._fps, self._size)
-        if not writer.isOpened():
-            log.warning("avc1 fourcc not available, falling back to mp4v at %s", clip.path)
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # Always write the thumbnail; skip the .mp4 when the caller said so
+        # (e.g., a pass outside the configured speed-capture range).
+        if clip.record_video:
+            # Try H.264 (avc1) first; modern browsers play it natively. Fall back to
+            # MPEG-4 Part 2 (mp4v) if the OpenCV build doesn't ship libx264 — Chrome
+            # won't play those, but at least the file is on disk for ffplay/VLC.
+            fourcc = cv2.VideoWriter_fourcc(*"avc1")
             writer = cv2.VideoWriter(clip.path, fourcc, self._fps, self._size)
-        if not writer.isOpened():
-            log.warning("clip writer failed to open at %s", clip.path)
-            return
-        for rec in clip.frames:
-            writer.write(self._render(rec, clip))
-        writer.release()
+            if not writer.isOpened():
+                log.warning("avc1 fourcc not available, falling back to mp4v at %s", clip.path)
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(clip.path, fourcc, self._fps, self._size)
+            if not writer.isOpened():
+                log.warning("clip writer failed to open at %s", clip.path)
+            else:
+                for rec in clip.frames:
+                    writer.write(self._render(rec, clip))
+                writer.release()
         self._write_thumbnail(clip)
-        log.debug("clip closed: %s (%d frames)", clip.path, len(clip.frames))
+        log.debug(
+            "clip closed: %s (%d frames, video=%s)",
+            clip.path, len(clip.frames), clip.record_video,
+        )
 
     def _write_thumbnail(self, clip: _ActiveClip) -> None:
         """Save a clean (no overlay) JPEG cropped tight to the focus car.

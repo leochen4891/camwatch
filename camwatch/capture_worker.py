@@ -56,6 +56,18 @@ class CaptureWorker(threading.Thread):
         self._stop_evt = threading.Event()
         self._stream: RtspStream | None = None
         self._error: BaseException | None = None
+        self._recorder: ClipRecorder | None = None
+
+    def update_clip_margin(self, seconds: float) -> None:
+        """Apply a new pre/post-roll value to the running recorder, if any.
+
+        Floats are atomically read/written in CPython, so we don't need a lock —
+        the recorder thread will see the new value on its next trigger() call.
+        """
+        s = max(0.0, float(seconds))
+        if self._recorder is not None:
+            self._recorder._pre_a = s
+            self._recorder._post_b = s
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -96,7 +108,12 @@ class CaptureWorker(threading.Thread):
             iou=self._cfg.model.iou,
             roi=None,
         )
-        recorder = ClipRecorder(self._recordings_dir)
+        recorder = ClipRecorder(
+            self._recordings_dir,
+            pre_seconds_before_a=self._cfg.clip_margin_s,
+            post_seconds_after_b=self._cfg.clip_margin_s,
+        )
+        self._recorder = recorder
         crossing = CrossingDetector(
             line_a_x=cal.line_a_x,
             line_b_x=cal.line_b_x,
@@ -151,6 +168,25 @@ class CaptureWorker(threading.Thread):
                     speed_mph: float | None = None
                     if distance > 0 and ev.elapsed_s > 0:
                         speed_mph = (distance / ev.elapsed_s) * 2.2369362920544
+                    # Gate VIDEO recording on the configured capture-speed range.
+                    # Thumbnails are always written so the list shows a preview
+                    # for every pass. If speed is unknown (no calibration), we
+                    # err on the side of recording.
+                    in_range = (
+                        speed_mph is None
+                        or (
+                            self._cfg.clip_capture_min_mph
+                            <= speed_mph
+                            <= self._cfg.clip_capture_max_mph
+                        )
+                    )
+                    if not in_range:
+                        log.info(
+                            "pass at %.1f mph outside capture range [%.1f, %.1f]; thumb only",
+                            speed_mph,
+                            self._cfg.clip_capture_min_mph,
+                            self._cfg.clip_capture_max_mph,
+                        )
                     clip_path = recorder.trigger(
                         name=clip_name,
                         focus_track_id=ev.track_id,
@@ -159,7 +195,12 @@ class CaptureWorker(threading.Thread):
                         t_a=ev.t_a,
                         t_b=ev.t_b,
                         speed_mph=speed_mph,
+                        record_video=in_range,
                     )
+                    # We always set clip_path (the .mp4 base name) so the
+                    # thumbnail can be located by stripping ".mp4" → ".jpg".
+                    # Whether the .mp4 actually exists on disk is the source
+                    # of truth for "has clip" in the UI.
                     pid = self._db.insert_pass(
                         captured_at=captured_at.isoformat(timespec="seconds"),
                         track_id=ev.track_id,

@@ -54,6 +54,12 @@ def clip_url(pass_id: int) -> str:
 
 def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict:
     mph = computed_mph(p, dist_n, dist_s)
+    has_clip = False
+    has_thumb = False
+    if p.clip_path:
+        has_clip = Path(p.clip_path).exists()
+        thumb = p.clip_path[:-4] + ".jpg" if p.clip_path.endswith(".mp4") else p.clip_path + ".jpg"
+        has_thumb = Path(thumb).exists()
     return {
         "id": p.id,
         "deleted": p.deleted,
@@ -63,7 +69,8 @@ def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict
         "known_mph": p.known_mph,
         "computed_mph": mph,
         "alert": (mph is not None and mph >= threshold and p.known_mph is None),
-        "has_clip": bool(p.clip_path),
+        "has_clip": has_clip,
+        "has_thumb": has_thumb,
     }
 
 
@@ -315,17 +322,34 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
         threshold_mph: float = Form(...),
         show_lines: str | None = Form(default=None),
         retention_days: int = Form(default=0),
+        clip_margin_s: float = Form(default=0.5),
+        clip_capture_min_mph: float = Form(default=0.0),
+        clip_capture_max_mph: float = Form(default=999.0),
     ):
         cfg_path = Path("config/config.yaml")
-        # Persist threshold and retention to config.yaml
+        margin = max(0.0, float(clip_margin_s))
+        cap_min = max(0.0, float(clip_capture_min_mph))
+        cap_max = max(cap_min, float(clip_capture_max_mph))
+        # Persist threshold, retention, and clip settings to config.yaml
         with cfg_path.open() as f:
             data = yaml.safe_load(f) or {}
         data.setdefault("alert", {})["threshold_mph"] = float(threshold_mph)
         data.setdefault("retention", {})["days"] = max(0, int(retention_days))
+        clip_section = data.setdefault("clip", {})
+        clip_section["margin_s"] = margin
+        clip_section["capture_min_mph"] = cap_min
+        clip_section["capture_max_mph"] = cap_max
         with cfg_path.open("w") as f:
             yaml.safe_dump(data, f, sort_keys=False)
         cfg.alert_threshold_mph = float(threshold_mph)
         cfg.retention_days = max(0, int(retention_days))
+        cfg.clip_margin_s = margin
+        cfg.clip_capture_min_mph = cap_min
+        cfg.clip_capture_max_mph = cap_max
+        # Push the new margin to the running capture worker without a restart.
+        worker = getattr(request.app.state, "worker", None)
+        if worker is not None:
+            worker.update_clip_margin(margin)
         # Show-lines is runtime-only (resets on server restart). Unchecked
         # checkboxes don't post a value, so a missing field means False.
         preview.set_show_lines(show_lines is not None)
@@ -435,6 +459,9 @@ def _render_index(request: Request, cfg: Config, db: Database):
             "dist_s": dist_s,
             "threshold": threshold,
             "retention_days": cfg.retention_days,
+            "clip_margin_s": cfg.clip_margin_s,
+            "clip_capture_min_mph": cfg.clip_capture_min_mph,
+            "clip_capture_max_mph": cfg.clip_capture_max_mph,
             "known_count": len(cal.calibration_points) if cal else 0,
             "running": True,
             "histogram": histogram,
