@@ -149,72 +149,82 @@ def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
     deadline = t0 + secs
     print(f"capture: watching for {secs}s. Drive at GPS-known speeds in each direction now.")
     print(f"clips will be written to {recordings_dir}/")
+    print("ctrl+c to stop early; everything captured so far will be saved.\n")
 
     def stop_at_deadline():
         return time.monotonic() >= deadline
 
-    for fr in cap.frames():
-        if stop_at_deadline():
-            cap.stop()
-            break
-        tracks = det.track(fr.image)
-        recorder.push(fr.image, fr.ts, tracks)
-        for tr in tracks:
-            x = tr.ground_point[0]
-            st = state.setdefault(tr.track_id, {
-                "t_a": None, "t_b": None,
-                "last_x": None, "last_t": None,
-                "cls_name": tr.cls_name,
-            })
-            if st["last_x"] is not None:
-                xp, tp = st["last_x"], st["last_t"]
-                if st["t_a"] is None and (xp - line_a) * (x - line_a) <= 0 and xp != line_a:
-                    span = x - xp
-                    st["t_a"] = tp + (line_a - xp) / span * (fr.ts - tp) if span else fr.ts
-                if st["t_b"] is None and (xp - line_b) * (x - line_b) <= 0 and xp != line_b:
-                    span = x - xp
-                    st["t_b"] = tp + (line_b - xp) / span * (fr.ts - tp) if span else fr.ts
-                if st["t_a"] is not None and st["t_b"] is not None:
-                    direction = "N" if st["t_a"] < st["t_b"] else "S"
-                    elapsed = abs(st["t_b"] - st["t_a"])
-                    captured_at = datetime.now().astimezone()
-                    stamp = captured_at.strftime("%Y%m%dT%H%M%S")
-                    clip_name = f"cal_{stamp}_id{tr.track_id}_{direction}.mp4"
-                    clip_path = recorder.trigger(
-                        name=clip_name,
-                        focus_track_id=tr.track_id,
-                        line_a_x=line_a,
-                        line_b_x=line_b,
-                        t_a=st["t_a"],
-                        t_b=st["t_b"],
-                    )
-                    p = {
-                        "captured_at": captured_at.isoformat(timespec="seconds"),
-                        "track_id": tr.track_id,
-                        "class": tr.cls_name,
-                        "direction": direction,
-                        "elapsed_s": round(elapsed, 4),
-                        "known_mph": None,
-                        "clip": clip_path or None,
-                    }
-                    passes.append(p)
-                    wallclock = captured_at.strftime("%H:%M:%S")
-                    print(
-                        f"  [{wallclock}] pass: id={tr.track_id} {tr.cls_name} {direction} "
-                        f"elapsed={elapsed:.3f}s -> {clip_name}"
-                    )
-                    del state[tr.track_id]
-                    continue
-            st["last_x"] = x
-            st["last_t"] = fr.ts
-
-    recorder.flush()
-    existing = _load_yaml(cfg.calibration_path)
-    existing_passes = existing.get("passes") or []
-    existing_passes.extend(passes)
-    existing["passes"] = existing_passes
-    _save_yaml(cfg.calibration_path, existing)
-    print(f"\ncapture done. {len(passes)} new passes appended to {cfg.calibration_path}")
+    interrupted = False
+    try:
+        for fr in cap.frames():
+            if stop_at_deadline():
+                cap.stop()
+                break
+            tracks = det.track(fr.image)
+            recorder.push(fr.image, fr.ts, tracks)
+            for tr in tracks:
+                x = tr.ground_point[0]
+                st = state.setdefault(tr.track_id, {
+                    "t_a": None, "t_b": None,
+                    "last_x": None, "last_t": None,
+                    "cls_name": tr.cls_name,
+                })
+                if st["last_x"] is not None:
+                    xp, tp = st["last_x"], st["last_t"]
+                    if st["t_a"] is None and (xp - line_a) * (x - line_a) <= 0 and xp != line_a:
+                        span = x - xp
+                        st["t_a"] = tp + (line_a - xp) / span * (fr.ts - tp) if span else fr.ts
+                    if st["t_b"] is None and (xp - line_b) * (x - line_b) <= 0 and xp != line_b:
+                        span = x - xp
+                        st["t_b"] = tp + (line_b - xp) / span * (fr.ts - tp) if span else fr.ts
+                    if st["t_a"] is not None and st["t_b"] is not None:
+                        direction = "N" if st["t_a"] < st["t_b"] else "S"
+                        elapsed = abs(st["t_b"] - st["t_a"])
+                        captured_at = datetime.now().astimezone()
+                        stamp = captured_at.strftime("%Y%m%dT%H%M%S")
+                        clip_name = f"cal_{stamp}_id{tr.track_id}_{direction}.mp4"
+                        clip_path = recorder.trigger(
+                            name=clip_name,
+                            focus_track_id=tr.track_id,
+                            line_a_x=line_a,
+                            line_b_x=line_b,
+                            t_a=st["t_a"],
+                            t_b=st["t_b"],
+                        )
+                        p = {
+                            "captured_at": captured_at.isoformat(timespec="seconds"),
+                            "track_id": tr.track_id,
+                            "class": tr.cls_name,
+                            "direction": direction,
+                            "elapsed_s": round(elapsed, 4),
+                            "known_mph": None,
+                            "clip": clip_path or None,
+                        }
+                        passes.append(p)
+                        wallclock = captured_at.strftime("%H:%M:%S")
+                        print(
+                            f"  [{wallclock}] pass: id={tr.track_id} {tr.cls_name} {direction} "
+                            f"elapsed={elapsed:.3f}s -> {clip_name}"
+                        )
+                        del state[tr.track_id]
+                        continue
+                st["last_x"] = x
+                st["last_t"] = fr.ts
+    except KeyboardInterrupt:
+        interrupted = True
+        cap.stop()
+        print("\ninterrupted; flushing pending clips and saving passes...")
+    finally:
+        recorder.flush()
+        existing = _load_yaml(cfg.calibration_path)
+        existing_passes = existing.get("passes") or []
+        existing_passes.extend(passes)
+        existing["passes"] = existing_passes
+        _save_yaml(cfg.calibration_path, existing)
+        verb = "interrupted" if interrupted else "done"
+        print(f"\ncapture {verb}. {len(passes)} new passes appended to {cfg.calibration_path}")
+        if not interrupted and passes:
+            print("Next: run `python -m camwatch.calibrate annotate` to label your own drives.")
     print("Next: run `python -m camwatch.calibrate annotate` to label your own drives.")
 
 
