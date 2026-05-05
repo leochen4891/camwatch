@@ -256,11 +256,6 @@ class ClipRecorder:
                 cv2.rectangle(img, (x1, y1), (x2, y2), _RED, 2)
                 cv2.circle(img, (gx, gy), 6, _RED, -1)
                 cv2.circle(img, (gx, gy), 6, _WHITE, 1)
-                if clip.speed_mph is not None:
-                    label = f"{clip.speed_mph:.0f} mph"
-                else:
-                    label = f"{(clip.t_b - clip.t_a):.2f}s"
-                _stamp(img, label, (x1, max(15, y1 - 6)), _RED, scale=0.6, thickness=2)
             else:
                 cv2.rectangle(img, (x1, y1), (x2, y2), _GRAY, 1)
                 cv2.circle(img, (gx, gy), 3, _GRAY, -1)
