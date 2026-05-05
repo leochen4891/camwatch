@@ -154,20 +154,21 @@ class ClipRecorder:
         if not writer.isOpened():
             log.warning("clip writer failed to open at %s", clip.path)
             return
-        rendered: list[np.ndarray] = []
         for rec in clip.frames:
-            img = self._render(rec, clip)
-            writer.write(img)
-            rendered.append(img)
+            writer.write(self._render(rec, clip))
         writer.release()
-        self._write_thumbnail(clip, rendered)
+        self._write_thumbnail(clip)
         log.debug("clip closed: %s (%d frames)", clip.path, len(clip.frames))
 
-    def _write_thumbnail(self, clip: _ActiveClip, rendered: list[np.ndarray]) -> None:
-        """Save a JPEG cropped tight to the focus car so it's identifiable in
-        the list view. Falls back to a downscale of the mid-crossing frame if
-        the focus track has no detection in the rendered range."""
-        if not rendered:
+    def _write_thumbnail(self, clip: _ActiveClip) -> None:
+        """Save a clean (no overlay) JPEG cropped tight to the focus car.
+
+        The crop uses the focus track's bbox at midcrossing time, but the
+        IMAGE used is the raw frame from the ring buffer rather than the
+        overlay-rendered frame written into the mp4. So thumbnails have no
+        bbox, no labels, no lines drawn on them.
+        """
+        if not clip.frames:
             return
         midpoint = (clip.t_a + clip.t_b) / 2.0
 
@@ -189,14 +190,12 @@ class ClipRecorder:
         target_w = 320
         if best_with_focus is not None:
             _, idx, bbox = best_with_focus
-            frame = rendered[idx]
-            fh, fw = frame.shape[:2]
+            raw = clip.frames[idx].image
+            fh, fw = raw.shape[:2]
             s = self._scale
             bx1, by1, bx2, by2 = (v * s for v in bbox)
             bw = bx2 - bx1
             bh = by2 - by1
-            # Pad ~50% horizontally and vertically. Floor at sensible minimums
-            # so a small/distant car still gets enough frame around it.
             pad_x = max(bw * 0.6, 40)
             pad_y = max(bh * 0.7, 40)
             cx1 = max(0, int(round(bx1 - pad_x)))
@@ -204,17 +203,15 @@ class ClipRecorder:
             cx2 = min(fw, int(round(bx2 + pad_x)))
             cy2 = min(fh, int(round(by2 + pad_y)))
             if cx2 - cx1 < 80 or cy2 - cy1 < 60:
-                # Bbox effectively missing. Fall back.
-                thumb = self._fallback_thumb(rendered[best_any[1]], target_w)
+                thumb = self._fallback_thumb(clip.frames[best_any[1]].image, target_w)
             else:
-                thumb = frame[cy1:cy2, cx1:cx2]
-                # Resize to target width while preserving aspect.
+                thumb = raw[cy1:cy2, cx1:cx2]
                 th, tw = thumb.shape[:2]
                 if tw != target_w:
                     scale = target_w / tw
                     thumb = cv2.resize(thumb, (target_w, max(1, int(round(th * scale)))))
         else:
-            thumb = self._fallback_thumb(rendered[best_any[1]], target_w)
+            thumb = self._fallback_thumb(clip.frames[best_any[1]].image, target_w)
 
         thumb_path = clip.path[:-4] + ".jpg" if clip.path.endswith(".mp4") else clip.path + ".jpg"
         cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 82])
