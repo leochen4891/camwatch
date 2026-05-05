@@ -16,12 +16,21 @@ class CameraConfig:
     path: str
     user: str
     password: str
+    path_sub: str | None = None  # optional low-res stream for detection
 
     @property
     def rtsp_url(self) -> str:
         u = quote(self.user, safe="")
         p = quote(self.password, safe="")
         return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path}"
+
+    @property
+    def rtsp_url_sub(self) -> str | None:
+        if not self.path_sub:
+            return None
+        u = quote(self.user, safe="")
+        p = quote(self.password, safe="")
+        return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path_sub}"
 
 
 @dataclass
@@ -112,6 +121,7 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
             host=cam["host"],
             port=int(cam["port"]),
             path=cam["path"],
+            path_sub=cam.get("path_sub"),
             user=user,
             password=pw,
         ),

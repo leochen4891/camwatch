@@ -1,17 +1,36 @@
-"""RTSP frame source with reconnect."""
+"""RTSP frame source with reconnect.
+
+Camera produces frames at ~20fps; the YOLO+tracker consumer runs at
+~6-10fps. Without intervention, ffmpeg's RTSP buffer fills up and we
+end up processing frames many seconds old. Two layers of mitigation:
+
+1. Pass low-latency flags to ffmpeg via the OPENCV_FFMPEG_CAPTURE_OPTIONS
+   env var (`fflags=nobuffer`, `flags=low_delay`).
+2. A background reader thread continuously calls cap.read() and stores
+   only the latest frame in a single-slot buffer. The consumer (the
+   `frames()` iterator) always sees the most recent frame; everything
+   else is silently dropped.
+
+Net: end-to-end latency stays close to the camera's frame interval, and
+detection always sees fresh state instead of a 15-second-stale backlog.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-# Force TCP transport for RTSP. UDP is the OpenCV default and causes occasional
-# packet loss visible as "left block unavailable" / "error while decoding MB"
-# warnings on Wi-Fi. Must be set before the first cv2.VideoCapture call.
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+# Set ffmpeg options before the first cv2.VideoCapture call. TCP transport
+# avoids UDP packet loss; nobuffer + low_delay tell ffmpeg to surface frames
+# as soon as they arrive instead of holding a multi-frame jitter buffer.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay",
+)
 
 import cv2  # noqa: E402  (must come after the env var)
 import numpy as np  # noqa: E402
@@ -46,22 +65,58 @@ class RtspStream:
         seq = 0
         while not self._stop:
             self._open()
-            failures = 0
-            while not self._stop:
-                ok, image = self._cap.read()
-                if not ok:
-                    failures += 1
-                    if failures >= self._max_failures:
-                        log.warning(
-                            "stream: %d consecutive read failures, reconnecting",
-                            failures,
-                        )
+            cap = self._cap
+            assert cap is not None
+
+            # Background reader fills a single-slot buffer with the latest frame.
+            latest: list[tuple[np.ndarray, float] | None] = [None]
+            latest_lock = threading.Lock()
+            new_frame_evt = threading.Event()
+            reader_stop = threading.Event()
+            reader_failures = [0]
+
+            def reader() -> None:
+                while not reader_stop.is_set() and not self._stop:
+                    ok, image = cap.read()
+                    if not ok:
+                        reader_failures[0] += 1
+                        if reader_failures[0] >= self._max_failures:
+                            log.warning(
+                                "stream: %d consecutive read failures, reconnecting",
+                                reader_failures[0],
+                            )
+                            return
+                        time.sleep(0.01)
+                        continue
+                    reader_failures[0] = 0
+                    with latest_lock:
+                        latest[0] = (image, time.monotonic())
+                    new_frame_evt.set()
+
+            reader_thread = threading.Thread(target=reader, name="rtsp-reader", daemon=True)
+            reader_thread.start()
+
+            try:
+                while not self._stop:
+                    if not new_frame_evt.wait(timeout=2.0):
+                        if not reader_thread.is_alive():
+                            break
+                        continue
+                    new_frame_evt.clear()
+                    with latest_lock:
+                        item = latest[0]
+                        latest[0] = None
+                    if item is None:
+                        continue
+                    image, ts = item
+                    seq += 1
+                    yield Frame(image=image, ts=ts, seq=seq)
+                    if not reader_thread.is_alive():
                         break
-                    continue
-                failures = 0
-                seq += 1
-                yield Frame(image=image, ts=time.monotonic(), seq=seq)
-            self._close()
+            finally:
+                reader_stop.set()
+                reader_thread.join(timeout=2.0)
+                self._close()
             if not self._stop:
                 time.sleep(self._reconnect_delay_s)
 
@@ -86,3 +141,54 @@ def _redact_url(url: str) -> str:
         user = creds.split(":", 1)[0] if ":" in creds else creds
         return f"{scheme}://{user}:***@{host}"
     return url
+
+
+class LatestFrameSource:
+    """Wraps an RtspStream and exposes the most-recent frame as a snapshot.
+
+    Internally consumes the stream in a background thread; old frames are
+    silently dropped. Useful for the secondary stream (e.g. main-stream
+    high-res frames consumed lazily for clip recording while detection drives
+    its own pace from a different stream).
+    """
+
+    def __init__(self, url: str, name: str = "stream") -> None:
+        self._stream = RtspStream(url)
+        self._name = name
+        self._latest: list[tuple[float, np.ndarray] | None] = [None]
+        self._cv = threading.Condition()
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        self._stream.stop()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def get_latest(self) -> tuple[float, np.ndarray] | None:
+        with self._cv:
+            return self._latest[0]
+
+    def wait_for_new(self, prev_ts: float, timeout: float = 1.0) -> tuple[float, np.ndarray] | None:
+        with self._cv:
+            self._cv.wait_for(
+                lambda: self._latest[0] is not None and self._latest[0][0] > prev_ts,
+                timeout=timeout,
+            )
+            return self._latest[0]
+
+    def _run(self) -> None:
+        for fr in self._stream.frames():
+            if self._stop_evt.is_set():
+                return
+            with self._cv:
+                self._latest[0] = (fr.ts, fr.image)
+                self._cv.notify_all()

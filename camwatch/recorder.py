@@ -66,7 +66,7 @@ class ClipRecorder:
         fps: int = 10,
         pre_seconds: float = 2.0,
         post_seconds: float = 1.5,
-        max_width: int = 1280,
+        max_width: int = 2560,
     ) -> None:
         self._dir = Path(recordings_dir)
         self._dir.mkdir(parents=True, exist_ok=True)

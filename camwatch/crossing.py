@@ -79,16 +79,27 @@ class CrossingDetector:
             seen.add(tid)
             x = float(tr.ground_point[0])
             st = self._state.setdefault(tid, _State())
+            new_track = st.last_x is None
             if not st.cls_name:
                 st.cls_name = getattr(tr, "cls_name", "")
+            had_a = st.t_cross_a is not None
+            had_b = st.t_cross_b is not None
             ev = self._step(st, tid, x, t, getattr(tr, "bbox", None))
             if ev is not None:
                 events.append(ev)
                 self._state.pop(tid, None)
-            else:
-                st.last_x = x
-                st.last_t = t
-                st.last_seen = t
+                continue
+            # Log first sighting and partial crossings as they happen so the
+            # log is enough to diagnose missed cars.
+            if new_track:
+                log.info("track %d (%s) first seen at x=%.0f", tid, st.cls_name, x)
+            if not had_a and st.t_cross_a is not None:
+                log.info("track %d crossed line A at x=%.0f t=%.3fs", tid, x, st.t_cross_a)
+            if not had_b and st.t_cross_b is not None:
+                log.info("track %d crossed line B at x=%.0f t=%.3fs", tid, x, st.t_cross_b)
+            st.last_x = x
+            st.last_t = t
+            st.last_seen = t
 
         # Garbage-collect stale tracks that never finished crossing.
         stale = [
@@ -96,7 +107,15 @@ class CrossingDetector:
             if tid not in seen and (t - st.last_seen) > self.max_age
         ]
         for tid in stale:
-            self._state.pop(tid, None)
+            st = self._state.pop(tid)
+            if st.t_cross_a is not None or st.t_cross_b is not None:
+                log.info(
+                    "track %d aged out with partial crossing (a=%s b=%s last_x=%.0f)",
+                    tid,
+                    "yes" if st.t_cross_a is not None else "no",
+                    "yes" if st.t_cross_b is not None else "no",
+                    st.last_x or 0,
+                )
         return events
 
     def _step(
