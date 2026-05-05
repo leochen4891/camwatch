@@ -82,24 +82,14 @@ class PreviewBuffer:
 
         ih, iw = img.shape[:2]
 
-        # ROI rectangle (orange-ish, thin)
-        if self._roi is not None:
-            x1, y1, x2, y2 = self._roi
-            cv2.rectangle(
-                img,
-                (int(round(x1 * scale)), int(round(y1 * scale))),
-                (int(round(x2 * scale)), int(round(y2 * scale))),
-                (0, 165, 255),
-                1,
-            )
-
-        # Crossing lines
+        # Crossing lines: thin gray, just visible reference markers.
+        line_color = (160, 160, 160)
         if self._line_a_x > 0:
             ax = int(round(self._line_a_x * scale))
-            cv2.line(img, (ax, 0), (ax, ih), (0, 220, 0), 2)
+            cv2.line(img, (ax, 0), (ax, ih), line_color, 1)
         if self._line_b_x > 0:
             bx = int(round(self._line_b_x * scale))
-            cv2.line(img, (bx, 0), (bx, ih), (220, 120, 0), 2)
+            cv2.line(img, (bx, 0), (bx, ih), line_color, 1)
 
         # Bboxes + ground points
         for t in tracks:
