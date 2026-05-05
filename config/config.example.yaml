@@ -1,8 +1,9 @@
 camera:
   host: 192.168.0.227
   port: 554
-  path: /h264Preview_01_main          # full-res, used for clip recording
-  path_sub: /h264Preview_01_sub       # low-res, used for live detection. omit for single-stream mode.
+  path: /h264Preview_01_sub           # use the sub stream (640x480) for detection + clips.
+                                      # Switch to /h264Preview_01_main if you want full-res but
+                                      # accept higher CPU and ~10s of latency from buffer buildup.
   # User and pass come from .env (REOLINK_USER, REOLINK_PASS)
 
 model:
