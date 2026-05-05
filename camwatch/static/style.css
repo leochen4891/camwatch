@@ -47,17 +47,16 @@ header {
   color: var(--green);
 }
 .settings-btn {
-  margin-left: auto;
   background: transparent;
   color: var(--muted);
   border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 4px 10px;
-  font-size: 14px;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 20px;
+  line-height: 1;
   cursor: pointer;
 }
 .settings-btn:hover { color: var(--text); border-color: var(--accent); }
-.title-row { justify-content: flex-start; }
 
 /* Settings modal dialog */
 .settings-dialog {
