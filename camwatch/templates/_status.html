@@ -5,11 +5,6 @@
     &nbsp;|&nbsp;
     <span>S = {{ "%.2f m" | format(dist_s) if dist_s else "—" }}</span>
     &nbsp;<span class="muted">({{ known_count }} known {{ "point" if known_count == 1 else "points" }})</span>
-    <button type="button"
-            hx-post="/calibration/recompute"
-            hx-target="#status-panel"
-            hx-swap="innerHTML"
-            class="muted-btn">recompute</button>
   </div>
   <form class="threshold-form"
         hx-post="/calibration/threshold"
