@@ -152,14 +152,12 @@
     }
 
     // Pause the auto-refresh poll while any video is open, so the list rerender
-    // doesn't wipe the <video> element mid-playback.
+    // doesn't wipe the <video> element mid-playback. Cancels every filter-form
+    // request (including the timer poll AND manual filter changes) while a
+    // video is open. User has to close the player to change direction filter.
     document.body.addEventListener("htmx:beforeRequest", (e) => {
       const elt = e.detail && e.detail.elt;
-      if (!elt) return;
-      // Only intercept the filter-form's polling GET on /passes.
-      const triggeringEvent = e.detail.requestConfig && e.detail.requestConfig.triggeringEvent;
-      const isPoll = triggeringEvent && triggeringEvent.type === "every";
-      if (!(elt.id === "filter-form" && isPoll)) return;
+      if (!elt || elt.id !== "filter-form") return;
       if (document.querySelector(".pass-row .video-wrap:not(.hidden)")) {
         e.preventDefault();
       }
