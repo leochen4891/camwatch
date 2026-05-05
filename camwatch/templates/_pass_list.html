@@ -1,0 +1,7 @@
+{% if not rows %}
+  <p class="empty">No passes yet. Drive past the camera, or wait for traffic.</p>
+{% else %}
+  {% for row in rows %}
+    {% include "_pass_row.html" %}
+  {% endfor %}
+{% endif %}

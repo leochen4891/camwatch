@@ -14,4 +14,8 @@ recordings/
 models/
 *.pt
 
+camwatch.db
+camwatch.db-wal
+camwatch.db-shm
+
 .DS_Store

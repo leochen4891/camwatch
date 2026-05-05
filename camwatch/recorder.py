@@ -144,10 +144,40 @@ class ClipRecorder:
         if not writer.isOpened():
             log.warning("clip writer failed to open at %s", clip.path)
             return
+        rendered: list[np.ndarray] = []
         for rec in clip.frames:
-            writer.write(self._render(rec, clip))
+            img = self._render(rec, clip)
+            writer.write(img)
+            rendered.append(img)
         writer.release()
+        self._write_thumbnail(clip, rendered)
         log.debug("clip closed: %s (%d frames)", clip.path, len(clip.frames))
+
+    def _write_thumbnail(self, clip: _ActiveClip, rendered: list[np.ndarray]) -> None:
+        """Save a 320px-wide JPEG of the frame closest to the midpoint between
+        the two crossings. Uses the already-rendered overlay frames so it
+        matches the mp4 visually."""
+        if not rendered:
+            return
+        # Find the frame whose ts is closest to (t_a + t_b) / 2.
+        midpoint = (clip.t_a + clip.t_b) / 2.0
+        best_idx = 0
+        best_diff = float("inf")
+        for i, rec in enumerate(clip.frames):
+            d = abs(rec.ts - midpoint)
+            if d < best_diff:
+                best_diff = d
+                best_idx = i
+        frame = rendered[best_idx]
+        h, w = frame.shape[:2]
+        target_w = 320
+        if w > target_w:
+            scale = target_w / w
+            thumb = cv2.resize(frame, (target_w, int(round(h * scale))))
+        else:
+            thumb = frame
+        thumb_path = clip.path.replace(".mp4", ".jpg") if clip.path.endswith(".mp4") else clip.path + ".jpg"
+        cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 80])
 
     def _render(self, rec: _FrameRec, clip: _ActiveClip) -> np.ndarray:
         img = rec.image.copy()

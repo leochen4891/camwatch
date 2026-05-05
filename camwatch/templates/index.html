@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>camwatch</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <h1>camwatch</h1>
+      <span class="status-badge" id="status">{% if running %}● live{% else %}○ idle{% endif %}</span>
+    </div>
+    <div id="status-panel">
+      {% include "_status.html" %}
+    </div>
+  </header>
+
+  <section class="controls">
+    <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form">
+      <label>direction
+        <select name="direction">
+          <option value="">all</option>
+          <option value="N">N</option>
+          <option value="S">S</option>
+        </select>
+      </label>
+      <label class="checkbox"><input type="checkbox" name="alerts_only" value="true"> alerts only</label>
+    </form>
+    <div class="actions">
+      <button type="button" id="select-toggle" onclick="toggleSelection()">Select…</button>
+      <button type="button" id="delete-btn" class="danger hidden" onclick="deleteSelected()">Delete selected</button>
+      <button type="button" id="cancel-btn" class="hidden" onclick="toggleSelection()">Cancel</button>
+    </div>
+  </section>
+
+  <main>
+    <div id="pass-list">
+      {% include "_pass_list.html" %}
+    </div>
+  </main>
+
+  <script>
+    let selectionMode = false;
+    function toggleSelection() {
+      selectionMode = !selectionMode;
+      document.body.classList.toggle("selection-mode", selectionMode);
+      document.getElementById("select-toggle").classList.toggle("hidden", selectionMode);
+      document.getElementById("delete-btn").classList.toggle("hidden", !selectionMode);
+      document.getElementById("cancel-btn").classList.toggle("hidden", !selectionMode);
+      if (!selectionMode) {
+        document.querySelectorAll('input[name="ids"]').forEach(cb => cb.checked = false);
+      }
+    }
+
+    async function deleteSelected() {
+      const ids = [...document.querySelectorAll('input[name="ids"]:checked')].map(cb => cb.value);
+      if (ids.length === 0) return;
+      if (!confirm(`Delete ${ids.length} pass${ids.length === 1 ? '' : 'es'}?`)) return;
+      const fd = new FormData();
+      ids.forEach(id => fd.append("ids", id));
+      await fetch("/passes/delete", { method: "POST", body: fd });
+      toggleSelection();
+      htmx.trigger("#filter-form", "change");
+    }
+
+    function toggleMenu(btn) {
+      const menu = btn.nextElementSibling;
+      const wasOpen = menu.classList.contains("open");
+      document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
+      if (!wasOpen) menu.classList.add("open");
+    }
+
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest(".kebab-wrap")) {
+        document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
+      }
+    });
+
+    function startKnownInput(passId) {
+      const row = document.getElementById(`pass-${passId}`);
+      const inputWrap = row.querySelector(".known-input-wrap");
+      inputWrap.classList.remove("hidden");
+      inputWrap.querySelector('input[name="known_mph"]').focus();
+      document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
+    }
+
+    function playClip(passId) {
+      const row = document.getElementById(`pass-${passId}`);
+      // close any other player
+      document.querySelectorAll(".video-wrap").forEach(w => {
+        if (!w.closest(".pass-row").contains(row)) {
+          w.querySelector("video")?.pause();
+          w.innerHTML = "";
+          w.classList.add("hidden");
+        }
+      });
+      const wrap = row.querySelector(".video-wrap");
+      if (wrap.classList.contains("hidden")) {
+        wrap.innerHTML = `<video controls autoplay playsinline src="/passes/${passId}/clip"></video>`;
+        wrap.classList.remove("hidden");
+      } else {
+        wrap.querySelector("video")?.pause();
+        wrap.innerHTML = "";
+        wrap.classList.add("hidden");
+      }
+      document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
+    }
+
+    async function deleteOne(passId) {
+      if (!confirm("Delete this pass?")) return;
+      const fd = new FormData();
+      fd.append("ids", passId);
+      await fetch("/passes/delete", { method: "POST", body: fd });
+      htmx.trigger("#filter-form", "change");
+    }
+  </script>
+</body>
+</html>

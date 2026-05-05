@@ -27,6 +27,8 @@ import yaml
 
 from .capture import RtspStream
 from .config import load_config
+from .crossing import CrossingDetector
+from .db import Database
 from .detect import Detector
 from .recorder import ClipRecorder
 from .speed import MPS_TO_MPH
@@ -142,98 +144,67 @@ def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
         iou=cfg.model.iou,
     )
     recorder = ClipRecorder(recordings_dir)
+    crossing = CrossingDetector(line_a, line_b, cfg.max_track_age_s)
+    db = Database()
 
-    state: dict[int, dict] = {}  # track_id -> {t_a, t_b, last_x, last_t, direction, cls_name}
-    passes: list[dict] = []
+    n_inserted = 0
     t0 = time.monotonic()
     deadline = t0 + secs
     print(f"capture: watching for {secs}s. Drive at GPS-known speeds in each direction now.")
     print(f"clips will be written to {recordings_dir}/")
     print("ctrl+c to stop early; everything captured so far will be saved.\n")
 
-    def stop_at_deadline():
-        return time.monotonic() >= deadline
-
     interrupted = False
     try:
         for fr in cap.frames():
-            if stop_at_deadline():
+            if time.monotonic() >= deadline:
                 cap.stop()
                 break
             tracks = det.track(fr.image)
             recorder.push(fr.image, fr.ts, tracks)
-            for tr in tracks:
-                x = tr.ground_point[0]
-                st = state.setdefault(tr.track_id, {
-                    "t_a": None, "t_b": None,
-                    "last_x": None, "last_t": None,
-                    "cls_name": tr.cls_name,
-                })
-                if st["last_x"] is not None:
-                    xp, tp = st["last_x"], st["last_t"]
-                    if st["t_a"] is None and (xp - line_a) * (x - line_a) <= 0 and xp != line_a:
-                        span = x - xp
-                        st["t_a"] = tp + (line_a - xp) / span * (fr.ts - tp) if span else fr.ts
-                    if st["t_b"] is None and (xp - line_b) * (x - line_b) <= 0 and xp != line_b:
-                        span = x - xp
-                        st["t_b"] = tp + (line_b - xp) / span * (fr.ts - tp) if span else fr.ts
-                    if st["t_a"] is not None and st["t_b"] is not None:
-                        direction = "N" if st["t_a"] < st["t_b"] else "S"
-                        elapsed = abs(st["t_b"] - st["t_a"])
-                        captured_at = datetime.now().astimezone()
-                        stamp = captured_at.strftime("%Y%m%dT%H%M%S")
-                        clip_name = f"cal_{stamp}_id{tr.track_id}_{direction}.mp4"
-                        clip_path = recorder.trigger(
-                            name=clip_name,
-                            focus_track_id=tr.track_id,
-                            line_a_x=line_a,
-                            line_b_x=line_b,
-                            t_a=st["t_a"],
-                            t_b=st["t_b"],
-                        )
-                        p = {
-                            "captured_at": captured_at.isoformat(timespec="seconds"),
-                            "track_id": tr.track_id,
-                            "class": tr.cls_name,
-                            "direction": direction,
-                            "elapsed_s": round(elapsed, 4),
-                            "known_mph": None,
-                            "clip": clip_path or None,
-                        }
-                        passes.append(p)
-                        wallclock = captured_at.strftime("%H:%M:%S")
-                        print(
-                            f"  [{wallclock}] pass: id={tr.track_id} {tr.cls_name} {direction} "
-                            f"elapsed={elapsed:.3f}s -> {clip_name}"
-                        )
-                        del state[tr.track_id]
-                        continue
-                st["last_x"] = x
-                st["last_t"] = fr.ts
+            for ev in crossing.update(tracks, fr.ts):
+                captured_at = datetime.now().astimezone()
+                stamp = captured_at.strftime("%Y%m%dT%H%M%S")
+                clip_name = f"cal_{stamp}_id{ev.track_id}_{ev.direction}.mp4"
+                clip_path = recorder.trigger(
+                    name=clip_name,
+                    focus_track_id=ev.track_id,
+                    line_a_x=line_a,
+                    line_b_x=line_b,
+                    t_a=ev.t_a,
+                    t_b=ev.t_b,
+                )
+                db.insert_pass(
+                    captured_at=captured_at.isoformat(timespec="seconds"),
+                    track_id=ev.track_id,
+                    cls_name=ev.cls_name,
+                    direction=ev.direction,
+                    elapsed_s=round(ev.elapsed_s, 4),
+                    clip_path=clip_path or None,
+                )
+                n_inserted += 1
+                wallclock = captured_at.strftime("%H:%M:%S")
+                print(
+                    f"  [{wallclock}] pass: id={ev.track_id} {ev.cls_name} {ev.direction} "
+                    f"elapsed={ev.elapsed_s:.3f}s -> {clip_name}"
+                )
     except KeyboardInterrupt:
         interrupted = True
         cap.stop()
-        print("\ninterrupted; flushing pending clips and saving passes...")
+        print("\ninterrupted; flushing pending clips...")
     finally:
         recorder.flush()
-        existing = _load_yaml(cfg.calibration_path)
-        existing_passes = existing.get("passes") or []
-        existing_passes.extend(passes)
-        existing["passes"] = existing_passes
-        _save_yaml(cfg.calibration_path, existing)
         verb = "interrupted" if interrupted else "done"
-        print(f"\ncapture {verb}. {len(passes)} new passes appended to {cfg.calibration_path}")
-        if not interrupted and passes:
+        print(f"\ncapture {verb}. {n_inserted} new passes inserted into camwatch.db")
+        if n_inserted:
             print("Next: run `python -m camwatch.calibrate annotate` to label your own drives.")
-    print("Next: run `python -m camwatch.calibrate annotate` to label your own drives.")
 
 
 # ---------- annotate ----------
 
 def cmd_annotate(cfg) -> None:
-    data = _load_yaml(cfg.calibration_path)
-    passes = data.get("passes") or []
-    todo = [(i, p) for i, p in enumerate(passes) if p.get("known_mph") is None]
+    db = Database()
+    todo = [p for p in db.list_passes(limit=10000) if p.known_mph is None]
     if not todo:
         print("no unannotated passes found.")
         return
@@ -241,65 +212,58 @@ def cmd_annotate(cfg) -> None:
     print(f"{len(todo)} unannotated pass(es). At each prompt, type:")
     print("  <number>   GPS-known speed in mph (e.g. 30)")
     print("  open       open the clip in the default player (then re-prompt)")
-    print("  skip / s   discard this pass (not your car)")
-    print("  q          stop annotating now (already-typed answers are saved)")
+    print("  skip / s   delete this pass (not your car)")
+    print("  q          stop annotating now")
     print()
 
-    discard_idxs: list[int] = []
     stopped = False
-    for n, (idx, p) in enumerate(todo, 1):
+    for n, p in enumerate(todo, 1):
         print(
-            f"[{n}/{len(todo)}] track_id={p['track_id']} dir={p['direction']} "
-            f"elapsed={p['elapsed_s']:.3f}s captured_at={p.get('captured_at', '?')}"
+            f"[{n}/{len(todo)}] id={p.id} track_id={p.track_id} dir={p.direction} "
+            f"elapsed={p.elapsed_s:.3f}s captured_at={p.captured_at}"
         )
-        if p.get("clip"):
-            print(f"  clip: {p['clip']}")
+        if p.clip_path:
+            print(f"  clip: {p.clip_path}")
         while True:
             ans = input("  > ").strip().lower()
             if ans == "q":
                 stopped = True
                 break
             if ans == "open":
-                clip = p.get("clip")
-                if clip and Path(clip).exists():
-                    subprocess.run(["open", clip], check=False)
+                if p.clip_path and Path(p.clip_path).exists():
+                    subprocess.run(["open", p.clip_path], check=False)
                 else:
                     print("  no clip available for this pass")
                 continue
             if ans in ("skip", "s"):
-                discard_idxs.append(idx)
+                db.soft_delete([p.id])
                 break
             try:
-                p["known_mph"] = float(ans)
+                db.set_known_mph(p.id, float(ans))
                 break
             except ValueError:
                 print("  not a number; type a speed, 'open', 'skip', or 'q'")
         if stopped:
             break
 
-    if discard_idxs:
-        keep = [p for i, p in enumerate(passes) if i not in set(discard_idxs)]
-        data["passes"] = keep
-    _save_yaml(cfg.calibration_path, data)
-    print(f"saved annotations to {cfg.calibration_path}")
+    print(f"annotations saved to camwatch.db")
 
 
 # ---------- compute ----------
 
 def cmd_compute(cfg) -> None:
-    data = _load_yaml(cfg.calibration_path)
-    passes = data.get("passes") or []
-    annotated = [p for p in passes if p.get("known_mph") is not None]
+    db = Database()
+    annotated = [p for p in db.list_passes(limit=10000) if p.known_mph is not None]
     if not annotated:
         raise SystemExit("no annotated passes; run `annotate` first")
 
     by_dir: dict[str, list[float]] = {"N": [], "S": []}
     for p in annotated:
-        mps = float(p["known_mph"]) / MPS_TO_MPH
-        implied = mps * float(p["elapsed_s"])
-        p["implied_distance_m"] = round(implied, 3)
-        by_dir.setdefault(p["direction"], []).append(implied)
+        mps = float(p.known_mph) / MPS_TO_MPH
+        implied = mps * float(p.elapsed_s)
+        by_dir.setdefault(p.direction, []).append(implied)
 
+    data = _load_yaml(cfg.calibration_path)
     if by_dir["N"]:
         d = sum(by_dir["N"]) / len(by_dir["N"])
         data["line_distance_m_north"] = round(d, 3)
@@ -308,7 +272,6 @@ def cmd_compute(cfg) -> None:
         d = sum(by_dir["S"]) / len(by_dir["S"])
         data["line_distance_m_south"] = round(d, 3)
         print(f"southbound: avg distance = {d:.3f} m  (n={len(by_dir['S'])})")
-
     _save_yaml(cfg.calibration_path, data)
     print(f"saved to {cfg.calibration_path}")
 
@@ -316,25 +279,26 @@ def cmd_compute(cfg) -> None:
 # ---------- report ----------
 
 def cmd_report(cfg) -> None:
-    data = _load_yaml(cfg.calibration_path)
-    passes = [p for p in (data.get("passes") or []) if p.get("known_mph") is not None]
-    if not passes:
+    db = Database()
+    annotated = [p for p in db.list_passes(limit=10000) if p.known_mph is not None]
+    if not annotated:
         print("no annotated passes")
         return
+    data = _load_yaml(cfg.calibration_path)
     dist_n = float(data.get("line_distance_m_north", 0))
     dist_s = float(data.get("line_distance_m_south", 0))
     print(f"calibrated distances: N={dist_n:.3f}m  S={dist_s:.3f}m\n")
     print(f"{'idx':>3}  {'dir':>3}  {'elapsed':>8}  {'known':>7}  {'pred':>7}  {'err':>6}")
-    for i, p in enumerate(passes, 1):
-        d = dist_n if p["direction"] == "N" else dist_s
-        if d <= 0 or p["elapsed_s"] <= 0:
-            print(f"{i:>3}  {p['direction']:>3}  {p['elapsed_s']:>8.3f}  "
-                  f"{p['known_mph']:>7.1f}  {'-':>7}  {'-':>6}")
+    for i, p in enumerate(annotated, 1):
+        d = dist_n if p.direction == "N" else dist_s
+        if d <= 0 or p.elapsed_s <= 0:
+            print(f"{i:>3}  {p.direction:>3}  {p.elapsed_s:>8.3f}  "
+                  f"{p.known_mph:>7.1f}  {'-':>7}  {'-':>6}")
             continue
-        pred = (d / p["elapsed_s"]) * MPS_TO_MPH
-        err = pred - p["known_mph"]
-        print(f"{i:>3}  {p['direction']:>3}  {p['elapsed_s']:>8.3f}  "
-              f"{p['known_mph']:>7.1f}  {pred:>7.1f}  {err:>+6.1f}")
+        pred = (d / p.elapsed_s) * MPS_TO_MPH
+        err = pred - p.known_mph
+        print(f"{i:>3}  {p.direction:>3}  {p.elapsed_s:>8.3f}  "
+              f"{p.known_mph:>7.1f}  {pred:>7.1f}  {err:>+6.1f}")
 
 
 # ---------- entry ----------

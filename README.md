@@ -1,8 +1,13 @@
 # camwatch
 
-Local traffic-speed monitor. Pulls a live RTSP feed from a Reolink IP camera, detects passing cars with YOLO, estimates each car's speed using a two-line crossing method, and writes an alert to a local JSONL file when the speed exceeds a threshold (default 40 mph).
+Local traffic-speed monitor. Pulls a live RTSP feed from a Reolink IP camera, detects passing cars with YOLO, estimates each car's speed using a two-line crossing method, and writes an alert when the speed exceeds a threshold (default 40 mph).
 
-v1 is intentionally minimal: foreground script, daytime use, file output. Email alerts and 24/7 daemon mode are out of scope and planned for v2.
+Two ways to run it:
+
+- **Web UI** (recommended): `uv run python -m camwatch serve` starts an always-on capture worker plus a FastAPI/HTMX web app at `http://localhost:8000`. Browse passes, play overlay-rendered clips, set known speeds inline, batch-delete, configure threshold.
+- **Headless**: `uv run python -m camwatch` runs the live alert pipeline and writes events.jsonl + alert JPGs.
+
+Both modes write into the same SQLite database (`camwatch.db`).
 
 ---
 
@@ -260,6 +265,24 @@ Healthy result: errors within ±2-3 mph and roughly random in sign. If errors ar
 ---
 
 ## Run
+
+### Web UI (recommended)
+
+```sh
+uv run python -m camwatch serve            # bind 127.0.0.1:8000
+uv run python -m camwatch serve --host 0.0.0.0 --port 8000   # LAN/phone access
+```
+
+Open `http://localhost:8000`. The page shows:
+
+- **Status panel**: live capture indicator, current per-direction calibration, # known points, alert threshold (editable inline).
+- **Filters**: by direction, alerts-only.
+- **Pass list**: each row has a thumbnail, timestamp, direction, speed (blank until calibration is set), and a `⋯` menu for play / set-known-mph / delete.
+- **Selection mode**: top-bar `Select…` toggles checkboxes for batch delete.
+
+Setting a known mph automatically recomputes per-direction calibration (writes `line_distance_m_north` / `line_distance_m_south` into `config/calibration.yaml`). All other passes in that direction immediately re-display computed mph on next render.
+
+### Headless
 
 ```sh
 uv run python -m camwatch
