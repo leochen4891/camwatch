@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+.env
+config/config.yaml
+config/calibration.yaml
+
+events/
+recordings/
+models/
+*.pt
+
+.DS_Store

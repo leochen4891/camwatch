@@ -1,0 +1,15 @@
+# Two vertical screen lines and the real-world distance between them per direction.
+# Populated by `python -m camwatch.calibrate pick-lines` and `... annotate ...`.
+
+line_a_x: 800              # left line, pixel x in source frame
+line_b_x: 1200             # right line, pixel x in source frame
+frame_width: 2560          # source frame width (sanity check)
+frame_height: 1920
+
+# Real-world distance between line_a and line_b, in meters, per direction.
+# Northbound = left→right, Southbound = right→left.
+line_distance_m_north: 0.0
+line_distance_m_south: 0.0
+
+# Optional: raw calibration passes, kept for the sanity report.
+passes: []                 # list of {direction, known_mph, t_a, t_b, implied_distance_m}
