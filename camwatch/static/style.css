@@ -171,7 +171,7 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   gap: 6px;
   align-items: center;
 }
-.quick-delete {
+.quick-delete, .quick-play {
   background: transparent;
   color: var(--muted);
   border: 1px solid var(--border);
@@ -187,6 +187,14 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   border-color: var(--alert);
   background: var(--alert-bg);
 }
+.quick-play:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Make active rows feel clickable; the row-click toggles inline playback. */
+.pass-row:not(.deleted) { cursor: pointer; }
+.pass-row:not(.deleted):hover { border-color: var(--accent); }
 
 /* Deleted (soft) rows: minimized single-line view with a Revert button. */
 .pass-row.deleted {

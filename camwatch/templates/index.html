@@ -97,17 +97,20 @@
       document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
     }
 
-    function playClip(passId) {
+    // Toggle the inline video player open/closed for a pass row.
+    function togglePlay(passId) {
       const row = document.getElementById(`pass-${passId}`);
-      // close any other player
-      document.querySelectorAll(".video-wrap").forEach(w => {
-        if (!w.closest(".pass-row").contains(row)) {
+      if (!row) return;
+      const wrap = row.querySelector(".video-wrap");
+      if (!wrap) return;
+      // Close any other open player (only one at a time).
+      document.querySelectorAll(".pass-row .video-wrap").forEach(w => {
+        if (w !== wrap && !w.classList.contains("hidden")) {
           w.querySelector("video")?.pause();
           w.innerHTML = "";
           w.classList.add("hidden");
         }
       });
-      const wrap = row.querySelector(".video-wrap");
       if (wrap.classList.contains("hidden")) {
         wrap.innerHTML = `<video controls autoplay playsinline src="/passes/${passId}/clip"></video>`;
         wrap.classList.remove("hidden");
@@ -116,7 +119,36 @@
         wrap.innerHTML = "";
         wrap.classList.add("hidden");
       }
-      document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
+    }
+
+    // The dedicated ▶ button: if open, restart from 0; if closed, open and play.
+    function restartPlay(passId) {
+      const row = document.getElementById(`pass-${passId}`);
+      if (!row) return;
+      const wrap = row.querySelector(".video-wrap");
+      if (wrap && !wrap.classList.contains("hidden")) {
+        const v = wrap.querySelector("video");
+        if (v) {
+          v.currentTime = 0;
+          v.play();
+          return;
+        }
+      }
+      togglePlay(passId);
+    }
+
+    // Click anywhere on the row (except interactive areas) toggles the player.
+    function rowClick(event, passId) {
+      if (
+        event.target.closest(".row-actions") ||
+        event.target.closest(".kebab-menu") ||
+        event.target.closest(".known-input-wrap") ||
+        event.target.closest(".video-wrap") ||
+        event.target.closest(".select-cell")
+      ) {
+        return;
+      }
+      togglePlay(passId);
     }
 
     function togglePreview() {

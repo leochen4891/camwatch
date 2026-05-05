@@ -20,8 +20,9 @@
             hx-swap="outerHTML">↩ Revert</button>
   </article>
 {% else %}
-  <article class="pass-row {% if p.alert %}alert{% endif %}" id="pass-{{ p.id }}">
-    <label class="select-cell">
+  <article class="pass-row {% if p.alert %}alert{% endif %}" id="pass-{{ p.id }}"
+           onclick="rowClick(event, {{ p.id }})">
+    <label class="select-cell" onclick="event.stopPropagation()">
       <input type="checkbox" name="ids" value="{{ p.id }}">
     </label>
 
@@ -51,25 +52,30 @@
     </div>
 
     <div class="row-actions">
+      {% if p.has_clip %}
+        <button type="button"
+                class="quick-play"
+                title="Play / restart"
+                onclick="event.stopPropagation(); restartPlay({{ p.id }})">▶</button>
+      {% endif %}
+
       <button type="button"
               class="quick-delete"
               title="Delete (revertable)"
               hx-post="/passes/{{ p.id }}/delete"
               hx-target="#pass-{{ p.id }}"
-              hx-swap="outerHTML">✕</button>
+              hx-swap="outerHTML"
+              onclick="event.stopPropagation()">✕</button>
 
-      <div class="kebab-wrap">
+      <div class="kebab-wrap" onclick="event.stopPropagation()">
         <button class="kebab" type="button" onclick="toggleMenu(this)" aria-label="actions">⋯</button>
         <div class="kebab-menu">
-          {% if p.has_clip %}
-            <button type="button" onclick="playClip({{ p.id }})">▶ Play clip</button>
-          {% endif %}
           <button type="button" onclick="startKnownInput({{ p.id }})">✎ Set known mph</button>
         </div>
       </div>
     </div>
 
-    <div class="known-input-wrap hidden">
+    <div class="known-input-wrap hidden" onclick="event.stopPropagation()">
       <form hx-post="/passes/{{ p.id }}/annotate"
             hx-target="#pass-{{ p.id }}"
             hx-swap="outerHTML">
@@ -82,6 +88,6 @@
       </form>
     </div>
 
-    <div class="video-wrap hidden"></div>
+    <div class="video-wrap hidden" onclick="event.stopPropagation()"></div>
   </article>
 {% endif %}
