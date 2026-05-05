@@ -58,6 +58,7 @@ class CalibrationConfig:
     roi_x2: int = 0
     roi_y2: int = 0
     passes: list[dict] = field(default_factory=list)
+    calibration_points: list[dict] = field(default_factory=list)
 
     @property
     def roi(self) -> tuple[int, int, int, int] | None:
@@ -93,6 +94,7 @@ class Config:
             roi_x2=int(data.get("roi_x2", 0) or 0),
             roi_y2=int(data.get("roi_y2", 0) or 0),
             passes=list(data.get("passes") or []),
+            calibration_points=list(data.get("calibration_points") or []),
         )
 
 

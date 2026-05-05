@@ -161,7 +161,18 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   margin-bottom: 8px;
+}
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.setting-row input[type="checkbox"] {
+  margin: 0;
 }
 .preview-header h2 {
   margin: 0;

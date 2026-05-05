@@ -32,6 +32,10 @@ class PreviewBuffer:
         self._roi: tuple[int, int, int, int] | None = None
         self._line_a_x: int = 0
         self._line_b_x: int = 0
+        self._show_lines: bool = True
+
+    def set_show_lines(self, show: bool) -> None:
+        self._show_lines = bool(show)
 
     def configure(
         self,
@@ -83,13 +87,14 @@ class PreviewBuffer:
         ih, iw = img.shape[:2]
 
         # Crossing lines: thin gray, just visible reference markers.
-        line_color = (160, 160, 160)
-        if self._line_a_x > 0:
-            ax = int(round(self._line_a_x * scale))
-            cv2.line(img, (ax, 0), (ax, ih), line_color, 1)
-        if self._line_b_x > 0:
-            bx = int(round(self._line_b_x * scale))
-            cv2.line(img, (bx, 0), (bx, ih), line_color, 1)
+        if self._show_lines:
+            line_color = (160, 160, 160)
+            if self._line_a_x > 0:
+                ax = int(round(self._line_a_x * scale))
+                cv2.line(img, (ax, 0), (ax, ih), line_color, 1)
+            if self._line_b_x > 0:
+                bx = int(round(self._line_b_x * scale))
+                cv2.line(img, (bx, 0), (bx, ih), line_color, 1)
 
         # Bboxes + ground points
         for t in tracks:

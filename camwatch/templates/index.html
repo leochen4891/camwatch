@@ -27,7 +27,7 @@
     </div>
 
     <section class="settings-section">
-      <h3>Alert threshold</h3>
+      <h3>Alarm speed</h3>
       <p class="muted-text">Passes at or above this speed get the 🚨 marker in the list.</p>
       <form class="threshold-form" id="threshold-form-settings"
             hx-post="/calibration/threshold"
@@ -37,6 +37,15 @@
         <span>mph</span>
         <button type="submit">Save</button>
       </form>
+    </section>
+
+    <section class="settings-section">
+      <h3>Live preview</h3>
+      <label class="setting-row">
+        <input type="checkbox" id="show-lines-toggle" checked
+               onchange="setShowLines(this.checked)">
+        <span>Show crossing lines on the live preview</span>
+      </label>
     </section>
   </dialog>
 
@@ -184,6 +193,12 @@
         e.preventDefault();
       }
     });
+
+    async function setShowLines(show) {
+      const fd = new FormData();
+      fd.append("show", show ? "true" : "false");
+      await fetch("/preview/show_lines", { method: "POST", body: fd });
+    }
 
     function togglePreview() {
       const frame = document.getElementById("preview-frame");

@@ -258,6 +258,11 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
         _, jpeg = latest
         return Response(content=jpeg, media_type="image/jpeg")
 
+    @app.post("/preview/show_lines")
+    async def set_preview_show_lines(show: bool = Form(False)):
+        preview.set_show_lines(show)
+        return Response(status_code=204)
+
     @app.get("/preview/stream")
     async def get_preview_stream():
         boundary = b"--frame"
@@ -311,7 +316,7 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
             "threshold_mph": cfg.alert_threshold_mph,
             "line_distance_m_north": cal.line_distance_m_north if cal else 0,
             "line_distance_m_south": cal.line_distance_m_south if cal else 0,
-            "known_count": db.count_known(),
+            "known_count": len(cal.calibration_points) if cal else 0,
         })
 
     return app
@@ -336,7 +341,7 @@ def _render_index(request: Request, cfg: Config, db: Database):
             "dist_n": dist_n,
             "dist_s": dist_s,
             "threshold": threshold,
-            "known_count": db.count_known(),
+            "known_count": len(cal.calibration_points) if cal else 0,
             "running": True,
         },
     )
@@ -390,7 +395,7 @@ def _render_status_panel(request: Request, cfg: Config, db: Database):
             "dist_n": dist_n,
             "dist_s": dist_s,
             "threshold": cfg.alert_threshold_mph,
-            "known_count": db.count_known(),
+            "known_count": len(cal.calibration_points) if cal else 0,
             "running": True,
         },
     )
