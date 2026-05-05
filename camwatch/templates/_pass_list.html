@@ -1,5 +1,14 @@
+{% if include_oob_histogram %}
+<section id="histogram" class="histogram-section" hx-swap-oob="true"
+         hx-get="/passes"
+         hx-trigger="change"
+         hx-target="#pass-list"
+         hx-include="#filter-form, #histogram">
+  {% include "_histogram.html" %}
+</section>
+{% endif %}
 {% if not rows %}
-  <p class="empty">No passes yet. Drive past the camera, or wait for traffic.</p>
+  <p class="empty">No passes match these filters.</p>
 {% else %}
   {% for row in rows %}
     {% include "_pass_row.html" %}

@@ -155,12 +155,20 @@ class Database:
         line_distance_m_north: float | None = None,
         line_distance_m_south: float | None = None,
         include_deleted: bool = False,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
     ) -> list[Pass]:
         sql = "SELECT * FROM passes" if include_deleted else "SELECT * FROM passes WHERE deleted = 0"
         params: list[Any] = []
         if direction in ("N", "S"):
             sql += (" AND " if "WHERE" in sql else " WHERE ") + "direction = ?"
             params.append(direction)
+        if from_ts:
+            sql += (" AND " if "WHERE" in sql else " WHERE ") + "captured_at >= ?"
+            params.append(from_ts)
+        if to_ts:
+            sql += (" AND " if "WHERE" in sql else " WHERE ") + "captured_at <= ?"
+            params.append(to_ts)
         sql += " ORDER BY captured_at DESC LIMIT ?"
         params.append(int(limit))
         with self.connect() as conn:

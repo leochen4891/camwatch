@@ -1,0 +1,24 @@
+{# context vars: histogram (list of {idx, label, count, height_pct, selected}), histogram_total, histogram_max #}
+{% if histogram %}
+  <div class="histogram">
+    <div class="histogram-title">
+      Speed distribution
+      <span class="muted">({{ histogram_total }} pass{{ "" if histogram_total == 1 else "es" }})</span>
+    </div>
+    <div class="bars">
+      {% for b in histogram %}
+        <label class="bar-wrap" title="{{ b.label }} mph: {{ b.count }}">
+          <input type="checkbox" name="buckets" form="filter-form" value="{{ b.idx }}"
+                 {% if b.selected %}checked{% endif %}>
+          <span class="bar-count">{{ b.count if b.count else "" }}</span>
+          <span class="bar-track">
+            <span class="bar" style="height: {{ b.height_pct }}%"></span>
+          </span>
+          <span class="bar-label">{{ b.label }}</span>
+        </label>
+      {% endfor %}
+    </div>
+  </div>
+{% else %}
+  <p class="muted histogram-empty">No passes match these filters yet.</p>
+{% endif %}

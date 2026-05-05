@@ -201,7 +201,7 @@ header {
 .preview-frame img {
   display: block;
   width: 100%;
-  max-width: 960px;
+  max-width: 480px;
   height: auto;
   background: black;
   border-radius: 4px;
@@ -215,6 +215,86 @@ header {
   align-items: center;
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
+}
+.controls input[type="datetime-local"] {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  color-scheme: dark;
+}
+
+.histogram-section {
+  padding: 12px 20px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.histogram-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.histogram-empty { padding: 12px 20px; }
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  min-height: 130px;
+}
+.bar-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1 1 0;
+  min-width: 28px;
+  cursor: pointer;
+  position: relative;
+}
+.bar-wrap input[type="checkbox"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.bar-count {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 2px;
+  height: 14px;
+}
+.bar-track {
+  display: flex;
+  align-items: flex-end;
+  width: 100%;
+  height: 100px;
+  background: transparent;
+  border-bottom: 1px solid var(--border);
+  border-radius: 2px;
+  position: relative;
+}
+.bar {
+  display: block;
+  width: 100%;
+  background: var(--surface-2);
+  border-radius: 2px 2px 0 0;
+  transition: background-color 0.1s ease;
+}
+.bar-wrap:hover .bar { background: #354054; }
+.bar-wrap input:checked + .bar-count + .bar-track .bar,
+.bar-wrap input:checked ~ .bar-track .bar {
+  /* fallback in case structure changes */
+  background: var(--accent);
+}
+.bar-wrap input:checked ~ .bar-track .bar { background: var(--accent); }
+.bar-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .controls form { display: flex; gap: 12px; align-items: center; }
 .controls label { display: flex; gap: 6px; align-items: center; font-size: 14px; color: var(--muted); }

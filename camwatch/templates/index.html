@@ -67,7 +67,7 @@
   </section>
 
   <section class="controls">
-    <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form">
+    <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram">
       <label>direction
         <select name="direction">
           <option value="">all</option>
@@ -76,12 +76,22 @@
         </select>
       </label>
       <label class="checkbox"><input type="checkbox" name="alerts_only" value="true"> alerts only</label>
+      <label>from <input type="datetime-local" name="from_ts"></label>
+      <label>to <input type="datetime-local" name="to_ts"></label>
     </form>
     <div class="actions">
       <button type="button" id="select-toggle" onclick="toggleSelection()">Select…</button>
       <button type="button" id="delete-btn" class="danger hidden" onclick="deleteSelected()">Delete selected</button>
       <button type="button" id="cancel-btn" class="hidden" onclick="toggleSelection()">Cancel</button>
     </div>
+  </section>
+
+  <section id="histogram" class="histogram-section"
+           hx-get="/passes"
+           hx-trigger="change"
+           hx-target="#pass-list"
+           hx-include="#filter-form, #histogram">
+    {% include "_histogram.html" %}
   </section>
 
   <main>

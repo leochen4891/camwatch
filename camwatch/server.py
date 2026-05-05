@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -182,8 +182,14 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
         request: Request,
         direction: str | None = None,
         alerts_only: bool = False,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+        buckets: list[int] = Query(default=[]),
     ):
-        return _render_pass_list(request, cfg, db, direction, alerts_only)
+        return _render_pass_list(
+            request, cfg, db, direction, alerts_only,
+            from_ts=from_ts, to_ts=to_ts, selected_buckets=buckets,
+        )
 
     @app.post("/passes/{pass_id}/annotate", response_class=HTMLResponse)
     async def annotate_pass(request: Request, pass_id: int, known_mph: str = Form(...)):
@@ -337,25 +343,78 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
 
 # ---------- render helpers (split out for clarity) ----------
 
+def _bucket_for(mph: float) -> int:
+    """5-mph buckets: 1..5 -> 0, 6..10 -> 1, …. Pre-1 mph clamps to 0."""
+    if mph < 1:
+        return 0
+    return int((mph - 1) // 5)
+
+
+def _bucket_label(idx: int) -> str:
+    return f"{idx * 5 + 1}-{idx * 5 + 5}"
+
+
+def _build_histogram(
+    rows_for_hist: list[dict],
+    threshold: float,
+    selected_buckets: set[int],
+) -> tuple[list[dict], int]:
+    """Returns (bars, total_count). Each bar dict has idx, label, count,
+    height_pct, selected. Bars are emitted from 0 up through max non-empty
+    bucket, with at least 2 buckets past the alarm threshold so high-speed
+    buckets remain visible/clickable."""
+    counts: dict[int, int] = {}
+    total = 0
+    for r in rows_for_hist:
+        if r["computed_mph"] is None:
+            continue
+        idx = _bucket_for(r["computed_mph"])
+        counts[idx] = counts.get(idx, 0) + 1
+        total += 1
+
+    threshold_bucket = _bucket_for(threshold)
+    max_observed = max(counts.keys(), default=-1)
+    last = max(max_observed, threshold_bucket + 2)
+    if last < 0:
+        return [], 0
+
+    max_count = max(counts.values(), default=0) or 1
+    bars: list[dict] = []
+    for idx in range(0, last + 1):
+        c = counts.get(idx, 0)
+        bars.append({
+            "idx": idx,
+            "label": _bucket_label(idx),
+            "count": c,
+            "height_pct": int(round(c / max_count * 100)),
+            "selected": idx in selected_buckets,
+        })
+    return bars, total
+
+
 def _render_index(request: Request, cfg: Config, db: Database):
     cal = cfg.load_calibration()
     dist_n = cal.line_distance_m_north if cal else 0
     dist_s = cal.line_distance_m_south if cal else 0
     threshold = cfg.alert_threshold_mph
-    rows = [
+    all_rows = [
         render_pass(p, dist_n, dist_s, threshold)
         for p in db.list_passes(limit=200, include_deleted=True)
     ]
+    hist_rows = [r for r in all_rows if not r["deleted"]]
+    histogram, hist_total = _build_histogram(hist_rows, threshold, set())
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
         {
-            "rows": rows,
+            "rows": all_rows,
             "dist_n": dist_n,
             "dist_s": dist_s,
             "threshold": threshold,
             "known_count": len(cal.calibration_points) if cal else 0,
             "running": True,
+            "histogram": histogram,
+            "histogram_total": hist_total,
         },
     )
 
@@ -363,12 +422,15 @@ def _render_index(request: Request, cfg: Config, db: Database):
 def _render_pass_list(
     request: Request, cfg: Config, db: Database,
     direction: str | None, alerts_only: bool,
+    from_ts: str | None = None, to_ts: str | None = None,
+    selected_buckets: list[int] | None = None,
 ):
     cal = cfg.load_calibration()
     dist_n = cal.line_distance_m_north if cal else 0
     dist_s = cal.line_distance_m_south if cal else 0
     threshold = cfg.alert_threshold_mph
     direction = direction if direction in ("N", "S") else None
+    selected_set: set[int] = set(selected_buckets or [])
     passes = db.list_passes(
         direction=direction,
         alerts_only=alerts_only,
@@ -377,9 +439,38 @@ def _render_pass_list(
         line_distance_m_south=dist_s,
         limit=200,
         include_deleted=True,
+        from_ts=from_ts,
+        to_ts=to_ts,
     )
-    rows = [render_pass(p, dist_n, dist_s, threshold) for p in passes]
-    return TEMPLATES.TemplateResponse(request, "_pass_list.html", {"rows": rows})
+    rendered = [render_pass(p, dist_n, dist_s, threshold) for p in passes]
+
+    # Histogram is computed over non-deleted rows only, ignoring bucket filter.
+    hist_rows = [r for r in rendered if not r["deleted"]]
+    histogram, hist_total = _build_histogram(hist_rows, threshold, selected_set)
+
+    # List filter: if any bucket selected, keep only rows whose computed_mph
+    # falls in those buckets (deleted rows are kept regardless so revert is
+    # always possible).
+    if selected_set:
+        def in_selected(r: dict) -> bool:
+            if r["deleted"]:
+                return True
+            mph = r["computed_mph"]
+            if mph is None:
+                return False
+            return _bucket_for(mph) in selected_set
+        rendered = [r for r in rendered if in_selected(r)]
+
+    return TEMPLATES.TemplateResponse(
+        request,
+        "_pass_list.html",
+        {
+            "rows": rendered,
+            "histogram": histogram,
+            "histogram_total": hist_total,
+            "include_oob_histogram": True,
+        },
+    )
 
 
 def _render_pass_row(request: Request, cfg: Config, db: Database, pass_id: int):
