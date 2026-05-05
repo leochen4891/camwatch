@@ -30,6 +30,7 @@ class Detector:
         conf: float = 0.35,
         iou: float = 0.5,
         tracker: str = "botsort.yaml",
+        roi: tuple[int, int, int, int] | None = None,
     ) -> None:
         self._model = YOLO(weights)
         self._device = device
@@ -37,15 +38,27 @@ class Detector:
         self._conf = conf
         self._iou = iou
         self._tracker = tracker
+        self._roi = roi
         self._names = self._model.names
         log.info(
-            "detector: weights=%s device=%s classes=%s tracker=%s",
-            weights, device, classes, tracker,
+            "detector: weights=%s device=%s classes=%s tracker=%s roi=%s",
+            weights, device, classes, tracker, roi,
         )
 
     def track(self, frame: np.ndarray) -> list[Track]:
+        # Crop to ROI if configured. YOLO sees the smaller window; bbox coords
+        # are translated back to full-frame space before returning, so all
+        # downstream code (crossing detection, clip overlay) is unaware.
+        if self._roi is not None:
+            x1, y1, x2, y2 = self._roi
+            view = frame[y1:y2, x1:x2]
+            ox, oy = x1, y1
+        else:
+            view = frame
+            ox, oy = 0, 0
+
         results = self._model.track(
-            frame,
+            view,
             persist=True,
             classes=self._classes,
             conf=self._conf,
@@ -68,7 +81,11 @@ class Detector:
 
         out: list[Track] = []
         for i in range(len(ids)):
-            x1, y1, x2, y2 = (float(v) for v in xyxy[i])
+            cx1, cy1, cx2, cy2 = (float(v) for v in xyxy[i])
+            x1 = cx1 + ox
+            y1 = cy1 + oy
+            x2 = cx2 + ox
+            y2 = cy2 + oy
             ground = ((x1 + x2) / 2.0, y2)
             out.append(
                 Track(

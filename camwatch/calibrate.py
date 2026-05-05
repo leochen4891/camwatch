@@ -120,9 +120,99 @@ def cmd_pick_lines(cfg) -> None:
         "frame_height": full_h,
         "line_distance_m_north": data.get("line_distance_m_north", 0.0),
         "line_distance_m_south": data.get("line_distance_m_south", 0.0),
-        "passes": data.get("passes") or [],
     })
     _save_yaml(cfg.calibration_path, data)
+    print(f"saved line_a_x={line_a_x} line_b_x={line_b_x} to {cfg.calibration_path}")
+
+
+# ---------- pick-roi ----------
+
+def cmd_pick_roi(cfg) -> None:
+    """Pick a region of interest rectangle. YOLO will only see pixels inside.
+
+    Click top-left, then bottom-right of the road belt. The two crossing lines
+    must lie within the chosen rectangle for detection to work end-to-end.
+    """
+    frame = _grab_one_frame(cfg.camera.rtsp_url)
+    full_h, full_w = frame.shape[:2]
+    disp, scale = _scale_to_fit(frame)
+
+    data = _load_yaml(cfg.calibration_path)
+    line_a_disp = int(round(int(data.get("line_a_x", 0) or 0) * scale))
+    line_b_disp = int(round(int(data.get("line_b_x", 0) or 0) * scale))
+
+    clicks_disp: list[tuple[int, int]] = []
+
+    def on_mouse(event, x, y, _flags, _userdata):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicks_disp.append((x, y))
+
+    win = "pick ROI (click top-left, then bottom-right; r=reset, s=save, q=quit)"
+    cv2.namedWindow(win)
+    cv2.setMouseCallback(win, on_mouse)
+
+    while True:
+        view = disp.copy()
+        # Show the existing crossing lines so the user knows where the ROI must cover.
+        if line_a_disp:
+            cv2.line(view, (line_a_disp, 0), (line_a_disp, view.shape[0]), (0, 220, 0), 1)
+        if line_b_disp:
+            cv2.line(view, (line_b_disp, 0), (line_b_disp, view.shape[0]), (220, 120, 0), 1)
+        if len(clicks_disp) >= 1:
+            cv2.circle(view, clicks_disp[0], 5, (0, 0, 255), -1)
+        if len(clicks_disp) >= 2:
+            p1 = (min(clicks_disp[0][0], clicks_disp[1][0]), min(clicks_disp[0][1], clicks_disp[1][1]))
+            p2 = (max(clicks_disp[0][0], clicks_disp[1][0]), max(clicks_disp[0][1], clicks_disp[1][1]))
+            # Dim everything outside the rectangle.
+            mask = view.copy()
+            cv2.rectangle(mask, (0, 0), (view.shape[1], view.shape[0]), (0, 0, 0), -1)
+            cv2.rectangle(mask, p1, p2, (0, 0, 0), -1)
+            view = cv2.addWeighted(view, 0.5, mask, 0.5, 0)
+            cv2.rectangle(view, p1, p2, (0, 0, 255), 2)
+            label = f"ROI {int(p1[0]/scale)},{int(p1[1]/scale)} -> {int(p2[0]/scale)},{int(p2[1]/scale)}"
+            cv2.putText(view, label, (p1[0] + 6, max(20, p1[1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.imshow(win, view)
+        key = cv2.waitKey(20) & 0xFF
+        if key == ord("q"):
+            cv2.destroyAllWindows()
+            return
+        if key == ord("r"):
+            clicks_disp.clear()
+        if key == ord("s") and len(clicks_disp) >= 2:
+            cv2.destroyAllWindows()
+            break
+        if len(clicks_disp) > 2:
+            del clicks_disp[2:]
+
+    p1 = clicks_disp[0]
+    p2 = clicks_disp[1]
+    roi_x1 = int(round(min(p1[0], p2[0]) / scale))
+    roi_y1 = int(round(min(p1[1], p2[1]) / scale))
+    roi_x2 = int(round(max(p1[0], p2[0]) / scale))
+    roi_y2 = int(round(max(p1[1], p2[1]) / scale))
+    # Clamp to frame
+    roi_x1 = max(0, min(roi_x1, full_w))
+    roi_x2 = max(0, min(roi_x2, full_w))
+    roi_y1 = max(0, min(roi_y1, full_h))
+    roi_y2 = max(0, min(roi_y2, full_h))
+
+    line_a = int(data.get("line_a_x") or 0)
+    line_b = int(data.get("line_b_x") or 0)
+    if line_a and not (roi_x1 <= line_a <= roi_x2):
+        print(f"WARNING: line_a_x={line_a} is outside roi x range [{roi_x1}, {roi_x2}]")
+    if line_b and not (roi_x1 <= line_b <= roi_x2):
+        print(f"WARNING: line_b_x={line_b} is outside roi x range [{roi_x1}, {roi_x2}]")
+
+    data["roi_x1"] = roi_x1
+    data["roi_y1"] = roi_y1
+    data["roi_x2"] = roi_x2
+    data["roi_y2"] = roi_y2
+    _save_yaml(cfg.calibration_path, data)
+    print(
+        f"saved ROI ({roi_x1}, {roi_y1}) -> ({roi_x2}, {roi_y2}) "
+        f"= {roi_x2 - roi_x1} x {roi_y2 - roi_y1} px to {cfg.calibration_path}"
+    )
     print(f"saved line_a_x={line_a_x} line_b_x={line_b_x} to {cfg.calibration_path}")
 
 
@@ -134,6 +224,9 @@ def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
         raise SystemExit("run `pick-lines` first")
     line_a = int(cal["line_a_x"])
     line_b = int(cal["line_b_x"])
+    rx1, ry1 = int(cal.get("roi_x1") or 0), int(cal.get("roi_y1") or 0)
+    rx2, ry2 = int(cal.get("roi_x2") or 0), int(cal.get("roi_y2") or 0)
+    roi = (rx1, ry1, rx2, ry2) if (rx2 > rx1 and ry2 > ry1) else None
 
     cap = RtspStream(cfg.camera.rtsp_url)
     det = Detector(
@@ -142,6 +235,7 @@ def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
         classes=cfg.model.classes,
         conf=cfg.model.conf,
         iou=cfg.model.iou,
+        roi=roi,
     )
     recorder = ClipRecorder(recordings_dir)
     crossing = CrossingDetector(line_a, line_b, cfg.max_track_age_s)
@@ -308,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="camwatch.calibrate")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("pick-lines")
+    sub.add_parser("pick-roi")
     p_cap = sub.add_parser("capture")
     p_cap.add_argument("--secs", type=int, default=300)
     p_cap.add_argument("--recordings-dir", type=Path, default=Path("recordings"))
@@ -319,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config()
     if args.cmd == "pick-lines":
         cmd_pick_lines(cfg)
+    elif args.cmd == "pick-roi":
+        cmd_pick_roi(cfg)
     elif args.cmd == "capture":
         cmd_capture(cfg, args.secs, args.recordings_dir)
     elif args.cmd == "annotate":

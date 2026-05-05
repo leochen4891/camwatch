@@ -62,8 +62,8 @@ class CaptureWorker(threading.Thread):
             return
 
         log.info(
-            "capture worker starting (lines a=%d b=%d, threshold=%.1f mph)",
-            cal.line_a_x, cal.line_b_x, self._cfg.alert_threshold_mph,
+            "capture worker starting (lines a=%d b=%d, threshold=%.1f mph, roi=%s)",
+            cal.line_a_x, cal.line_b_x, self._cfg.alert_threshold_mph, cal.roi,
         )
         self._stream = RtspStream(self._cfg.camera.rtsp_url)
         det = Detector(
@@ -72,6 +72,7 @@ class CaptureWorker(threading.Thread):
             classes=self._cfg.model.classes,
             conf=self._cfg.model.conf,
             iou=self._cfg.model.iou,
+            roi=cal.roi,
         )
         recorder = ClipRecorder(self._recordings_dir)
         crossing = CrossingDetector(

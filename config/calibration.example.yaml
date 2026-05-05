@@ -7,9 +7,16 @@ frame_width: 2560          # source frame width (sanity check)
 frame_height: 1920
 
 # Real-world distance between line_a and line_b, in meters, per direction.
-# Northbound = left→right, Southbound = right→left.
+# Northbound = left to right, Southbound = right to left.
 line_distance_m_north: 0.0
 line_distance_m_south: 0.0
 
-# Optional: raw calibration passes, kept for the sanity report.
-passes: []                 # list of {direction, known_mph, t_a, t_b, implied_distance_m}
+# Region of interest cropped from the full frame before YOLO inference.
+# Lawn / sky / driveway pixels outside this rectangle are not seen by the
+# detector; clips and any future security view still use the full frame.
+# Set with `python -m camwatch.calibrate pick-roi`. Leave all zeros to feed
+# the full frame to YOLO.
+roi_x1: 0
+roi_y1: 0
+roi_x2: 0
+roi_y2: 0

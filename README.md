@@ -164,6 +164,20 @@ Opens a live still from the camera in a window. **Click line A (left), then line
 
 Pick lines that are clearly perpendicular to the road and far enough apart that even a fast-moving car spends a noticeable fraction of a second between them. ~30-60% of the frame width is a good target.
 
+### 1b. `pick-roi`: limit YOLO to the road belt (optional but recommended)
+
+```sh
+uv run python -m camwatch.calibrate pick-roi
+```
+
+Opens the same still and lets you drag a rectangle around just the road. **Click the top-left corner, then the bottom-right corner of the road belt.** The two crossing lines from `pick-lines` are drawn on the frame so you can verify they fall inside the rectangle.
+
+The ROI is the only region YOLO sees; lawn / sky / driveways outside it cannot generate detections. Two benefits:
+- Faster inference (often 2-3x): YOLO processes a smaller image.
+- Fewer false positives: parked cars in driveways stop appearing as tracks.
+
+The full frame is still saved in clips and shown in any future security view; ROI only affects what the detector looks at. Saved as `roi_x1/y1/x2/y2` in `calibration.yaml`. Leave it un-set (all zeros) to feed the full frame to YOLO.
+
 ### 2. `capture`: record calibration drives
 
 ```sh

@@ -38,6 +38,7 @@ def main() -> None:
         classes=cfg.model.classes,
         conf=cfg.model.conf,
         iou=cfg.model.iou,
+        roi=cal.roi,
     )
     spd = SpeedTracker(
         line_a_x=cal.line_a_x,

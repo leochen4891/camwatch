@@ -41,7 +41,21 @@ class CalibrationConfig:
     frame_height: int
     line_distance_m_north: float
     line_distance_m_south: float
+    # Region of interest fed to YOLO. Anything outside is invisible to detection
+    # but still saved in clips and visible to any future security view. Set all
+    # four to 0 (or omit) to feed the full frame to YOLO.
+    roi_x1: int = 0
+    roi_y1: int = 0
+    roi_x2: int = 0
+    roi_y2: int = 0
     passes: list[dict] = field(default_factory=list)
+
+    @property
+    def roi(self) -> tuple[int, int, int, int] | None:
+        """ROI as (x1, y1, x2, y2) in full-frame coords, or None if disabled."""
+        if self.roi_x2 > self.roi_x1 and self.roi_y2 > self.roi_y1:
+            return (self.roi_x1, self.roi_y1, self.roi_x2, self.roi_y2)
+        return None
 
 
 @dataclass
@@ -65,6 +79,10 @@ class Config:
             frame_height=int(data["frame_height"]),
             line_distance_m_north=float(data.get("line_distance_m_north", 0.0)),
             line_distance_m_south=float(data.get("line_distance_m_south", 0.0)),
+            roi_x1=int(data.get("roi_x1", 0) or 0),
+            roi_y1=int(data.get("roi_y1", 0) or 0),
+            roi_x2=int(data.get("roi_x2", 0) or 0),
+            roi_y2=int(data.get("roi_y2", 0) or 0),
             passes=list(data.get("passes") or []),
         )
 
