@@ -151,6 +151,20 @@
       togglePlay(passId);
     }
 
+    // Pause the auto-refresh poll while any video is open, so the list rerender
+    // doesn't wipe the <video> element mid-playback.
+    document.body.addEventListener("htmx:beforeRequest", (e) => {
+      const elt = e.detail && e.detail.elt;
+      if (!elt) return;
+      // Only intercept the filter-form's polling GET on /passes.
+      const triggeringEvent = e.detail.requestConfig && e.detail.requestConfig.triggeringEvent;
+      const isPoll = triggeringEvent && triggeringEvent.type === "every";
+      if (!(elt.id === "filter-form" && isPoll)) return;
+      if (document.querySelector(".pass-row .video-wrap:not(.hidden)")) {
+        e.preventDefault();
+      }
+    });
+
     function togglePreview() {
       const frame = document.getElementById("preview-frame");
       const img = document.getElementById("preview-img");
