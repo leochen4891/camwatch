@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-import cv2
-import numpy as np
+# Force TCP transport for RTSP. UDP is the OpenCV default and causes occasional
+# packet loss visible as "left block unavailable" / "error while decoding MB"
+# warnings on Wi-Fi. Must be set before the first cv2.VideoCapture call.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
+import cv2  # noqa: E402  (must come after the env var)
+import numpy as np  # noqa: E402
 
 log = logging.getLogger(__name__)
 

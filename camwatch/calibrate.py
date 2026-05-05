@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -27,6 +28,7 @@ import yaml
 from .capture import RtspStream
 from .config import load_config
 from .detect import Detector
+from .recorder import ClipRecorder
 from .speed import MPS_TO_MPH
 
 log = logging.getLogger("camwatch.calibrate")
@@ -124,7 +126,7 @@ def cmd_pick_lines(cfg) -> None:
 
 # ---------- capture ----------
 
-def cmd_capture(cfg, secs: int) -> None:
+def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
     cal = _load_yaml(cfg.calibration_path)
     if "line_a_x" not in cal or "line_b_x" not in cal:
         raise SystemExit("run `pick-lines` first")
@@ -139,17 +141,20 @@ def cmd_capture(cfg, secs: int) -> None:
         conf=cfg.model.conf,
         iou=cfg.model.iou,
     )
+    recorder = ClipRecorder(recordings_dir)
 
     state: dict[int, dict] = {}  # track_id -> {t_a, t_b, last_x, last_t, direction, cls_name}
     passes: list[dict] = []
     t0 = time.monotonic()
     deadline = t0 + secs
     print(f"capture: watching for {secs}s. Drive at GPS-known speeds in each direction now.")
+    print(f"clips will be written to {recordings_dir}/")
 
     def stop_at_deadline():
         return time.monotonic() >= deadline
 
     for fr in cap.frames():
+        recorder.push(fr.image)
         if stop_at_deadline():
             cap.stop()
             break
@@ -172,24 +177,31 @@ def cmd_capture(cfg, secs: int) -> None:
                 if st["t_a"] is not None and st["t_b"] is not None:
                     direction = "N" if st["t_a"] < st["t_b"] else "S"
                     elapsed = abs(st["t_b"] - st["t_a"])
+                    captured_at = datetime.now().astimezone()
+                    stamp = captured_at.strftime("%Y%m%dT%H%M%S")
+                    clip_name = f"cal_{stamp}_id{tr.track_id}_{direction}.mp4"
+                    clip_path = recorder.trigger(clip_name)
                     p = {
-                        "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "captured_at": captured_at.isoformat(timespec="seconds"),
                         "track_id": tr.track_id,
                         "class": tr.cls_name,
                         "direction": direction,
                         "elapsed_s": round(elapsed, 4),
                         "known_mph": None,
+                        "clip": clip_path or None,
                     }
                     passes.append(p)
+                    wallclock = captured_at.strftime("%H:%M:%S")
                     print(
-                        f"  pass: id={tr.track_id} {tr.cls_name} {direction} "
-                        f"elapsed={elapsed:.3f}s"
+                        f"  [{wallclock}] pass: id={tr.track_id} {tr.cls_name} {direction} "
+                        f"elapsed={elapsed:.3f}s -> {clip_name}"
                     )
                     del state[tr.track_id]
                     continue
             st["last_x"] = x
             st["last_t"] = fr.ts
 
+    recorder.flush()
     existing = _load_yaml(cfg.calibration_path)
     existing_passes = existing.get("passes") or []
     existing_passes.extend(passes)
@@ -209,25 +221,44 @@ def cmd_annotate(cfg) -> None:
         print("no unannotated passes found.")
         return
 
-    print(f"{len(todo)} unannotated pass(es). For each, type the GPS-known speed in mph,")
-    print("or 'skip' to discard (e.g., it wasn't your car), or 'q' to stop.\n")
+    print(f"{len(todo)} unannotated pass(es). At each prompt, type:")
+    print("  <number>   GPS-known speed in mph (e.g. 30)")
+    print("  open       open the clip in the default player (then re-prompt)")
+    print("  skip / s   discard this pass (not your car)")
+    print("  q          stop annotating now (already-typed answers are saved)")
+    print()
 
     discard_idxs: list[int] = []
+    stopped = False
     for n, (idx, p) in enumerate(todo, 1):
         print(
             f"[{n}/{len(todo)}] track_id={p['track_id']} dir={p['direction']} "
             f"elapsed={p['elapsed_s']:.3f}s captured_at={p.get('captured_at', '?')}"
         )
-        ans = input("  known mph: ").strip().lower()
-        if ans == "q":
+        if p.get("clip"):
+            print(f"  clip: {p['clip']}")
+        while True:
+            ans = input("  > ").strip().lower()
+            if ans == "q":
+                stopped = True
+                break
+            if ans == "open":
+                clip = p.get("clip")
+                if clip and Path(clip).exists():
+                    subprocess.run(["open", clip], check=False)
+                else:
+                    print("  no clip available for this pass")
+                continue
+            if ans in ("skip", "s"):
+                discard_idxs.append(idx)
+                break
+            try:
+                p["known_mph"] = float(ans)
+                break
+            except ValueError:
+                print("  not a number; type a speed, 'open', 'skip', or 'q'")
+        if stopped:
             break
-        if ans == "skip" or ans == "s":
-            discard_idxs.append(idx)
-            continue
-        try:
-            p["known_mph"] = float(ans)
-        except ValueError:
-            print("  not a number; leaving unannotated")
 
     if discard_idxs:
         keep = [p for i, p in enumerate(passes) if i not in set(discard_idxs)]
@@ -298,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("pick-lines")
     p_cap = sub.add_parser("capture")
     p_cap.add_argument("--secs", type=int, default=300)
+    p_cap.add_argument("--recordings-dir", type=Path, default=Path("recordings"))
     sub.add_parser("annotate")
     sub.add_parser("compute")
     sub.add_parser("report")
@@ -307,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "pick-lines":
         cmd_pick_lines(cfg)
     elif args.cmd == "capture":
-        cmd_capture(cfg, args.secs)
+        cmd_capture(cfg, args.secs, args.recordings_dir)
     elif args.cmd == "annotate":
         cmd_annotate(cfg)
     elif args.cmd == "compute":

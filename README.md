@@ -165,11 +165,14 @@ Pick lines that are clearly perpendicular to the road and far enough apart that 
 uv run python -m camwatch.calibrate capture --secs 600
 ```
 
-Watches the live stream for 600 seconds. For every car that crosses both lines, prints a line and appends a `passes:` entry to `calibration.yaml`:
+Watches the live stream for 600 seconds. For every car that crosses both lines, the tool:
+1. Records a short mp4 clip into `recordings/cal_<timestamp>_id<id>_<dir>.mp4` (~3.5 sec, downscaled to 1280px wide), covering ~2 sec before line A through ~1.5 sec after line B.
+2. Prints a line including the wall-clock time and the clip name.
+3. Appends a `passes:` entry to `calibration.yaml`.
 
 ```
-pass: id=47 car N elapsed=0.823s
-pass: id=48 car S elapsed=1.105s
+[06:59:52] pass: id=47 car N elapsed=0.823s -> cal_20260505T065952_id47_N.mp4
+[06:59:54] pass: id=48 car S elapsed=1.105s -> cal_20260505T065954_id48_S.mp4
 ```
 
 While this is running, **drive past at GPS-confirmed speeds** in both directions. A reasonable plan, ~10 min:
@@ -194,16 +197,25 @@ The tool can't tell which passes are you and which are random other cars on the 
 uv run python -m camwatch.calibrate annotate
 ```
 
-Walks through every unannotated pass, one at a time:
+Walks through every unannotated pass, one at a time. Each prompt shows the elapsed time, the wall-clock timestamp, and the clip path:
 
 ```
 [1/14] track_id=47 dir=N elapsed=1.214s captured_at=2026-05-04T21:46:12-04:00
-  known mph: 20
+  clip: recordings/cal_20260504T214612_id47_N.mp4
+  > 20
 [2/14] track_id=48 dir=S elapsed=1.105s captured_at=2026-05-04T21:46:54-04:00
-  known mph: skip
+  clip: recordings/cal_20260504T214654_id48_S.mp4
+  > open
+  > skip
 ```
 
-For each pass, type your GPS-known speed (e.g. `20`), or `skip` if it wasn't you, or `q` to stop. Skipped passes are deleted; annotated passes get `known_mph` filled in.
+At each prompt:
+- Type a number to record the GPS speed in mph.
+- Type `open` to play the clip in the default video player, then re-prompt.
+- Type `skip` (or `s`) to discard the pass (not your car, or a tracker artifact).
+- Type `q` to stop annotating now; already-typed answers are saved.
+
+The clip preview makes it easy to filter out tracker re-ID artifacts (a single car split into two `track_id`s by BotSORT mid-crossing). Those show up as suspiciously short elapsed times (e.g. 0.3 sec across a span that should take 0.8 sec).
 
 ### 4. `compute`: average the implied distances
 
