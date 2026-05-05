@@ -41,7 +41,7 @@ class _FrameRec:
 class _ActiveClip:
     path: str
     frames: list[_FrameRec]
-    target_count: int
+    target_end_ts: float  # finalize once a pushed frame has ts >= this
     focus_track_id: int
     line_a_x: int  # in scaled coords
     line_b_x: int  # in scaled coords
@@ -65,18 +65,26 @@ class ClipRecorder:
         self,
         recordings_dir: Path,
         fps: int = 10,
-        pre_seconds: float = 2.0,
-        post_seconds: float = 1.5,
+        pre_seconds_before_a: float = 1.0,
+        post_seconds_after_b: float = 1.0,
+        max_clip_seconds: float = 5.0,
+        ring_seconds: float = 7.0,
         max_width: int = 2560,
     ) -> None:
         self._dir = Path(recordings_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._fps = fps
-        self._pre_n = max(1, int(pre_seconds * fps))
-        self._post_n = max(1, int(post_seconds * fps))
+        self._pre_a = float(pre_seconds_before_a)
+        self._post_b = float(post_seconds_after_b)
+        self._max_clip = float(max_clip_seconds)
         self._max_width = max_width
         self._size: tuple[int, int] | None = None
         self._scale: float = 1.0
+        # Ring buffer must hold enough frames that, at trigger time, we can
+        # still find a frame at (t_a - pre_seconds_before_a). Worst case is a
+        # slow car (long elapsed) plus the pre-roll window. Default 7s gives
+        # comfortable headroom over a 5s clip cap with 5s max track age.
+        self._pre_n = max(1, int(ring_seconds * fps))
         self._ring: collections.deque[_FrameRec] = collections.deque(maxlen=self._pre_n)
         self._active: list[_ActiveClip] = []
 
@@ -88,7 +96,7 @@ class ClipRecorder:
         completed: list[_ActiveClip] = []
         for clip in self._active:
             clip.frames.append(rec)
-            if len(clip.frames) >= clip.target_count:
+            if rec.ts >= clip.target_end_ts:
                 completed.append(clip)
         for clip in completed:
             self._finalize(clip)
@@ -106,11 +114,22 @@ class ClipRecorder:
     ) -> str:
         if self._size is None:
             raise RuntimeError("trigger() called before any frames were pushed")
+
+        # Default clip range: 1s before line A through 1s after line B.
+        desired_start = t_a - self._pre_a
+        desired_end = t_b + self._post_b
+        # If that exceeds the cap, center the crossing window in a max-length clip.
+        if desired_end - desired_start > self._max_clip:
+            midpoint = (t_a + t_b) / 2.0
+            desired_start = midpoint - self._max_clip / 2.0
+            desired_end = midpoint + self._max_clip / 2.0
+
         path = str(self._dir / name)
+        pre_frames = [r for r in self._ring if r.ts >= desired_start]
         clip = _ActiveClip(
             path=path,
-            frames=list(self._ring),  # snapshot of pre-roll
-            target_count=len(self._ring) + self._post_n,
+            frames=pre_frames,
+            target_end_ts=desired_end,
             focus_track_id=focus_track_id,
             line_a_x=int(round(line_a_x * self._scale)),
             line_b_x=int(round(line_b_x * self._scale)),
