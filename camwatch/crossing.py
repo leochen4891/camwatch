@@ -56,6 +56,13 @@ class CrossingDetector:
     Call `update(tracks, t)` once per frame with the list of tracks (objects
     exposing .track_id, .cls_name, .ground_point, .bbox). Yields a
     CrossingEvent for each track that completes both crossings on this frame.
+
+    A simple per-direction debounce drops events that fire within
+    `dedupe_window_s` of the last accepted event in the same direction. YOLO
+    occasionally splits a long car (or its reflection) into two overlapping
+    bboxes; BotSORT then assigns two track IDs to the same vehicle, both of
+    which cross the lines within a few milliseconds of each other. The
+    debounce keeps only the first.
     """
 
     def __init__(
@@ -63,13 +70,16 @@ class CrossingDetector:
         line_a_x: int,
         line_b_x: int,
         max_track_age_s: float = 5.0,
+        dedupe_window_s: float = 0.5,
     ) -> None:
         if line_a_x >= line_b_x:
             raise ValueError("line_a_x must be < line_b_x")
         self.line_a = int(line_a_x)
         self.line_b = int(line_b_x)
         self.max_age = float(max_track_age_s)
+        self.dedupe_window = float(dedupe_window_s)
         self._state: dict[int, _State] = {}
+        self._last_event_t: dict[str, float] = {"N": -1e9, "S": -1e9}
 
     def update(self, tracks: list[Any], t: float) -> list[CrossingEvent]:
         events: list[CrossingEvent] = []
@@ -86,7 +96,18 @@ class CrossingDetector:
             had_b = st.t_cross_b is not None
             ev = self._step(st, tid, x, t, getattr(tr, "bbox", None))
             if ev is not None:
-                events.append(ev)
+                # Debounce: drop events that fall within dedupe_window_s of
+                # the last accepted event in the same direction.
+                event_t = max(ev.t_a, ev.t_b)
+                if event_t - self._last_event_t[ev.direction] < self.dedupe_window:
+                    log.info(
+                        "track %d %s crossing dropped (%.3fs after previous %s pass)",
+                        tid, ev.direction,
+                        event_t - self._last_event_t[ev.direction], ev.direction,
+                    )
+                else:
+                    events.append(ev)
+                    self._last_event_t[ev.direction] = event_t
                 self._state.pop(tid, None)
                 continue
             # Log first sighting and partial crossings as they happen so the
