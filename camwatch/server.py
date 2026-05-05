@@ -79,12 +79,15 @@ def update_threshold(cfg_path: Path, value: float) -> None:
 def recompute_calibration(cfg: Config, db: Database) -> tuple[float, float]:
     """Average implied distances per direction; rewrite calibration.yaml.
 
-    Considers BOTH the DB's known passes AND any frozen `calibration_points`
-    in calibration.yaml (saved by `python -m camwatch.calibrate freeze`).
-    Frozen points are deduped against DB rows by (track_id, captured_at) so
-    a frozen point that's also still in the DB only counts once. This way
-    clearing the DB pass list never weakens the calibration as long as the
-    points were frozen first.
+    Considers BOTH the DB's known passes AND any existing `calibration_points`
+    in calibration.yaml (saved by `python -m camwatch.calibrate freeze` or by
+    earlier auto-saves). Deduped by (track_id, captured_at).
+
+    Side effect: every call refreshes the `calibration_points` list in the
+    YAML to be the merged set, so any new annotation in the UI is durably
+    saved on the next recompute (which the annotate endpoint triggers
+    automatically). Points already in YAML are preserved even if their DB
+    row got deleted — that's the whole point of freezing.
 
     Returns (line_distance_m_north, line_distance_m_south)."""
     cal_path = cfg.calibration_path
@@ -92,8 +95,10 @@ def recompute_calibration(cfg: Config, db: Database) -> tuple[float, float]:
         cal = yaml.safe_load(f) or {}
 
     by_dir: dict[str, list[float]] = {"N": [], "S": []}
+    merged_points: list[dict] = []
     seen: set[tuple] = set()
 
+    # Existing YAML points (durable, preserved even if DB row is gone).
     for pt in (cal.get("calibration_points") or []):
         try:
             elapsed = float(pt["elapsed_s"])
@@ -103,19 +108,32 @@ def recompute_calibration(cfg: Config, db: Database) -> tuple[float, float]:
         if elapsed <= 0:
             continue
         seen.add((pt.get("track_id"), pt.get("captured_at")))
+        merged_points.append(pt)
         by_dir[pt["direction"]].append((known / MPS_TO_MPH) * elapsed)
 
+    # DB known passes that aren't already in YAML.
     for p in db.passes_with_known():
-        if (p.track_id, p.captured_at) in seen:
+        key = (p.track_id, p.captured_at)
+        if key in seen:
             continue
         if p.elapsed_s <= 0:
             continue
+        merged_points.append({
+            "direction": p.direction,
+            "known_mph": float(p.known_mph),
+            "elapsed_s": float(p.elapsed_s),
+            "captured_at": p.captured_at,
+            "track_id": int(p.track_id),
+            "cls_name": p.cls_name,
+            "clip_path": p.clip_path,
+        })
         by_dir[p.direction].append((float(p.known_mph) / MPS_TO_MPH) * p.elapsed_s)
 
     if by_dir["N"]:
         cal["line_distance_m_north"] = round(sum(by_dir["N"]) / len(by_dir["N"]), 3)
     if by_dir["S"]:
         cal["line_distance_m_south"] = round(sum(by_dir["S"]) / len(by_dir["S"]), 3)
+    cal["calibration_points"] = merged_points
 
     with cal_path.open("w") as f:
         yaml.safe_dump(cal, f, sort_keys=False)
