@@ -26,27 +26,34 @@
       <form method="dialog"><button class="muted-btn" aria-label="close">✕</button></form>
     </div>
 
-    <section class="settings-section">
-      <h3>Alarm speed</h3>
-      <p class="muted-text">Passes at or above this speed get the 🚨 marker in the list.</p>
-      <form class="threshold-form" id="threshold-form-settings"
-            hx-post="/calibration/threshold"
-            hx-target="#status-panel"
-            hx-swap="innerHTML">
-        <input type="number" name="threshold_mph" value="{{ threshold }}" step="1" min="1" max="200">
-        <span>mph</span>
-        <button type="submit">Save</button>
-      </form>
-    </section>
+    <form class="settings-form"
+          hx-post="/settings"
+          hx-target="#status-panel"
+          hx-swap="innerHTML"
+          hx-on::after-request="document.getElementById('settings-dialog').close()">
+      <section class="settings-section">
+        <h3>Alarm speed</h3>
+        <p class="muted-text">Passes at or above this speed get the 🚨 marker in the list.</p>
+        <div class="setting-row">
+          <input type="number" name="threshold_mph" value="{{ threshold }}" step="1" min="1" max="200">
+          <span>mph</span>
+        </div>
+      </section>
 
-    <section class="settings-section">
-      <h3>Live preview</h3>
-      <label class="setting-row">
-        <input type="checkbox" id="show-lines-toggle" checked
-               onchange="setShowLines(this.checked)">
-        <span>Show crossing lines on the live preview</span>
-      </label>
-    </section>
+      <section class="settings-section">
+        <h3>Live preview</h3>
+        <label class="setting-row">
+          <input type="checkbox" name="show_lines" value="true" checked>
+          <span>Show crossing lines on the live preview</span>
+        </label>
+      </section>
+
+      <div class="settings-footer">
+        <button type="button" class="muted-btn"
+                onclick="document.getElementById('settings-dialog').close()">Cancel</button>
+        <button type="submit" class="primary-btn">Save</button>
+      </div>
+    </form>
   </dialog>
 
   <section class="preview-section">
@@ -193,12 +200,6 @@
         e.preventDefault();
       }
     });
-
-    async function setShowLines(show) {
-      const fd = new FormData();
-      fd.append("show", show ? "true" : "false");
-      await fetch("/preview/show_lines", { method: "POST", body: fd });
-    }
 
     function togglePreview() {
       const frame = document.getElementById("preview-frame");

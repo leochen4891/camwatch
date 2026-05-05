@@ -299,8 +299,21 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
     @app.post("/calibration/threshold", response_class=HTMLResponse)
     async def set_threshold(request: Request, threshold_mph: float = Form(...)):
         update_threshold(Path("config/config.yaml"), threshold_mph)
-        # mutate the in-memory cfg too
         cfg.alert_threshold_mph = float(threshold_mph)
+        return _render_status_panel(request, cfg, db)
+
+    @app.post("/settings", response_class=HTMLResponse)
+    async def save_settings(
+        request: Request,
+        threshold_mph: float = Form(...),
+        show_lines: str | None = Form(default=None),
+    ):
+        # Threshold is persisted to config.yaml.
+        update_threshold(Path("config/config.yaml"), threshold_mph)
+        cfg.alert_threshold_mph = float(threshold_mph)
+        # Show-lines is runtime-only (resets on server restart). Unchecked
+        # checkboxes don't post a value, so a missing field means False.
+        preview.set_show_lines(show_lines is not None)
         return _render_status_panel(request, cfg, db)
 
     @app.post("/calibration/recompute", response_class=HTMLResponse)
