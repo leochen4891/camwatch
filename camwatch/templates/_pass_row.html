@@ -1,57 +1,87 @@
 {% set p = row %}
-<article class="pass-row {% if p.alert %}alert{% endif %}" id="pass-{{ p.id }}">
-  <label class="select-cell">
-    <input type="checkbox" name="ids" value="{{ p.id }}">
-  </label>
-
-  <div class="thumb">
-    {% if p.has_clip %}
-      <img src="/passes/{{ p.id }}/thumb" alt="" loading="lazy">
-    {% else %}
-      <div class="thumb-placeholder">no thumb</div>
-    {% endif %}
-  </div>
-
-  <div class="meta">
-    <div class="time">{{ p.captured_at[11:19] }} <span class="muted">{{ p.captured_at[:10] }}</span></div>
-    <div class="dir">{{ p.direction }}</div>
-    <div class="speed">
-      {% if p.computed_mph is not none %}
-        <strong>{{ "%.0f" | format(p.computed_mph) }} mph</strong>
-        {% if p.alert %}<span class="alert-icon">🚨</span>{% endif %}
-      {% else %}
-        <span class="muted">—</span>
-      {% endif %}
-      {% if p.known_mph is not none %}
-        <span class="known-pill" title="GPS-known speed used for calibration">known: {{ "%.0f" | format(p.known_mph) }}</span>
-      {% endif %}
+{% if p.deleted %}
+  <article class="pass-row deleted" id="pass-{{ p.id }}">
+    <div class="meta-min">
+      <span class="del-tag">deleted</span>
+      <span class="time">{{ p.captured_at[11:19] }}</span>
+      <span class="dir">{{ p.direction }}</span>
+      <span class="speed-min">
+        {% if p.computed_mph is not none %}
+          {{ "%.0f" | format(p.computed_mph) }} mph
+        {% else %}
+          {{ "%.3f" | format(p.elapsed_s) }} s
+        {% endif %}
+      </span>
     </div>
-    <div class="elapsed muted">{{ "%.3f" | format(p.elapsed_s) }} s</div>
-  </div>
+    <button type="button"
+            class="muted-btn"
+            hx-post="/passes/{{ p.id }}/restore"
+            hx-target="#pass-{{ p.id }}"
+            hx-swap="outerHTML">↩ Revert</button>
+  </article>
+{% else %}
+  <article class="pass-row {% if p.alert %}alert{% endif %}" id="pass-{{ p.id }}">
+    <label class="select-cell">
+      <input type="checkbox" name="ids" value="{{ p.id }}">
+    </label>
 
-  <div class="kebab-wrap">
-    <button class="kebab" type="button" onclick="toggleMenu(this)" aria-label="actions">⋯</button>
-    <div class="kebab-menu">
+    <div class="thumb">
       {% if p.has_clip %}
-        <button type="button" onclick="playClip({{ p.id }})">▶ Play clip</button>
+        <img src="/passes/{{ p.id }}/thumb" alt="" loading="lazy">
+      {% else %}
+        <div class="thumb-placeholder">no thumb</div>
       {% endif %}
-      <button type="button" onclick="startKnownInput({{ p.id }})">✎ Set known mph</button>
-      <button type="button" class="danger" onclick="deleteOne({{ p.id }})">🗑 Delete</button>
     </div>
-  </div>
 
-  <div class="known-input-wrap hidden">
-    <form hx-post="/passes/{{ p.id }}/annotate"
-          hx-target="#pass-{{ p.id }}"
-          hx-swap="outerHTML">
-      <label>known mph:
-        <input type="number" name="known_mph" step="0.1" min="0" max="200"
-               value="{{ p.known_mph if p.known_mph is not none else '' }}">
-      </label>
-      <button type="submit">save</button>
-      <button type="button" onclick="this.closest('.known-input-wrap').classList.add('hidden')">cancel</button>
-    </form>
-  </div>
+    <div class="meta">
+      <div class="time">{{ p.captured_at[11:19] }} <span class="muted">{{ p.captured_at[:10] }}</span></div>
+      <div class="dir">{{ p.direction }}</div>
+      <div class="speed">
+        {% if p.computed_mph is not none %}
+          <strong>{{ "%.0f" | format(p.computed_mph) }} mph</strong>
+          {% if p.alert %}<span class="alert-icon">🚨</span>{% endif %}
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+        {% if p.known_mph is not none %}
+          <span class="known-pill" title="GPS-known speed used for calibration">known: {{ "%.0f" | format(p.known_mph) }}</span>
+        {% endif %}
+      </div>
+      <div class="elapsed muted">{{ "%.3f" | format(p.elapsed_s) }} s</div>
+    </div>
 
-  <div class="video-wrap hidden"></div>
-</article>
+    <div class="row-actions">
+      <button type="button"
+              class="quick-delete"
+              title="Delete (revertable)"
+              hx-post="/passes/{{ p.id }}/delete"
+              hx-target="#pass-{{ p.id }}"
+              hx-swap="outerHTML">✕</button>
+
+      <div class="kebab-wrap">
+        <button class="kebab" type="button" onclick="toggleMenu(this)" aria-label="actions">⋯</button>
+        <div class="kebab-menu">
+          {% if p.has_clip %}
+            <button type="button" onclick="playClip({{ p.id }})">▶ Play clip</button>
+          {% endif %}
+          <button type="button" onclick="startKnownInput({{ p.id }})">✎ Set known mph</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="known-input-wrap hidden">
+      <form hx-post="/passes/{{ p.id }}/annotate"
+            hx-target="#pass-{{ p.id }}"
+            hx-swap="outerHTML">
+        <label>known mph:
+          <input type="number" name="known_mph" step="0.1" min="0" max="200"
+                 value="{{ p.known_mph if p.known_mph is not none else '' }}">
+        </label>
+        <button type="submit">save</button>
+        <button type="button" onclick="this.closest('.known-input-wrap').classList.add('hidden')">cancel</button>
+      </form>
+    </div>
+
+    <div class="video-wrap hidden"></div>
+  </article>
+{% endif %}

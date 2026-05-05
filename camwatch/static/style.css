@@ -149,7 +149,7 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   display: grid;
   grid-template-columns: auto 130px 1fr auto;
   grid-template-areas:
-    "select thumb meta kebab"
+    "select thumb meta actions"
     "select thumb known known"
     "select thumb video video";
   gap: 12px;
@@ -163,6 +163,62 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
 .pass-row.alert {
   background: var(--alert-bg);
   border-color: var(--alert);
+}
+
+.row-actions {
+  grid-area: actions;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.quick-delete {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.quick-delete:hover {
+  color: var(--alert);
+  border-color: var(--alert);
+  background: var(--alert-bg);
+}
+
+/* Deleted (soft) rows: minimized single-line view with a Revert button. */
+.pass-row.deleted {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 14px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  opacity: 0.6;
+}
+.pass-row.deleted .meta-min {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font-size: 13px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.pass-row.deleted .del-tag {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--alert);
+}
+.pass-row.deleted .dir {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .select-cell { grid-area: select; display: none; }

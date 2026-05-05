@@ -56,6 +56,7 @@ def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict
     mph = computed_mph(p, dist_n, dist_s)
     return {
         "id": p.id,
+        "deleted": p.deleted,
         "captured_at": p.captured_at,
         "direction": p.direction,
         "elapsed_s": p.elapsed_s,
@@ -193,6 +194,24 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
             headers={"HX-Trigger": "passes-changed"},
         )
 
+    @app.post("/passes/{pass_id}/delete", response_class=HTMLResponse)
+    async def delete_one(request: Request, pass_id: int):
+        p = db.get_pass(pass_id)
+        if p is None:
+            raise HTTPException(status_code=404)
+        db.soft_delete([pass_id])
+        recompute_calibration(cfg, db)
+        return _render_pass_row(request, cfg, db, pass_id)
+
+    @app.post("/passes/{pass_id}/restore", response_class=HTMLResponse)
+    async def restore_one(request: Request, pass_id: int):
+        p = db.get_pass(pass_id)
+        if p is None:
+            raise HTTPException(status_code=404)
+        db.restore([pass_id])
+        recompute_calibration(cfg, db)
+        return _render_pass_row(request, cfg, db, pass_id)
+
     @app.get("/passes/{pass_id}/clip")
     async def get_clip(pass_id: int):
         p = db.get_pass(pass_id)
@@ -287,7 +306,10 @@ def _render_index(request: Request, cfg: Config, db: Database):
     dist_n = cal.line_distance_m_north if cal else 0
     dist_s = cal.line_distance_m_south if cal else 0
     threshold = cfg.alert_threshold_mph
-    rows = [render_pass(p, dist_n, dist_s, threshold) for p in db.list_passes(limit=200)]
+    rows = [
+        render_pass(p, dist_n, dist_s, threshold)
+        for p in db.list_passes(limit=200, include_deleted=True)
+    ]
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
@@ -318,6 +340,7 @@ def _render_pass_list(
         line_distance_m_north=dist_n,
         line_distance_m_south=dist_s,
         limit=200,
+        include_deleted=True,
     )
     rows = [render_pass(p, dist_n, dist_s, threshold) for p in passes]
     return TEMPLATES.TemplateResponse(request, "_pass_list.html", {"rows": rows})

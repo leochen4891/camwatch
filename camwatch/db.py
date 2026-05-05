@@ -133,6 +133,17 @@ class Database:
             )
             return cur.rowcount
 
+    def restore(self, ids: list[int]) -> int:
+        if not ids:
+            return 0
+        with self.connect() as conn:
+            placeholders = ",".join("?" * len(ids))
+            cur = conn.execute(
+                f"UPDATE passes SET deleted = 0 WHERE id IN ({placeholders})",
+                [int(i) for i in ids],
+            )
+            return cur.rowcount
+
     # ---------- reads ----------
 
     def list_passes(
@@ -143,11 +154,12 @@ class Database:
         threshold_mph: float | None = None,
         line_distance_m_north: float | None = None,
         line_distance_m_south: float | None = None,
+        include_deleted: bool = False,
     ) -> list[Pass]:
-        sql = "SELECT * FROM passes WHERE deleted = 0"
+        sql = "SELECT * FROM passes" if include_deleted else "SELECT * FROM passes WHERE deleted = 0"
         params: list[Any] = []
         if direction in ("N", "S"):
-            sql += " AND direction = ?"
+            sql += (" AND " if "WHERE" in sql else " WHERE ") + "direction = ?"
             params.append(direction)
         sql += " ORDER BY captured_at DESC LIMIT ?"
         params.append(int(limit))

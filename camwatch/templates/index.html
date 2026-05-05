@@ -119,14 +119,6 @@
       document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
     }
 
-    async function deleteOne(passId) {
-      if (!confirm("Delete this pass?")) return;
-      const fd = new FormData();
-      fd.append("ids", passId);
-      await fetch("/passes/delete", { method: "POST", body: fd });
-      htmx.trigger("#filter-form", "change");
-    }
-
     function togglePreview() {
       const frame = document.getElementById("preview-frame");
       const img = document.getElementById("preview-img");
