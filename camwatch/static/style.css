@@ -78,6 +78,38 @@ header {
 }
 .muted-btn:hover { border-color: var(--accent); }
 
+.preview-section {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.preview-header h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.preview-frame {
+  display: flex;
+  justify-content: center;
+}
+.preview-frame img {
+  display: block;
+  width: 100%;
+  max-width: 960px;
+  height: auto;
+  background: black;
+  border-radius: 4px;
+}
+
 .controls {
   display: flex;
   flex-wrap: wrap;

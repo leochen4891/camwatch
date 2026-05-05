@@ -8,6 +8,7 @@ The capture worker is started in the lifespan handler and joined on shutdown.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -15,13 +16,14 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .capture_worker import CaptureWorker
 from .config import Config, load_config
 from .db import Database, Pass
+from .preview import PreviewBuffer
 
 log = logging.getLogger(__name__)
 
@@ -106,13 +108,16 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
     cfg = cfg or load_config()
     db = Database(db_path)
 
+    preview = PreviewBuffer()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        worker = CaptureWorker(cfg, db)
+        worker = CaptureWorker(cfg, db, preview=preview)
         worker.start()
         app.state.worker = worker
         app.state.cfg = cfg
         app.state.db = db
+        app.state.preview = preview
         log.info("server startup complete")
         try:
             yield
@@ -185,6 +190,47 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
         if not thumb_path.exists():
             raise HTTPException(status_code=404)
         return FileResponse(thumb_path, media_type="image/jpeg")
+
+    @app.get("/preview.jpg")
+    async def get_preview_frame():
+        latest = preview.get_latest()
+        if latest is None:
+            raise HTTPException(status_code=503, detail="preview not ready")
+        _, jpeg = latest
+        return Response(content=jpeg, media_type="image/jpeg")
+
+    @app.get("/preview/stream")
+    async def get_preview_stream():
+        boundary = b"--frame"
+
+        async def gen():
+            last_id = 0
+            while True:
+                # 5s timeout so a stalled stream still emits a keepalive frame.
+                result = await asyncio.to_thread(preview.wait_for_next, last_id, 5.0)
+                if result is None:
+                    cached = preview.get_latest()
+                    if cached is None:
+                        await asyncio.sleep(0.2)
+                        continue
+                    last_id, jpeg = cached
+                else:
+                    last_id, jpeg = result
+                chunk = (
+                    boundary
+                    + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(jpeg)).encode()
+                    + b"\r\n\r\n"
+                    + jpeg
+                    + b"\r\n"
+                )
+                yield chunk
+
+        return StreamingResponse(
+            gen(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/calibration/threshold", response_class=HTMLResponse)
     async def set_threshold(request: Request, threshold_mph: float = Form(...)):

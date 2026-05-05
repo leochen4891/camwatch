@@ -17,6 +17,7 @@ from .config import Config
 from .crossing import CrossingDetector
 from .db import Database
 from .detect import Detector
+from .preview import PreviewBuffer
 from .recorder import ClipRecorder
 
 log = logging.getLogger(__name__)
@@ -28,11 +29,13 @@ class CaptureWorker(threading.Thread):
         cfg: Config,
         db: Database,
         recordings_dir: Path = Path("recordings"),
+        preview: PreviewBuffer | None = None,
     ) -> None:
         super().__init__(name="capture-worker", daemon=True)
         self._cfg = cfg
         self._db = db
         self._recordings_dir = Path(recordings_dir)
+        self._preview = preview
         self._stop_evt = threading.Event()
         self._stream: RtspStream | None = None
         self._error: BaseException | None = None
@@ -80,6 +83,8 @@ class CaptureWorker(threading.Thread):
             line_b_x=cal.line_b_x,
             max_track_age_s=self._cfg.max_track_age_s,
         )
+        if self._preview is not None:
+            self._preview.configure(cal.roi, cal.line_a_x, cal.line_b_x)
 
         try:
             for fr in self._stream.frames():
@@ -87,6 +92,8 @@ class CaptureWorker(threading.Thread):
                     break
                 tracks = det.track(fr.image)
                 recorder.push(fr.image, fr.ts, tracks)
+                if self._preview is not None:
+                    self._preview.update(fr.image, tracks)
                 events = crossing.update(tracks, fr.ts)
                 for ev in events:
                     captured_at = datetime.now().astimezone()

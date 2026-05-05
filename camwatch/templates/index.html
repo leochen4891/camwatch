@@ -18,6 +18,16 @@
     </div>
   </header>
 
+  <section class="preview-section">
+    <div class="preview-header">
+      <h2>Live preview</h2>
+      <button type="button" class="muted-btn" id="preview-toggle" onclick="togglePreview()">hide</button>
+    </div>
+    <div class="preview-frame" id="preview-frame">
+      <img src="/preview/stream" alt="live preview" id="preview-img">
+    </div>
+  </section>
+
   <section class="controls">
     <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form">
       <label>direction
@@ -115,6 +125,23 @@
       fd.append("ids", passId);
       await fetch("/passes/delete", { method: "POST", body: fd });
       htmx.trigger("#filter-form", "change");
+    }
+
+    function togglePreview() {
+      const frame = document.getElementById("preview-frame");
+      const img = document.getElementById("preview-img");
+      const btn = document.getElementById("preview-toggle");
+      const hidden = frame.classList.toggle("hidden");
+      btn.textContent = hidden ? "show" : "hide";
+      // Detach src when hidden so we stop pulling MJPEG bytes.
+      if (hidden) {
+        img.dataset.src = img.src;
+        img.removeAttribute("src");
+      } else if (img.dataset.src) {
+        img.src = img.dataset.src;
+      } else {
+        img.src = "/preview/stream";
+      }
     }
   </script>
 </body>

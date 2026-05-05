@@ -139,8 +139,15 @@ class ClipRecorder:
         return cv2.resize(frame, (new_w, new_h))
 
     def _finalize(self, clip: _ActiveClip) -> None:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # Try H.264 (avc1) first; modern browsers play it natively. Fall back to
+        # MPEG-4 Part 2 (mp4v) if the OpenCV build doesn't ship libx264 — Chrome
+        # won't play those, but at least the file is on disk for ffplay/VLC.
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
         writer = cv2.VideoWriter(clip.path, fourcc, self._fps, self._size)
+        if not writer.isOpened():
+            log.warning("avc1 fourcc not available, falling back to mp4v at %s", clip.path)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(clip.path, fourcc, self._fps, self._size)
         if not writer.isOpened():
             log.warning("clip writer failed to open at %s", clip.path)
             return
@@ -154,30 +161,68 @@ class ClipRecorder:
         log.debug("clip closed: %s (%d frames)", clip.path, len(clip.frames))
 
     def _write_thumbnail(self, clip: _ActiveClip, rendered: list[np.ndarray]) -> None:
-        """Save a 320px-wide JPEG of the frame closest to the midpoint between
-        the two crossings. Uses the already-rendered overlay frames so it
-        matches the mp4 visually."""
+        """Save a JPEG cropped tight to the focus car so it's identifiable in
+        the list view. Falls back to a downscale of the mid-crossing frame if
+        the focus track has no detection in the rendered range."""
         if not rendered:
             return
-        # Find the frame whose ts is closest to (t_a + t_b) / 2.
         midpoint = (clip.t_a + clip.t_b) / 2.0
-        best_idx = 0
-        best_diff = float("inf")
+
+        # Find the rec closest to midpoint where the focus track is detected.
+        best_with_focus: tuple[float, int, tuple[float, float, float, float]] | None = None
+        best_any: tuple[float, int] = (float("inf"), 0)
         for i, rec in enumerate(clip.frames):
-            d = abs(rec.ts - midpoint)
-            if d < best_diff:
-                best_diff = d
-                best_idx = i
-        frame = rendered[best_idx]
-        h, w = frame.shape[:2]
+            diff = abs(rec.ts - midpoint)
+            if diff < best_any[0]:
+                best_any = (diff, i)
+            for d in rec.detections:
+                if getattr(d, "track_id", None) == clip.focus_track_id:
+                    bbox = getattr(d, "bbox", None)
+                    if bbox is not None:
+                        if best_with_focus is None or diff < best_with_focus[0]:
+                            best_with_focus = (diff, i, bbox)
+                    break
+
         target_w = 320
-        if w > target_w:
-            scale = target_w / w
-            thumb = cv2.resize(frame, (target_w, int(round(h * scale))))
+        if best_with_focus is not None:
+            _, idx, bbox = best_with_focus
+            frame = rendered[idx]
+            fh, fw = frame.shape[:2]
+            s = self._scale
+            bx1, by1, bx2, by2 = (v * s for v in bbox)
+            bw = bx2 - bx1
+            bh = by2 - by1
+            # Pad ~50% horizontally and vertically. Floor at sensible minimums
+            # so a small/distant car still gets enough frame around it.
+            pad_x = max(bw * 0.6, 40)
+            pad_y = max(bh * 0.7, 40)
+            cx1 = max(0, int(round(bx1 - pad_x)))
+            cy1 = max(0, int(round(by1 - pad_y)))
+            cx2 = min(fw, int(round(bx2 + pad_x)))
+            cy2 = min(fh, int(round(by2 + pad_y)))
+            if cx2 - cx1 < 80 or cy2 - cy1 < 60:
+                # Bbox effectively missing. Fall back.
+                thumb = self._fallback_thumb(rendered[best_any[1]], target_w)
+            else:
+                thumb = frame[cy1:cy2, cx1:cx2]
+                # Resize to target width while preserving aspect.
+                th, tw = thumb.shape[:2]
+                if tw != target_w:
+                    scale = target_w / tw
+                    thumb = cv2.resize(thumb, (target_w, max(1, int(round(th * scale)))))
         else:
-            thumb = frame
-        thumb_path = clip.path.replace(".mp4", ".jpg") if clip.path.endswith(".mp4") else clip.path + ".jpg"
-        cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            thumb = self._fallback_thumb(rendered[best_any[1]], target_w)
+
+        thumb_path = clip.path[:-4] + ".jpg" if clip.path.endswith(".mp4") else clip.path + ".jpg"
+        cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 82])
+
+    @staticmethod
+    def _fallback_thumb(frame: np.ndarray, target_w: int) -> np.ndarray:
+        h, w = frame.shape[:2]
+        if w <= target_w:
+            return frame
+        scale = target_w / w
+        return cv2.resize(frame, (target_w, int(round(h * scale))))
 
     def _render(self, rec: _FrameRec, clip: _ActiveClip) -> np.ndarray:
         img = rec.image.copy()
