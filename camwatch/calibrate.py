@@ -394,6 +394,70 @@ def cmd_report(cfg) -> None:
               f"{p.known_mph:>7.1f}  {pred:>7.1f}  {err:>+6.1f}")
 
 
+# ---------- freeze / restore ----------
+
+def cmd_freeze(cfg) -> None:
+    """Snapshot all DB passes that have known_mph set into calibration.yaml.
+
+    Survives DB clears. Use `restore` to recreate the rows if the DB is later
+    wiped. Replaces any existing `calibration_points` list in the YAML.
+    """
+    db = Database()
+    annotated = [p for p in db.list_passes(limit=10000) if p.known_mph is not None]
+    if not annotated:
+        print("no annotated passes in DB to freeze")
+        return
+    points = [
+        {
+            "direction": p.direction,
+            "known_mph": float(p.known_mph),
+            "elapsed_s": float(p.elapsed_s),
+            "captured_at": p.captured_at,
+            "track_id": int(p.track_id),
+            "cls_name": p.cls_name,
+            "clip_path": p.clip_path,
+        }
+        for p in annotated
+    ]
+    data = _load_yaml(cfg.calibration_path)
+    data["calibration_points"] = points
+    _save_yaml(cfg.calibration_path, data)
+    print(f"froze {len(points)} calibration points to {cfg.calibration_path}")
+
+
+def cmd_restore(cfg) -> None:
+    """Recreate DB passes from `calibration_points` in calibration.yaml.
+
+    Skips entries whose (track_id, captured_at) already exists in the DB so
+    the command is idempotent.
+    """
+    data = _load_yaml(cfg.calibration_path)
+    points = data.get("calibration_points") or []
+    if not points:
+        print(f"no calibration_points found in {cfg.calibration_path}")
+        return
+
+    db = Database()
+    existing = {(p.track_id, p.captured_at) for p in db.list_passes(limit=10000)}
+    n_new = n_skip = 0
+    for pt in points:
+        key = (int(pt["track_id"]), pt["captured_at"])
+        if key in existing:
+            n_skip += 1
+            continue
+        pid = db.insert_pass(
+            captured_at=pt["captured_at"],
+            track_id=int(pt["track_id"]),
+            cls_name=pt.get("cls_name"),
+            direction=pt["direction"],
+            elapsed_s=float(pt["elapsed_s"]),
+            clip_path=pt.get("clip_path"),
+        )
+        db.set_known_mph(pid, float(pt["known_mph"]))
+        n_new += 1
+    print(f"restore: inserted {n_new}, skipped {n_skip} already-present")
+
+
 # ---------- entry ----------
 
 def main(argv: list[str] | None = None) -> int:
@@ -408,6 +472,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("annotate")
     sub.add_parser("compute")
     sub.add_parser("report")
+    sub.add_parser("freeze")
+    sub.add_parser("restore")
     args = parser.parse_args(argv)
 
     cfg = load_config()
@@ -421,6 +487,10 @@ def main(argv: list[str] | None = None) -> int:
         cmd_annotate(cfg)
     elif args.cmd == "compute":
         cmd_compute(cfg)
+    elif args.cmd == "freeze":
+        cmd_freeze(cfg)
+    elif args.cmd == "restore":
+        cmd_restore(cfg)
     elif args.cmd == "report":
         cmd_report(cfg)
     return 0
