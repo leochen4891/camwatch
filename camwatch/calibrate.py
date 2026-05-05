@@ -213,7 +213,6 @@ def cmd_pick_roi(cfg) -> None:
         f"saved ROI ({roi_x1}, {roi_y1}) -> ({roi_x2}, {roi_y2}) "
         f"= {roi_x2 - roi_x1} x {roi_y2 - roi_y1} px to {cfg.calibration_path}"
     )
-    print(f"saved line_a_x={line_a_x} line_b_x={line_b_x} to {cfg.calibration_path}")
 
 
 # ---------- capture ----------
