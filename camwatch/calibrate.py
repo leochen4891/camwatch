@@ -154,11 +154,11 @@ def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
         return time.monotonic() >= deadline
 
     for fr in cap.frames():
-        recorder.push(fr.image)
         if stop_at_deadline():
             cap.stop()
             break
         tracks = det.track(fr.image)
+        recorder.push(fr.image, fr.ts, tracks)
         for tr in tracks:
             x = tr.ground_point[0]
             st = state.setdefault(tr.track_id, {
@@ -180,7 +180,14 @@ def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
                     captured_at = datetime.now().astimezone()
                     stamp = captured_at.strftime("%Y%m%dT%H%M%S")
                     clip_name = f"cal_{stamp}_id{tr.track_id}_{direction}.mp4"
-                    clip_path = recorder.trigger(clip_name)
+                    clip_path = recorder.trigger(
+                        name=clip_name,
+                        focus_track_id=tr.track_id,
+                        line_a_x=line_a,
+                        line_b_x=line_b,
+                        t_a=st["t_a"],
+                        t_b=st["t_b"],
+                    )
                     p = {
                         "captured_at": captured_at.isoformat(timespec="seconds"),
                         "track_id": tr.track_id,

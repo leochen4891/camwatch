@@ -166,7 +166,12 @@ uv run python -m camwatch.calibrate capture --secs 600
 ```
 
 Watches the live stream for 600 seconds. For every car that crosses both lines, the tool:
-1. Records a short mp4 clip into `recordings/cal_<timestamp>_id<id>_<dir>.mp4` (~3.5 sec, downscaled to 1280px wide), covering ~2 sec before line A through ~1.5 sec after line B.
+1. Records a short mp4 clip into `recordings/cal_<timestamp>_id<id>_<dir>.mp4` (~3.5 sec, downscaled to 1280px wide), covering ~2 sec before line A through ~1.5 sec after line B. The clip is rendered with a debugging overlay:
+   - both vertical lines (line A in green, line B in blue), drawn dim before the focus car has crossed them and bright after, with the crossing timestamp labelled next to each
+   - the focus car's bounding box in red, with `id=N` label, plus a red dot at its `ground_point` (bbox bottom-center, the feature the speed math anchors to)
+   - any other detected cars in the frame in gray (faint bbox + small dot), so you can see when the tracker confused two cars
+   - a top header strip with the focus track ID and the total span (`B - A`)
+   - a bottom strip with `t = +X.XXXs (relative to line A)`, so you can scrub the clip and see exactly when each crossing fires
 2. Prints a line including the wall-clock time and the clip name.
 3. Appends a `passes:` entry to `calibration.yaml`.
 
