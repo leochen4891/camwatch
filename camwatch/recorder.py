@@ -47,6 +47,7 @@ class _ActiveClip:
     line_b_x: int  # in scaled coords
     t_a: float
     t_b: float
+    speed_mph: float | None = None
 
 
 _GRAY = (180, 180, 180)
@@ -101,6 +102,7 @@ class ClipRecorder:
         line_b_x: int,
         t_a: float,
         t_b: float,
+        speed_mph: float | None = None,
     ) -> str:
         if self._size is None:
             raise RuntimeError("trigger() called before any frames were pushed")
@@ -114,6 +116,7 @@ class ClipRecorder:
             line_b_x=int(round(line_b_x * self._scale)),
             t_a=t_a,
             t_b=t_b,
+            speed_mph=speed_mph,
         )
         self._active.append(clip)
         return path
@@ -256,12 +259,14 @@ class ClipRecorder:
                 cv2.rectangle(img, (x1, y1), (x2, y2), _RED, 2)
                 cv2.circle(img, (gx, gy), 6, _RED, -1)
                 cv2.circle(img, (gx, gy), 6, _WHITE, 1)
-                _stamp(img, f"id={tid}", (x1, max(15, y1 - 6)), _RED, scale=0.6, thickness=2)
+                if clip.speed_mph is not None:
+                    label = f"{clip.speed_mph:.0f} mph"
+                else:
+                    label = f"{(clip.t_b - clip.t_a):.2f}s"
+                _stamp(img, label, (x1, max(15, y1 - 6)), _RED, scale=0.6, thickness=2)
             else:
                 cv2.rectangle(img, (x1, y1), (x2, y2), _GRAY, 1)
                 cv2.circle(img, (gx, gy), 3, _GRAY, -1)
-                if tid is not None:
-                    _stamp(img, f"id={tid}", (x1, max(12, y1 - 4)), _GRAY, scale=0.4, thickness=1)
 
         # Header (top): focus id + total span
         span = clip.t_b - clip.t_a

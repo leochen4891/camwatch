@@ -125,6 +125,13 @@ class CaptureWorker(threading.Thread):
                     captured_at = datetime.now().astimezone()
                     stamp = captured_at.strftime("%Y%m%dT%H%M%S")
                     clip_name = f"cal_{stamp}_id{ev.track_id}_{ev.direction}.mp4"
+                    distance = (
+                        cal.line_distance_m_north if ev.direction == "N"
+                        else cal.line_distance_m_south
+                    )
+                    speed_mph: float | None = None
+                    if distance > 0 and ev.elapsed_s > 0:
+                        speed_mph = (distance / ev.elapsed_s) * 2.2369362920544
                     clip_path = recorder.trigger(
                         name=clip_name,
                         focus_track_id=ev.track_id,
@@ -132,6 +139,7 @@ class CaptureWorker(threading.Thread):
                         line_b_x=cal.line_b_x,
                         t_a=ev.t_a,
                         t_b=ev.t_b,
+                        speed_mph=speed_mph,
                     )
                     pid = self._db.insert_pass(
                         captured_at=captured_at.isoformat(timespec="seconds"),
