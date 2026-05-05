@@ -185,10 +185,11 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
         from_ts: str | None = None,
         to_ts: str | None = None,
         buckets: list[int] = Query(default=[]),
+        page: int = 1,
     ):
         return _render_pass_list(
             request, cfg, db, direction, alerts_only,
-            from_ts=from_ts, to_ts=to_ts, selected_buckets=buckets,
+            from_ts=from_ts, to_ts=to_ts, selected_buckets=buckets, page=page,
         )
 
     @app.post("/passes/{pass_id}/annotate", response_class=HTMLResponse)
@@ -313,13 +314,32 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
         request: Request,
         threshold_mph: float = Form(...),
         show_lines: str | None = Form(default=None),
+        retention_days: int = Form(default=0),
     ):
-        # Threshold is persisted to config.yaml.
-        update_threshold(Path("config/config.yaml"), threshold_mph)
+        cfg_path = Path("config/config.yaml")
+        # Persist threshold and retention to config.yaml
+        with cfg_path.open() as f:
+            data = yaml.safe_load(f) or {}
+        data.setdefault("alert", {})["threshold_mph"] = float(threshold_mph)
+        data.setdefault("retention", {})["days"] = max(0, int(retention_days))
+        with cfg_path.open("w") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
         cfg.alert_threshold_mph = float(threshold_mph)
+        cfg.retention_days = max(0, int(retention_days))
         # Show-lines is runtime-only (resets on server restart). Unchecked
         # checkboxes don't post a value, so a missing field means False.
         preview.set_show_lines(show_lines is not None)
+        # Trigger an immediate retention sweep if enabled
+        if cfg.retention_days > 0:
+            n, clips = db.purge_older_than(cfg.retention_days)
+            for cp in clips:
+                try:
+                    Path(cp).unlink(missing_ok=True)
+                    Path(cp[:-4] + ".jpg").unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if n:
+                log.info("retention: purged %d passes on settings save", n)
         return _render_status_panel(request, cfg, db)
 
     @app.post("/calibration/recompute", response_class=HTMLResponse)
@@ -399,24 +419,34 @@ def _render_index(request: Request, cfg: Config, db: Database):
     threshold = cfg.alert_threshold_mph
     all_rows = [
         render_pass(p, dist_n, dist_s, threshold)
-        for p in db.list_passes(limit=200, include_deleted=True)
+        for p in db.list_passes(limit=10000, include_deleted=True)
     ]
     hist_rows = [r for r in all_rows if not r["deleted"]]
     histogram, hist_total = _build_histogram(hist_rows, threshold, set())
+    total_filtered = len(all_rows)
+    total_pages = max(1, (total_filtered + PAGE_SIZE - 1) // PAGE_SIZE)
+    rows = all_rows[:PAGE_SIZE]
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
         {
-            "rows": all_rows,
+            "rows": rows,
             "dist_n": dist_n,
             "dist_s": dist_s,
             "threshold": threshold,
+            "retention_days": cfg.retention_days,
             "known_count": len(cal.calibration_points) if cal else 0,
             "running": True,
             "histogram": histogram,
             "histogram_total": hist_total,
+            "page": 1,
+            "total_pages": total_pages,
+            "total_filtered": total_filtered,
         },
     )
+
+
+PAGE_SIZE = 100
 
 
 def _render_pass_list(
@@ -424,6 +454,7 @@ def _render_pass_list(
     direction: str | None, alerts_only: bool,
     from_ts: str | None = None, to_ts: str | None = None,
     selected_buckets: list[int] | None = None,
+    page: int = 1,
 ):
     cal = cfg.load_calibration()
     dist_n = cal.line_distance_m_north if cal else 0
@@ -431,26 +462,27 @@ def _render_pass_list(
     threshold = cfg.alert_threshold_mph
     direction = direction if direction in ("N", "S") else None
     selected_set: set[int] = set(selected_buckets or [])
-    passes = db.list_passes(
+    page = max(1, int(page or 1))
+
+    # Histogram needs the FULL filtered (by direction/alerts/time) set, not
+    # just the current page. Pull a wide list with a generous cap.
+    all_filtered = db.list_passes(
         direction=direction,
         alerts_only=alerts_only,
         threshold_mph=threshold,
         line_distance_m_north=dist_n,
         line_distance_m_south=dist_s,
-        limit=200,
+        limit=10000,
         include_deleted=True,
         from_ts=from_ts,
         to_ts=to_ts,
     )
-    rendered = [render_pass(p, dist_n, dist_s, threshold) for p in passes]
+    rendered_all = [render_pass(p, dist_n, dist_s, threshold) for p in all_filtered]
 
-    # Histogram is computed over non-deleted rows only, ignoring bucket filter.
-    hist_rows = [r for r in rendered if not r["deleted"]]
+    hist_rows = [r for r in rendered_all if not r["deleted"]]
     histogram, hist_total = _build_histogram(hist_rows, threshold, selected_set)
 
-    # List filter: if any bucket selected, keep only rows whose computed_mph
-    # falls in those buckets (deleted rows are kept regardless so revert is
-    # always possible).
+    # List filter: bucket selection narrows further (deleted rows pass through).
     if selected_set:
         def in_selected(r: dict) -> bool:
             if r["deleted"]:
@@ -459,7 +491,13 @@ def _render_pass_list(
             if mph is None:
                 return False
             return _bucket_for(mph) in selected_set
-        rendered = [r for r in rendered if in_selected(r)]
+        rendered_all = [r for r in rendered_all if in_selected(r)]
+
+    total_filtered = len(rendered_all)
+    total_pages = max(1, (total_filtered + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages)
+    start = (page - 1) * PAGE_SIZE
+    rendered = rendered_all[start:start + PAGE_SIZE]
 
     return TEMPLATES.TemplateResponse(
         request,
@@ -469,6 +507,9 @@ def _render_pass_list(
             "histogram": histogram,
             "histogram_total": hist_total,
             "include_oob_histogram": True,
+            "page": page,
+            "total_pages": total_pages,
+            "total_filtered": total_filtered,
         },
     )
 

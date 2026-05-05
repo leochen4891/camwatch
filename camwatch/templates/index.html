@@ -48,6 +48,15 @@
         </label>
       </section>
 
+      <section class="settings-section">
+        <h3>Storage retention</h3>
+        <p class="muted-text">Auto-delete passes (and their clips) older than this many days. <code>0</code> disables auto-deletion.</p>
+        <div class="setting-row">
+          <input type="number" name="retention_days" value="{{ retention_days }}" step="1" min="0" max="365">
+          <span>days</span>
+        </div>
+      </section>
+
       <div class="settings-footer">
         <button type="button" class="muted-btn"
                 onclick="document.getElementById('settings-dialog').close()">Cancel</button>
@@ -78,12 +87,8 @@
       <label class="checkbox"><input type="checkbox" name="alerts_only" value="true"> alerts only</label>
       <label>from <input type="datetime-local" name="from_ts"></label>
       <label>to <input type="datetime-local" name="to_ts"></label>
+      <input type="hidden" name="page" value="{{ page }}" id="page-input">
     </form>
-    <div class="actions">
-      <button type="button" id="select-toggle" onclick="toggleSelection()">Select…</button>
-      <button type="button" id="delete-btn" class="danger hidden" onclick="deleteSelected()">Delete selected</button>
-      <button type="button" id="cancel-btn" class="hidden" onclick="toggleSelection()">Cancel</button>
-    </div>
   </section>
 
   <section id="histogram" class="histogram-section"
@@ -101,28 +106,26 @@
   </main>
 
   <script>
-    let selectionMode = false;
-    function toggleSelection() {
-      selectionMode = !selectionMode;
-      document.body.classList.toggle("selection-mode", selectionMode);
-      document.getElementById("select-toggle").classList.toggle("hidden", selectionMode);
-      document.getElementById("delete-btn").classList.toggle("hidden", !selectionMode);
-      document.getElementById("cancel-btn").classList.toggle("hidden", !selectionMode);
-      if (!selectionMode) {
-        document.querySelectorAll('input[name="ids"]').forEach(cb => cb.checked = false);
-      }
-    }
-
-    async function deleteSelected() {
-      const ids = [...document.querySelectorAll('input[name="ids"]:checked')].map(cb => cb.value);
-      if (ids.length === 0) return;
-      if (!confirm(`Delete ${ids.length} pass${ids.length === 1 ? '' : 'es'}?`)) return;
-      const fd = new FormData();
-      ids.forEach(id => fd.append("ids", id));
-      await fetch("/passes/delete", { method: "POST", body: fd });
-      toggleSelection();
+    function goToPage(n) {
+      const input = document.getElementById("page-input");
+      if (!input) return;
+      input.value = String(Math.max(1, n));
       htmx.trigger("#filter-form", "change");
     }
+
+    // Reset to page 1 whenever a filter (other than page) changes.
+    document.addEventListener("DOMContentLoaded", () => {
+      const filterForm = document.getElementById("filter-form");
+      const histogram = document.getElementById("histogram");
+      const reset = () => {
+        const input = document.getElementById("page-input");
+        if (input) input.value = "1";
+      };
+      filterForm?.addEventListener("change", (e) => {
+        if (e.target && e.target.name && e.target.name !== "page") reset();
+      });
+      histogram?.addEventListener("change", reset);
+    });
 
     function toggleMenu(btn) {
       const menu = btn.nextElementSibling;
@@ -191,8 +194,7 @@
         event.target.closest(".row-actions") ||
         event.target.closest(".kebab-menu") ||
         event.target.closest(".known-input-wrap") ||
-        event.target.closest(".video-wrap") ||
-        event.target.closest(".select-cell")
+        event.target.closest(".video-wrap")
       ) {
         return;
       }

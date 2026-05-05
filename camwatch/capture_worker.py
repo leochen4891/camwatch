@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -105,11 +106,29 @@ class CaptureWorker(threading.Thread):
             self._preview.configure(cal.roi, cal.line_a_x, cal.line_b_x)
 
         self._stream = RtspStream(self._cfg.camera.rtsp_url)
+        last_purge = time.monotonic()
+        purge_interval_s = 3600.0  # check retention once an hour
 
         try:
             for fr in self._stream.frames():
                 if self._stop_evt.is_set():
                     break
+
+                # Periodic retention sweep.
+                if time.monotonic() - last_purge > purge_interval_s:
+                    last_purge = time.monotonic()
+                    days = int(self._cfg.retention_days or 0)
+                    if days > 0:
+                        n, clips = self._db.purge_older_than(days)
+                        for cp in clips:
+                            try:
+                                Path(cp).unlink(missing_ok=True)
+                                Path(cp[:-4] + ".jpg").unlink(missing_ok=True)
+                            except Exception as e:  # noqa: BLE001
+                                log.debug("retention: %s: %s", cp, e)
+                        if n:
+                            log.info("retention: purged %d passes older than %d days", n, days)
+
                 all_tracks = det.track(fr.image)
                 tracks = [t for t in all_tracks if _track_in_roi(t, cal.roi)]
 

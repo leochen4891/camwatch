@@ -13,4 +13,13 @@
   {% for row in rows %}
     {% include "_pass_row.html" %}
   {% endfor %}
+  {% if total_pages and total_pages > 1 %}
+    <nav class="paginator">
+      <button type="button" onclick="goToPage({{ page - 1 }})"
+              {% if page <= 1 %}disabled{% endif %}>← Prev</button>
+      <span class="muted">Page {{ page }} of {{ total_pages }} · {{ total_filtered }} matches</span>
+      <button type="button" onclick="goToPage({{ page + 1 }})"
+              {% if page >= total_pages %}disabled{% endif %}>Next →</button>
+    </nav>
+  {% endif %}
 {% endif %}

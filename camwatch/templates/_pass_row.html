@@ -22,10 +22,6 @@
 {% else %}
   <article class="pass-row {% if p.alert %}alert{% endif %}" id="pass-{{ p.id }}"
            onclick="rowClick(event, {{ p.id }})">
-    <label class="select-cell" onclick="event.stopPropagation()">
-      <input type="checkbox" name="ids" value="{{ p.id }}">
-    </label>
-
     <div class="thumb">
       {% if p.has_clip %}
         <img src="/passes/{{ p.id }}/thumb" alt="" loading="lazy">

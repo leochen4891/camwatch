@@ -144,6 +144,30 @@ class Database:
             )
             return cur.rowcount
 
+    def purge_older_than(self, days: int) -> tuple[int, list[str]]:
+        """Hard-delete passes older than `days` and return (count, removed_clip_paths)
+        so the caller can also clean up the clip + thumb files on disk."""
+        if days <= 0:
+            return 0, []
+        from datetime import datetime, timedelta, timezone
+        cutoff = (
+            datetime.now(timezone.utc).astimezone() - timedelta(days=days)
+        ).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            rows = list(conn.execute(
+                "SELECT id, clip_path FROM passes WHERE captured_at < ?",
+                (cutoff,),
+            ))
+            ids = [r["id"] for r in rows]
+            clip_paths = [r["clip_path"] for r in rows if r["clip_path"]]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"DELETE FROM passes WHERE id IN ({placeholders})",
+                    ids,
+                )
+            return len(ids), clip_paths
+
     # ---------- reads ----------
 
     def list_passes(
@@ -157,6 +181,7 @@ class Database:
         include_deleted: bool = False,
         from_ts: str | None = None,
         to_ts: str | None = None,
+        offset: int = 0,
     ) -> list[Pass]:
         sql = "SELECT * FROM passes" if include_deleted else "SELECT * FROM passes WHERE deleted = 0"
         params: list[Any] = []
@@ -169,8 +194,9 @@ class Database:
         if to_ts:
             sql += (" AND " if "WHERE" in sql else " WHERE ") + "captured_at <= ?"
             params.append(to_ts)
-        sql += " ORDER BY captured_at DESC LIMIT ?"
+        sql += " ORDER BY captured_at DESC LIMIT ? OFFSET ?"
         params.append(int(limit))
+        params.append(int(offset))
         with self.connect() as conn:
             rows = [Pass.from_row(r) for r in conn.execute(sql, params)]
 
@@ -207,6 +233,28 @@ class Database:
         sql += " ORDER BY captured_at"
         with self.connect() as conn:
             return [Pass.from_row(r) for r in conn.execute(sql, params)]
+
+    def count_passes(
+        self,
+        direction: str | None = None,
+        include_deleted: bool = True,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+    ) -> int:
+        sql = "SELECT COUNT(*) FROM passes" if include_deleted else "SELECT COUNT(*) FROM passes WHERE deleted = 0"
+        params: list[Any] = []
+        if direction in ("N", "S"):
+            sql += (" AND " if "WHERE" in sql else " WHERE ") + "direction = ?"
+            params.append(direction)
+        if from_ts:
+            sql += (" AND " if "WHERE" in sql else " WHERE ") + "captured_at >= ?"
+            params.append(from_ts)
+        if to_ts:
+            sql += (" AND " if "WHERE" in sql else " WHERE ") + "captured_at <= ?"
+            params.append(to_ts)
+        with self.connect() as conn:
+            (n,) = conn.execute(sql, params).fetchone()
+            return int(n)
 
     def count_known(self) -> int:
         with self.connect() as conn:

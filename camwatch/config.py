@@ -76,6 +76,7 @@ class Config:
     events_dir: Path
     calibration_path: Path
     max_track_age_s: float
+    retention_days: int = 0  # 0 = no auto-delete
 
     def load_calibration(self) -> CalibrationConfig | None:
         if not self.calibration_path.exists():
@@ -138,4 +139,5 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         events_dir=Path(raw["paths"]["events_dir"]),
         calibration_path=Path(raw["paths"]["calibration"]),
         max_track_age_s=float(raw["speed"]["max_track_age_s"]),
+        retention_days=int((raw.get("retention") or {}).get("days", 0) or 0),
     )

@@ -320,15 +320,34 @@ header {
 
 main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
 
+.paginator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 16px 0;
+}
+.paginator button {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.paginator button:hover:not(:disabled) { border-color: var(--accent); }
+.paginator button:disabled { opacity: 0.4; cursor: default; }
+
 .empty { color: var(--muted); text-align: center; padding: 40px; }
 
 .pass-row {
   display: grid;
-  grid-template-columns: auto 130px 1fr auto;
+  grid-template-columns: 130px 1fr auto;
   grid-template-areas:
-    "select thumb meta actions"
-    "select thumb known known"
-    "select thumb video video";
+    "thumb meta actions"
+    "thumb known known"
+    "thumb video video";
   gap: 12px;
   align-items: center;
   padding: 12px;
@@ -406,8 +425,6 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   font-weight: 600;
 }
 
-.select-cell { grid-area: select; display: none; }
-body.selection-mode .select-cell { display: block; }
 
 .thumb { grid-area: thumb; }
 .thumb img {
@@ -542,12 +559,12 @@ body.selection-mode .select-cell { display: block; }
 
 @media (max-width: 600px) {
   .pass-row {
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: 1fr auto;
     grid-template-areas:
-      "select thumb kebab"
-      "meta meta meta"
-      "known known known"
-      "video video video";
+      "thumb actions"
+      "meta meta"
+      "known known"
+      "video video";
   }
   .thumb img, .thumb-placeholder { width: 100%; height: auto; aspect-ratio: 4/3; }
   .meta { grid-template-columns: auto auto auto 1fr; }
