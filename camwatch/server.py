@@ -77,17 +77,39 @@ def update_threshold(cfg_path: Path, value: float) -> None:
 
 def recompute_calibration(cfg: Config, db: Database) -> tuple[float, float]:
     """Average implied distances per direction; rewrite calibration.yaml.
-    Returns (line_distance_m_north, line_distance_m_south)."""
-    by_dir: dict[str, list[float]] = {"N": [], "S": []}
-    for p in db.passes_with_known():
-        if p.elapsed_s <= 0:
-            continue
-        mps = float(p.known_mph) / MPS_TO_MPH
-        by_dir[p.direction].append(mps * p.elapsed_s)
 
+    Considers BOTH the DB's known passes AND any frozen `calibration_points`
+    in calibration.yaml (saved by `python -m camwatch.calibrate freeze`).
+    Frozen points are deduped against DB rows by (track_id, captured_at) so
+    a frozen point that's also still in the DB only counts once. This way
+    clearing the DB pass list never weakens the calibration as long as the
+    points were frozen first.
+
+    Returns (line_distance_m_north, line_distance_m_south)."""
     cal_path = cfg.calibration_path
     with cal_path.open() as f:
         cal = yaml.safe_load(f) or {}
+
+    by_dir: dict[str, list[float]] = {"N": [], "S": []}
+    seen: set[tuple] = set()
+
+    for pt in (cal.get("calibration_points") or []):
+        try:
+            elapsed = float(pt["elapsed_s"])
+            known = float(pt["known_mph"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if elapsed <= 0:
+            continue
+        seen.add((pt.get("track_id"), pt.get("captured_at")))
+        by_dir[pt["direction"]].append((known / MPS_TO_MPH) * elapsed)
+
+    for p in db.passes_with_known():
+        if (p.track_id, p.captured_at) in seen:
+            continue
+        if p.elapsed_s <= 0:
+            continue
+        by_dir[p.direction].append((float(p.known_mph) / MPS_TO_MPH) * p.elapsed_s)
 
     if by_dir["N"]:
         cal["line_distance_m_north"] = round(sum(by_dir["N"]) / len(by_dir["N"]), 3)

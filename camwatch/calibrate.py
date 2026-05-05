@@ -346,17 +346,34 @@ def cmd_annotate(cfg) -> None:
 
 def cmd_compute(cfg) -> None:
     db = Database()
-    annotated = [p for p in db.list_passes(limit=10000) if p.known_mph is not None]
-    if not annotated:
-        raise SystemExit("no annotated passes; run `annotate` first")
+    data = _load_yaml(cfg.calibration_path)
 
     by_dir: dict[str, list[float]] = {"N": [], "S": []}
-    for p in annotated:
-        mps = float(p.known_mph) / MPS_TO_MPH
-        implied = mps * float(p.elapsed_s)
-        by_dir.setdefault(p.direction, []).append(implied)
+    seen: set[tuple] = set()
+    # Frozen YAML points first (always count, survive DB clears).
+    for pt in (data.get("calibration_points") or []):
+        try:
+            elapsed = float(pt["elapsed_s"])
+            known = float(pt["known_mph"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if elapsed <= 0:
+            continue
+        seen.add((pt.get("track_id"), pt.get("captured_at")))
+        by_dir[pt["direction"]].append((known / MPS_TO_MPH) * elapsed)
+    # Then DB known passes (skip duplicates already in YAML).
+    for p in db.list_passes(limit=10000):
+        if p.known_mph is None:
+            continue
+        if (p.track_id, p.captured_at) in seen:
+            continue
+        if p.elapsed_s <= 0:
+            continue
+        by_dir[p.direction].append((float(p.known_mph) / MPS_TO_MPH) * p.elapsed_s)
 
-    data = _load_yaml(cfg.calibration_path)
+    if not by_dir["N"] and not by_dir["S"]:
+        raise SystemExit("no calibration data; annotate passes or freeze first")
+
     if by_dir["N"]:
         d = sum(by_dir["N"]) / len(by_dir["N"])
         data["line_distance_m_north"] = round(d, 3)
