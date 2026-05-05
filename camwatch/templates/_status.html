@@ -5,14 +5,6 @@
     &nbsp;|&nbsp;
     <span>S = {{ "%.2f m" | format(dist_s) if dist_s else "—" }}</span>
     &nbsp;<span class="muted">({{ known_count }} known {{ "point" if known_count == 1 else "points" }})</span>
+    &nbsp;<span class="muted">·</span>&nbsp;<span class="muted">threshold {{ threshold | int }} mph</span>
   </div>
-  <form class="threshold-form"
-        hx-post="/calibration/threshold"
-        hx-target="#status-panel"
-        hx-swap="innerHTML">
-    threshold:
-    <input type="number" name="threshold_mph" value="{{ threshold }}" step="1" min="1" max="200">
-    mph
-    <button type="submit">save</button>
-  </form>
 </div>

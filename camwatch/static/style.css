@@ -46,6 +46,81 @@ header {
   font-size: 13px;
   color: var(--green);
 }
+.settings-btn {
+  margin-left: auto;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.settings-btn:hover { color: var(--text); border-color: var(--accent); }
+.title-row { justify-content: flex-start; }
+
+/* Settings modal dialog */
+.settings-dialog {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0;
+  min-width: 320px;
+  max-width: 480px;
+  font-family: inherit;
+}
+.settings-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+.settings-header form { margin: 0; }
+.settings-section {
+  padding: 16px 18px;
+}
+.settings-section h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.muted-text {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.settings-section .threshold-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-section .threshold-form input[type="number"] {
+  width: 80px;
+}
+.settings-section .threshold-form button {
+  margin-left: auto;
+  background: var(--accent);
+  color: white;
+  border: 0;
+  padding: 6px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}
 
 #status-panel { margin-top: 8px; }
 .status {

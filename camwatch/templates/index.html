@@ -12,11 +12,33 @@
     <div class="title-row">
       <h1>camwatch</h1>
       <span class="status-badge" id="status">{% if running %}● live{% else %}○ idle{% endif %}</span>
+      <button type="button" class="settings-btn" title="Settings"
+              onclick="document.getElementById('settings-dialog').showModal()">⚙</button>
     </div>
     <div id="status-panel">
       {% include "_status.html" %}
     </div>
   </header>
+
+  <dialog id="settings-dialog" class="settings-dialog">
+    <div class="settings-header">
+      <h2>Settings</h2>
+      <form method="dialog"><button class="muted-btn" aria-label="close">✕</button></form>
+    </div>
+
+    <section class="settings-section">
+      <h3>Alert threshold</h3>
+      <p class="muted-text">Passes at or above this speed get the 🚨 marker in the list.</p>
+      <form class="threshold-form" id="threshold-form-settings"
+            hx-post="/calibration/threshold"
+            hx-target="#status-panel"
+            hx-swap="innerHTML">
+        <input type="number" name="threshold_mph" value="{{ threshold }}" step="1" min="1" max="200">
+        <span>mph</span>
+        <button type="submit">Save</button>
+      </form>
+    </section>
+  </dialog>
 
   <section class="preview-section">
     <div class="preview-header">
