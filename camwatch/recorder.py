@@ -313,14 +313,14 @@ class ClipRecorder:
             bg=True,
         )
 
-        # Footer (bottom): time relative to t_a. Kept short so it doesn't
-        # overlap the camera's burned-in OSD timestamp at bottom-center, which
-        # the verifier tool needs to read.
+        # Time relative to t_a, placed on a second line under the header so
+        # it doesn't overlap the camera's burned-in OSD at the bottom of the
+        # frame (the verifier tool needs to read those digits).
         rel_t = rec.ts - clip.t_a
         _stamp(
             img,
             f"t={rel_t:+.3f}s",
-            (10, h - 12),
+            (10, 46),
             _WHITE,
             scale=0.6,
             thickness=2,

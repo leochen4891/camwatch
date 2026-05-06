@@ -34,6 +34,15 @@ _TS_RE = re.compile(
 
 _OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789:/MONTUEWDFRISA"
 
+# Tesseract regularly confuses digit ↔ letter on the OSD's small font.
+# `O` for `0` is by far the most common (the day-of-week strings like MON/TUE
+# train Tesseract to expect Os near digits). `I`/`l` for `1`, `S` for `5`,
+# and `B` for `8` show up at lower thresholds. We collapse these before
+# regex parsing — the substitution can't hurt the date/time portion (it
+# only contains digits), and it can damage the day-of-week (e.g. MON → M0N)
+# but we don't read the day-of-week anyway.
+_DIGIT_FIXUPS = str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "S": "5", "B": "8"})
+
 
 def read_timestamp(
     frame: np.ndarray,
@@ -61,7 +70,8 @@ def read_timestamp(
         inv = cv2.bitwise_not(th)
         raw = pytesseract.image_to_string(inv, config=_OCR_CONFIG).strip()
         last_raw = raw
-        m = _TS_RE.search(raw.replace(" ", ""))
+        cleaned = raw.replace(" ", "").translate(_DIGIT_FIXUPS)
+        m = _TS_RE.search(cleaned)
         if not m:
             continue
         mo, da, yr, h, mi, se = (int(g) for g in m.groups())
