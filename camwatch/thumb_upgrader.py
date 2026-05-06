@@ -63,8 +63,13 @@ class _Job:
     sub_bbox: tuple[float, float, float, float]
     sub_frame_size: tuple[int, int]  # (w, h) of the sub-stream frame
     target_ts: float                  # sub-stream PTS-anchored monotonic ts at trigger
-    target_wallclock_unix: float      # unix seconds at trigger (for offset calibration)
+    target_wallclock_unix: float      # unix seconds at trigger (fallback when drift_sub_override is None)
     sub_epoch: int                    # sub-stream session epoch when ts was captured
+    # If set, overrides the (target_ts - target_wallclock_unix) computation
+    # of drift_sub. Carries the value capture_worker derived from a sub-
+    # stream OSD-tick — bias-free, unlike datetime.now() which includes the
+    # full sub-stream pipeline lag.
+    drift_sub_override: float | None = None
 
 
 class ThumbUpgrader:
@@ -140,6 +145,7 @@ class ThumbUpgrader:
         target_ts: float,
         target_wallclock: datetime,
         sub_epoch: int,
+        drift_sub_override: float | None = None,
     ) -> None:
         target_wallclock_unix = target_wallclock.timestamp()
         job = _Job(
@@ -151,6 +157,7 @@ class ThumbUpgrader:
             target_ts=target_ts,
             target_wallclock_unix=target_wallclock_unix,
             sub_epoch=sub_epoch,
+            drift_sub_override=drift_sub_override,
         )
         try:
             self._queue.put_nowait(job)
@@ -324,77 +331,115 @@ class ThumbUpgrader:
         )
         self._db.set_thumb_upgrade_status(job.pass_id, "ok")
 
-    def _calibrate_offset(self, job: _Job) -> float | None:
-        """Determine main_ts - sub_ts for the same camera-instant.
+    def _compute_drift_main_via_tick(self) -> float | None:
+        """Find the camera-instant of an OSD second-tick on the main stream
+        and use it to derive `drift_main = main_ts(tick) - tick_unix`.
 
-        Uses one OCR'd main frame plus the calling job's (target_ts,
-        target_wallclock_unix) pair. Strategy:
+        OCR'ing a single main frame gives only 1-second-resolution wallclock
+        (the OSD second the frame was captured in), so the derived drift has
+        ±0.5s error from a midpoint approximation. By scanning multiple
+        consecutive frames and finding two adjacent frames whose OSDs differ
+        by 1 second, we know the true OSD-tick (the camera-instant when the
+        next second begins) sits between their main_ts values. Using their
+        midpoint cuts the drift error to ~half a frame interval (~33ms at
+        15fps), which is plenty to land the matched frame on the right
+        camera-instant.
 
-          drift_main = main_ts(F) - wallclock_unix(F)   from OCR'd main frame F
-          drift_sub  = job.target_ts - job.target_wallclock_unix
-          offset     = drift_main - drift_sub  (= main_ts - sub_ts at same instant)
-
-        Both drifts are constants for the (sub_epoch, main_epoch) pair
-        under which they're computed; reconnect bumps an epoch and forces
-        a fresh calibration. Only main frames from the buffer's current
-        epoch are eligible — frames from a previous session live in a
-        different ts space. Returns None if no current-epoch frame is
-        OCR-readable yet (caller should retry on next job).
-        """
-        if self._buffer is None:
+        Returns None if not enough current-epoch frames OCR'd to clear the
+        wallclock sanity check, or if no OSD-tick was observed in the
+        scanned window. Caller should retry on the next job."""
+        if self._buffer is None or self._main_matcher is None:
             return None
-        latest = self._buffer.latest_indexed()
-        if latest is None:
-            return None
-        # Try OCR on the most recent main frames; ignore frames from prior
-        # epochs which don't share the current ts anchor.
         with self._buffer._lock:  # noqa: SLF001
             current_epoch = self._buffer._latest_epoch  # noqa: SLF001
             candidates = [
                 (ts, frame) for ts, epoch, frame in self._buffer._frames  # noqa: SLF001
                 if epoch == current_epoch
             ]
-        # Sanity-check the OCR result against the current wallclock. Even
-        # the template matcher can miss on heavily occluded OSDs (cars
-        # crossing under the timestamp band) and produce a wrong reading;
-        # the wallclock check rejects any datetime more than a minute from
-        # now so a bad reading can't poison the cached offset.
+        if len(candidates) < 2:
+            return None
+        # OCR each candidate (oldest → newest so consecutive pairs are
+        # naturally adjacent); apply wallclock sanity check on every read.
+        from datetime import datetime as _dt, timedelta as _td
+        now_local = _dt.now()
+        observed: list[tuple[float, "_dt"]] = []  # (main_ts, OSD_dt)
+        for main_ts, main_frame in candidates:
+            dt = self._main_matcher.read_timestamp(main_frame, _OSD_REGION_MAIN)
+            if dt is None:
+                continue
+            if abs(dt - now_local) > _td(seconds=60):
+                continue
+            observed.append((main_ts, dt))
+        if len(observed) < 2:
+            log.info(
+                "thumb upgrade: only %d OCR'd main frames, need >=2 for tick "
+                "calibration; will retry on next job", len(observed),
+            )
+            return None
+        # Sort by main_ts ascending (should already be, but defensive) and
+        # find the FIRST adjacent pair with a 1-second OSD jump.
+        observed.sort(key=lambda r: r[0])
+        for (ts_old, dt_old), (ts_new, dt_new) in zip(observed, observed[1:]):
+            delta_seconds = (dt_new - dt_old).total_seconds()
+            if delta_seconds == 1.0:
+                # Tick: dt_new began at camera-instant (ts_old + ts_new) / 2
+                # plus or minus half a frame interval.
+                tick_main_ts = (ts_old + ts_new) / 2.0
+                tick_wallclock_unix = dt_new.timestamp()
+                drift_main = tick_main_ts - tick_wallclock_unix
+                log.info(
+                    "thumb upgrade: drift_main=%+.3fs from tick %s→%s "
+                    "(ts_old=%.3f ts_new=%.3f gap=%.3fs)",
+                    drift_main, dt_old.strftime("%H:%M:%S"),
+                    dt_new.strftime("%H:%M:%S"),
+                    ts_old, ts_new, ts_new - ts_old,
+                )
+                return drift_main
+        # No tick observed across the buffered window. This happens when the
+        # buffer holds <1s of OCR-readable frames; caller will retry next
+        # time and the buffer will hold more by then.
+        log.info(
+            "thumb upgrade: no OSD-tick found across %d OCR'd main frames "
+            "(spans %.2fs); will retry on next job",
+            len(observed), observed[-1][0] - observed[0][0],
+        )
+        return None
+
+    def _calibrate_offset(self, job: _Job) -> float | None:
+        """Compute cross_stream_offset = drift_main - drift_sub.
+
+        drift_main is derived from an OSD second-tick observed in the main
+        buffer (precise camera-instant ±33ms).
+
+        drift_sub: prefer the bias-free value capture_worker derived from
+        a sub-stream OSD-tick (passed in `job.drift_sub_override`). Fall
+        back to (target_ts - target_wallclock_unix) only if the sub-stream
+        calibration hasn't completed yet — that fallback carries the full
+        sub-stream pipeline-lag bias (~2s) and will produce off-by-2s
+        matches, but it's better than no calibration at all and the next
+        trigger after sub calibration completes will recompute correctly.
+        """
         if self._main_matcher is None:
             log.warning(
                 "thumb upgrade: no DigitMatcher loaded; cannot calibrate offset"
             )
             return None
-        from datetime import datetime as _dt, timedelta as _td
-        now_local = _dt.now()
-        for main_ts, main_frame in reversed(candidates):
-            dt = self._main_matcher.read_timestamp(main_frame, _OSD_REGION_MAIN)
-            if dt is None:
-                continue
-            if abs(dt - now_local) > _td(seconds=60):
-                log.info(
-                    "thumb upgrade: OCR sanity check failed (osd=%s now=%s, "
-                    "Δ=%+.0fs); trying next frame",
-                    dt.strftime("%H:%M:%S"), now_local.strftime("%H:%M:%S"),
-                    (dt - now_local).total_seconds(),
-                )
-                continue
-            # OSD has 1-second resolution: when it shows "09:34:00", the
-            # actual frame capture wallclock is uniformly distributed in
-            # [09:34:00.000, 09:34:01.000). Use the midpoint as the
-            # unbiased wallclock estimate; without this correction the
-            # offset is biased ~+0.5s on average and worst-case +1s,
-            # which lands the matched main frame after the car has left.
-            wallclock_unix = dt.timestamp() + 0.5
-            drift_main = main_ts - wallclock_unix
+        drift_main = self._compute_drift_main_via_tick()
+        if drift_main is None:
+            return None
+        if job.drift_sub_override is not None:
+            drift_sub = job.drift_sub_override
+            drift_sub_source = "sub-tick"
+        else:
             drift_sub = job.target_ts - job.target_wallclock_unix
-            offset = drift_main - drift_sub
-            log.info(
-                "thumb upgrade: calibrated cross_stream_offset=%+.3fs "
-                "(drift_main=%.3f drift_sub=%.3f, OCR=%s+0.5)",
-                offset, drift_main, drift_sub, dt.strftime("%H:%M:%S"),
-            )
-            return offset
-        return None
+            drift_sub_source = "datetime.now() (BIASED)"
+        offset = drift_main - drift_sub
+        log.info(
+            "thumb upgrade: calibrated cross_stream_offset=%+.3fs "
+            "(drift_main=%.3f drift_sub=%.3f via %s)",
+            offset, drift_main, drift_sub, drift_sub_source,
+        )
+        return offset
 
     def _wait_until_matching_frame_available(
         self, target_ts: float, timeout_s: float

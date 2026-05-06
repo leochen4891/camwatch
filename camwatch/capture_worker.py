@@ -25,9 +25,15 @@ from .config import Config
 from .crossing import CrossingDetector
 from .db import Database
 from .detect import Detector, Track
+from .digit_matcher import DigitMatcher
 from .preview import PreviewBuffer
 from .recorder import ClipRecorder
 from .thumb_upgrader import ThumbUpgrader
+
+# OSD pixel rectangle on the Reolink E1 sub stream (640x480) with the OSD
+# at the bottom of the frame. Used only for the one-time per-epoch sub-
+# stream drift calibration.
+_OSD_REGION_SUB = (175, 452, 500, 477)
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +113,26 @@ class CaptureWorker(threading.Thread):
         self._error: BaseException | None = None
         self._recorder: ClipRecorder | None = None
         self._upgrader: ThumbUpgrader | None = None
+        # Sub-stream drift calibration state. drift_sub = sub_ts(T) - wallclock_unix(T)
+        # for any camera-instant T; constant within an RTSP session, but
+        # invalidates on reconnect. We learn it by OCR'ing live sub frames
+        # until we observe an OSD second-tick (consecutive frames with
+        # different OSD seconds), at which point the tick's camera-instant
+        # is known to ~half-a-frame-interval precision (~33ms at 15fps).
+        self._drift_sub: float | None = None
+        self._drift_sub_epoch: int = -1
+        # Sliding history of recent (sub_ts, OSD_dt) for tick detection.
+        # Cleared once drift_sub is established for the current epoch.
+        self._sub_ocr_history: list[tuple[float, datetime]] = []
+        try:
+            self._sub_matcher: DigitMatcher | None = DigitMatcher("templates/sub")
+        except (FileNotFoundError, ValueError) as e:
+            log.warning(
+                "sub-stream DigitMatcher disabled (%s); drift_sub will not "
+                "be calibrated and the upgrader's offset will retain its "
+                "datetime.now()-based pipeline-lag bias", e,
+            )
+            self._sub_matcher = None
 
     def update_clip_margin(self, seconds: float) -> None:
         """Apply a new pre/post-roll value to the running recorder, if any.
@@ -125,6 +151,65 @@ class CaptureWorker(threading.Thread):
             self._stream.stop()
         if self._upgrader is not None:
             self._upgrader.stop()
+
+    def _maybe_calibrate_sub_drift(self, fr) -> None:
+        """OCR the current sub-stream frame's OSD; if we observe an OSD
+        second-tick relative to the prior OCR'd frame, derive `drift_sub`
+        from the tick midpoint and cache it for this epoch.
+
+        The history list is reset on epoch change (RTSP reconnect) since
+        the new session has a fresh PTS anchor."""
+        if self._drift_sub_epoch != fr.epoch:
+            self._sub_ocr_history = []
+            self._drift_sub_epoch = fr.epoch
+            self._drift_sub = None
+            self._sub_calibration_attempts = 0
+            self._sub_calibration_failures = 0
+        assert self._sub_matcher is not None  # checked by caller
+        self._sub_calibration_attempts = getattr(
+            self, "_sub_calibration_attempts", 0
+        ) + 1
+        dt = self._sub_matcher.read_timestamp(fr.image, _OSD_REGION_SUB)
+        if dt is None:
+            self._sub_calibration_failures = getattr(
+                self, "_sub_calibration_failures", 0
+            ) + 1
+            # Log rate periodically so we know if OCR is broken on this stream.
+            if self._sub_calibration_attempts in (10, 30, 100, 300):
+                log.info(
+                    "sub-stream OCR: %d/%d failures so far during drift "
+                    "calibration on epoch %d",
+                    self._sub_calibration_failures,
+                    self._sub_calibration_attempts, fr.epoch,
+                )
+            return
+        # Sanity: reject any datetime far from now (template matcher does
+        # occasionally pick up junk on heavily occluded crops).
+        from datetime import datetime as _dt, timedelta as _td
+        if abs(dt - _dt.now()) > _td(seconds=60):
+            return
+        self._sub_ocr_history.append((fr.ts, dt))
+        # Keep memory bounded; we only need the most recent ~30 samples.
+        if len(self._sub_ocr_history) > 30:
+            self._sub_ocr_history.pop(0)
+        if len(self._sub_ocr_history) < 2:
+            return
+        ts_old, dt_old = self._sub_ocr_history[-2]
+        ts_new, dt_new = self._sub_ocr_history[-1]
+        delta_seconds = (dt_new - dt_old).total_seconds()
+        if delta_seconds != 1.0:
+            return
+        tick_sub_ts = (ts_old + ts_new) / 2.0
+        tick_wallclock_unix = dt_new.timestamp()
+        self._drift_sub = tick_sub_ts - tick_wallclock_unix
+        self._sub_ocr_history = []  # done; free the memory
+        log.info(
+            "sub-stream drift_sub=%+.3fs (epoch %d) from tick %s→%s "
+            "(ts_old=%.3f ts_new=%.3f gap=%.3fs)",
+            self._drift_sub, fr.epoch,
+            dt_old.strftime("%H:%M:%S"), dt_new.strftime("%H:%M:%S"),
+            ts_old, ts_new, ts_new - ts_old,
+        )
 
     def run(self) -> None:
         try:
@@ -220,6 +305,17 @@ class CaptureWorker(threading.Thread):
                     # this gap reflects the real consumer rate.
                     prof.record("interframe_gap", loop_t - last_loop_t)
                 last_loop_t = loop_t
+
+                # Sub-stream drift calibration (runs only when drift_sub is
+                # missing for the current epoch; once we observe an OSD-tick
+                # we cache the result and stop OCR'ing). OCR cost: ~10-20ms
+                # per frame via DigitMatcher; only active during the few
+                # frames it takes to span an OSD-tick (~1-2s after each
+                # session start).
+                if self._sub_matcher is not None and (
+                    self._drift_sub is None or self._drift_sub_epoch != fr.epoch
+                ):
+                    self._maybe_calibrate_sub_drift(fr)
 
                 t0 = time.perf_counter() if prof else 0.0
                 all_tracks = det.track(fr.image)
@@ -319,6 +415,7 @@ class CaptureWorker(threading.Thread):
                             _ts=target_ts,
                             _wc=target_wallclock,
                             _ep=target_sub_epoch,
+                            _drift_sub=self._drift_sub,
                             _holder=pid_holder,
                         ) -> None:
                             pid = _holder[0]
@@ -333,6 +430,7 @@ class CaptureWorker(threading.Thread):
                                 target_ts=_ts,
                                 target_wallclock=_wc,
                                 sub_epoch=_ep,
+                                drift_sub_override=_drift_sub,
                             )
 
                     clip_path = recorder.trigger(
