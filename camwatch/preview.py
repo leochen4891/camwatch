@@ -32,7 +32,7 @@ class PreviewBuffer:
         self._roi: tuple[int, int, int, int] | None = None
         self._line_a_x: int = 0
         self._line_b_x: int = 0
-        self._show_lines: bool = True
+        self._show_lines: bool = False
 
     def set_show_lines(self, show: bool) -> None:
         self._show_lines = bool(show)

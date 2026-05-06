@@ -332,12 +332,14 @@ class TimestampedFrameBuffer:
             ffmpeg_options="rtsp_transport;tcp",
             bufsize=None,
             log_label="main",
-            # 50-frame queue absorbs typical ffmpeg post-keyframe bursts
-            # (~30s of camera-time delivered in a few wallclock seconds at
-            # 4fps = ~120 frames produced; sample-by-camera-time downstream
-            # collapses adjacent frames so 50 is plenty of headroom for
-            # the consumer to drain without missing any).
-            queue_size=50,
+            # Generous queue to absorb worst-case ffmpeg post-keyframe
+            # bursts. Observed: ~35s of camera-time delivered in ~5
+            # wallclock seconds → 140 frames at 4fps. 200 leaves
+            # headroom in case a longer stall happens. Memory peak per
+            # frame at 2048x1536 is ~9.4MB, but the consumer drains
+            # ~1000× faster than the reader fills, so peak occupancy
+            # stays in the single digits except during a burst.
+            queue_size=200,
         )
         self._max_age = float(max_age_s)
         self._sample_interval = float(sample_interval_s)
