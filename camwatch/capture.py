@@ -28,15 +28,41 @@ from typing import Any
 # Set ffmpeg options before the first cv2.VideoCapture call. TCP transport
 # avoids UDP packet loss; nobuffer + low_delay tell ffmpeg to surface frames
 # as soon as they arrive instead of holding a multi-frame jitter buffer.
-os.environ.setdefault(
-    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay",
-)
+# This is the LIVE-CAPTURE default. Streams that don't need low latency
+# (like the thumb-upgrader's main-stream buffer) override at open time via
+# RtspStream(ffmpeg_options=...) — see _open_with_ffmpeg_options below.
+_LIVE_FFMPEG_OPTIONS = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", _LIVE_FFMPEG_OPTIONS)
 
 import cv2  # noqa: E402  (must come after the env var)
 import numpy as np  # noqa: E402
 
 log = logging.getLogger(__name__)
+
+# Lock around env-var-swap during cv2.VideoCapture() open. The FFmpeg
+# backend reads OPENCV_FFMPEG_CAPTURE_OPTIONS at open time, so we change
+# the env var, open, then restore. The lock keeps two threads opening
+# streams with different options from clobbering each other.
+_OPEN_LOCK = threading.Lock()
+
+
+def _open_with_ffmpeg_options(url: str, options: str | None) -> "cv2.VideoCapture":
+    """Open a VideoCapture with stream-specific ffmpeg options. If options
+    is None, uses whatever's already in OPENCV_FFMPEG_CAPTURE_OPTIONS
+    (i.e., the live-capture default)."""
+    if options is None:
+        return cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    with _OPEN_LOCK:
+        prior = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
+        try:
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        finally:
+            if prior is None:
+                os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+            else:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prior
+    return cap
 
 
 @dataclass
@@ -53,12 +79,24 @@ class RtspStream:
         url: str,
         reconnect_delay_s: float = 2.0,
         max_consecutive_read_failures: int = 30,
+        ffmpeg_options: str | None = None,
+        bufsize: int | None = 1,
     ) -> None:
         self._url = url
         self._reconnect_delay_s = reconnect_delay_s
         self._max_failures = max_consecutive_read_failures
         self._cap: cv2.VideoCapture | None = None
         self._stop = False
+        # ffmpeg_options is a string in OPENCV_FFMPEG_CAPTURE_OPTIONS format
+        # (e.g. "rtsp_transport;tcp|fflags;nobuffer"). None uses the
+        # process-wide default (low-latency). Pass a different string to
+        # opt out of low-latency mode for offline-ish consumers — the
+        # thumb upgrader does this so ffmpeg keeps decoded-frame backlogs
+        # rather than discarding all but the latest after a keyframe wait.
+        self._ffmpeg_options = ffmpeg_options
+        # bufsize → cv2.CAP_PROP_BUFFERSIZE. None skips the .set() call,
+        # leaving ffmpeg's default queue depth.
+        self._bufsize = bufsize
         # session_epoch increments on each reconnect (each new VideoCapture).
         # Frames yielded from the same RTSP session share an epoch, and that
         # epoch is the validity scope of their ts space — PTS is re-anchored
@@ -155,11 +193,17 @@ class RtspStream:
                 time.sleep(self._reconnect_delay_s)
 
     def _open(self) -> None:
-        log.info("stream: opening %s", _redact_url(self._url))
-        cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+        log.info(
+            "stream: opening %s (ffmpeg_opts=%s, bufsize=%s)",
+            _redact_url(self._url),
+            "default" if self._ffmpeg_options is None else "custom",
+            self._bufsize,
+        )
+        cap = _open_with_ffmpeg_options(self._url, self._ffmpeg_options)
         if not cap.isOpened():
             raise RuntimeError("cv2.VideoCapture failed to open stream")
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if self._bufsize is not None:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, self._bufsize)
         self._cap = cap
 
     def _close(self) -> None:
@@ -206,7 +250,22 @@ class TimestampedFrameBuffer:
         sample_interval_s: float = 0.25,
         name: str = "ts-stream",
     ) -> None:
-        self._stream = RtspStream(url)
+        # Open the main stream WITHOUT live-capture's nobuffer/low_delay
+        # flags. Empirically (scripts/probe_main_gaps.py), ffmpeg with
+        # nobuffer flags handles main-stream H.264 by waiting for an IDR
+        # then batch-decoding the queued P/B frames and surfacing only the
+        # latest — leaving multi-second gaps in the fr.ts values our buffer
+        # actually receives. Removing the flags has ffmpeg keep the
+        # decoded-frame backlog so cap.read() drains it one frame at a
+        # time. The upgrader is async w.r.t. the live trigger, so the
+        # extra latency this adds is acceptable.
+        # Also drop CAP_PROP_BUFFERSIZE=1 so ffmpeg's default frame queue
+        # depth (which absorbs short bursts) is in effect.
+        self._stream = RtspStream(
+            url,
+            ffmpeg_options="rtsp_transport;tcp",
+            bufsize=None,
+        )
         self._max_age = float(max_age_s)
         self._sample_interval = float(sample_interval_s)
         self._name = name
