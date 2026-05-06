@@ -310,12 +310,19 @@ class TimestampedFrameBuffer:
                 n_sampled = 0
 
     def _evict_locked(self, now: float) -> None:
-        # ts is monotonic-anchored, so age = now - ts. Drop the prefix that's
-        # too old — list is in insertion (== ts) order. Frames from a previous
-        # epoch are also dropped here as they age out: their ts isn't in the
-        # current epoch's space, but the prefix sweep doesn't care because
-        # those frames are necessarily older (by wall-clock) than current ones.
-        cutoff = now - self._max_age
+        # Anchor eviction to the buffer's own latest ts rather than to
+        # monotonic-now. ffmpeg/RTSP delivers frames with a variable
+        # pipeline lag (anywhere from 1s to 15s observed); using
+        # monotonic-now as the cutoff causes the buffer's ts coverage to
+        # shrink dramatically during high-lag periods (because latest_ts
+        # is far behind monotonic-now, but eviction proceeds anyway,
+        # cutting into the older end of useful coverage). Anchoring to
+        # latest_ts gives stable "last N seconds of camera-time" coverage
+        # regardless of lag oscillation.
+        if not self._frames:
+            return
+        latest_ts = self._frames[-1][0]
+        cutoff = latest_ts - self._max_age
         i = 0
         for ts, _epoch, _frame in self._frames:
             if ts >= cutoff:
