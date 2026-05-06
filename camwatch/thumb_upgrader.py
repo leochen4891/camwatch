@@ -45,7 +45,7 @@ from .capture import TimestampedFrameBuffer
 from .config import ModelConfig
 from .db import Database
 from .detect import Detector
-from .ts_reader import read_timestamp
+from .digit_matcher import DigitMatcher
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +93,19 @@ class ThumbUpgrader:
         self._cross_stream_offset: float | None = None
         self._cached_sub_epoch: int = -1
         self._cached_main_epoch: int = -1
+        # Template-based OCR for the calibration step. Loaded once. The
+        # templates were collected from the main stream's OSD, so this
+        # matcher is specific to that stream's font/resolution.
+        try:
+            self._main_matcher: DigitMatcher | None = DigitMatcher("templates/main")
+        except (FileNotFoundError, ValueError) as e:
+            log.warning(
+                "DigitMatcher disabled (templates/main missing or invalid: %s); "
+                "calibration will silently fall back to no-OCR and offset will "
+                "stay None forever — collect templates first",
+                e,
+            )
+            self._main_matcher = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -341,15 +354,20 @@ class ThumbUpgrader:
                 (ts, frame) for ts, epoch, frame in self._buffer._frames  # noqa: SLF001
                 if epoch == current_epoch
             ]
-        # Sanity-check the OCR result against the current wallclock. Tesseract
-        # occasionally misreads digits in similar shapes (8↔6, 5↔3) and can
-        # produce a timestamp hours off, which would poison the cached offset.
-        # Reject any OCR'd datetime that's more than a minute from now and
-        # try the next candidate.
+        # Sanity-check the OCR result against the current wallclock. Even
+        # the template matcher can miss on heavily occluded OSDs (cars
+        # crossing under the timestamp band) and produce a wrong reading;
+        # the wallclock check rejects any datetime more than a minute from
+        # now so a bad reading can't poison the cached offset.
+        if self._main_matcher is None:
+            log.warning(
+                "thumb upgrade: no DigitMatcher loaded; cannot calibrate offset"
+            )
+            return None
         from datetime import datetime as _dt, timedelta as _td
         now_local = _dt.now()
         for main_ts, main_frame in reversed(candidates):
-            dt = read_timestamp(main_frame, _OSD_REGION_MAIN)
+            dt = self._main_matcher.read_timestamp(main_frame, _OSD_REGION_MAIN)
             if dt is None:
                 continue
             if abs(dt - now_local) > _td(seconds=60):
