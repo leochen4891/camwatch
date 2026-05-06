@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -81,12 +82,35 @@ class RtspStream:
         max_consecutive_read_failures: int = 30,
         ffmpeg_options: str | None = None,
         bufsize: int | None = 1,
+        log_label: str = "stream",
+        queue_size: int = 1,
     ) -> None:
         self._url = url
         self._reconnect_delay_s = reconnect_delay_s
         self._max_failures = max_consecutive_read_failures
         self._cap: cv2.VideoCapture | None = None
         self._stop = False
+        # queue_size controls the reader→consumer hand-off:
+        #   1  → single-slot semantics (always keep latest, drop older).
+        #        Right for live capture where freshness > completeness.
+        #   N  → bounded FIFO (deque(maxlen=N), oldest evicted on overflow).
+        #        Right for non-live consumers like the thumb upgrader, where
+        #        we want to retain every frame ffmpeg gives us during a
+        #        backlog burst — single-slot would silently drop ~120 of 140
+        #        burst frames since the consumer can't iterate fast enough.
+        if queue_size < 1:
+            raise ValueError("queue_size must be >= 1")
+        self._queue_size = queue_size
+        # Lightweight diagnostic. Counts every successful cap.read() at the
+        # earliest possible point — the inner reader thread, before any of
+        # our consumer-side filtering / sampling / single-slot logic. If
+        # this counter ticks at the camera's nominal fps, no frames are
+        # being lost between the camera and our cap.read() return; any
+        # apparent loss downstream is then caused by our wrapper code, not
+        # ffmpeg or the network. Periodically logged with `log_label` so
+        # sub and main can be compared side-by-side.
+        self._frames_read = 0
+        self._log_label = log_label
         # ffmpeg_options is a string in OPENCV_FFMPEG_CAPTURE_OPTIONS format
         # (e.g. "rtsp_transport;tcp|fflags;nobuffer"). None uses the
         # process-wide default (low-latency). Pass a different string to
@@ -121,9 +145,13 @@ class RtspStream:
             self._session_epoch += 1
             current_epoch = self._session_epoch
 
-            # Background reader fills a single-slot buffer with the latest frame.
-            latest: list[tuple[np.ndarray, float] | None] = [None]
-            latest_lock = threading.Lock()
+            # Background reader writes into a deque(maxlen=queue_size).
+            # With maxlen=1 this is identical to a single-slot keep-latest
+            # buffer; with maxlen>1 it's a bounded FIFO that evicts the
+            # oldest frame on overflow (the same automatic policy the deque
+            # gives us). Consumer drains every queued frame on each cycle.
+            latest_buf: "deque[tuple[np.ndarray, float]]" = deque(maxlen=self._queue_size)
+            buf_lock = threading.Lock()
             new_frame_evt = threading.Event()
             reader_stop = threading.Event()
             reader_failures = [0]
@@ -137,19 +165,23 @@ class RtspStream:
             # accurate inter-frame intervals; this is the load-bearing fix.
             def reader() -> None:
                 pts_offset: float | None = None
+                last_log_t = time.monotonic()
+                last_log_count = self._frames_read
+                last_log_pts: float | None = None
                 while not reader_stop.is_set() and not self._stop:
                     ok, image = cap.read()
                     if not ok:
                         reader_failures[0] += 1
                         if reader_failures[0] >= self._max_failures:
                             log.warning(
-                                "stream: %d consecutive read failures, reconnecting",
-                                reader_failures[0],
+                                "stream %s: %d consecutive read failures, reconnecting",
+                                self._log_label, reader_failures[0],
                             )
                             return
                         time.sleep(0.01)
                         continue
                     reader_failures[0] = 0
+                    self._frames_read += 1
                     pts_s = float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
                     if pts_s > 0:
                         # Re-anchor PTS (which is stream-relative) to the
@@ -161,8 +193,35 @@ class RtspStream:
                         ts = pts_s + pts_offset
                     else:
                         ts = time.monotonic()
-                    with latest_lock:
-                        latest[0] = (image, ts)
+                    # Periodic raw-rate diagnostic. fps_real = frames pulled
+                    # per wallclock second from cap.read(); fps_pts = how
+                    # fast camera-time advances per wallclock second. If
+                    # fps_real ≪ fps_pts we're getting bursts after gaps
+                    # (frames truly missed somewhere upstream of our read).
+                    # If fps_real ≈ fps_pts ≈ camera nominal fps, no loss.
+                    now = time.monotonic()
+                    if now - last_log_t >= 10.0:
+                        dt_wall = now - last_log_t
+                        dn = self._frames_read - last_log_count
+                        fps_real = dn / dt_wall
+                        if last_log_pts is not None and pts_s > 0:
+                            fps_pts = (pts_s - last_log_pts) / dt_wall
+                            log.info(
+                                "stream %s: raw read fps=%.2f, pts advance=%.2fx "
+                                "(total frames=%d in this session)",
+                                self._log_label, fps_real, fps_pts,
+                                self._frames_read,
+                            )
+                        else:
+                            log.info(
+                                "stream %s: raw read fps=%.2f (initial)",
+                                self._log_label, fps_real,
+                            )
+                        last_log_t = now
+                        last_log_count = self._frames_read
+                        last_log_pts = pts_s if pts_s > 0 else last_log_pts
+                    with buf_lock:
+                        latest_buf.append((image, ts))
                     new_frame_evt.set()
 
             reader_thread = threading.Thread(target=reader, name="rtsp-reader", daemon=True)
@@ -170,19 +229,26 @@ class RtspStream:
 
             try:
                 while not self._stop:
-                    if not new_frame_evt.wait(timeout=2.0):
-                        if not reader_thread.is_alive():
-                            break
+                    # Drain any frames the reader has queued. With queue_size=1
+                    # this returns 0 or 1 items (single-slot semantics); with
+                    # queue_size>1 it returns up to queue_size items in
+                    # arrival order. Yielding inside the lock is wrong (would
+                    # block the reader for the duration of the consumer's
+                    # work), so we copy out then yield.
+                    with buf_lock:
+                        items = list(latest_buf)
+                        latest_buf.clear()
+                    if not items:
+                        if not new_frame_evt.wait(timeout=2.0):
+                            if not reader_thread.is_alive():
+                                break
+                            continue
+                        new_frame_evt.clear()
                         continue
                     new_frame_evt.clear()
-                    with latest_lock:
-                        item = latest[0]
-                        latest[0] = None
-                    if item is None:
-                        continue
-                    image, ts = item
-                    seq += 1
-                    yield Frame(image=image, ts=ts, seq=seq, epoch=current_epoch)
+                    for image, ts in items:
+                        seq += 1
+                        yield Frame(image=image, ts=ts, seq=seq, epoch=current_epoch)
                     if not reader_thread.is_alive():
                         break
             finally:
@@ -265,6 +331,13 @@ class TimestampedFrameBuffer:
             url,
             ffmpeg_options="rtsp_transport;tcp",
             bufsize=None,
+            log_label="main",
+            # 50-frame queue absorbs typical ffmpeg post-keyframe bursts
+            # (~30s of camera-time delivered in a few wallclock seconds at
+            # 4fps = ~120 frames produced; sample-by-camera-time downstream
+            # collapses adjacent frames so 50 is plenty of headroom for
+            # the consumer to drain without missing any).
+            queue_size=50,
         )
         self._max_age = float(max_age_s)
         self._sample_interval = float(sample_interval_s)

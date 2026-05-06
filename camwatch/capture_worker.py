@@ -270,7 +270,7 @@ class CaptureWorker(threading.Thread):
             )
             self._upgrader.start()
 
-        self._stream = RtspStream(self._cfg.camera.rtsp_url)
+        self._stream = RtspStream(self._cfg.camera.rtsp_url, log_label="sub")
         last_purge = time.monotonic()
         purge_interval_s = 3600.0  # check retention once an hour
         prof = _StageTimer() if self._profile else None

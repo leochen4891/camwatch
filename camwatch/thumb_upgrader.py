@@ -52,7 +52,11 @@ log = logging.getLogger(__name__)
 # Pixel rectangle of the OSD timestamp on the Reolink E1 main stream
 # (2560x1920) with the OSD at bottom-center. Used only for the one-time
 # cross-stream offset calibration.
-_OSD_REGION_MAIN = (700, 1810, 2000, 1910)
+# Main resolution is 2048x1536 (4:3). OSD timestamp spans roughly
+# x=657..1360 in the bottom band (auto-detected from bright-pixel runs).
+# If you change the camera's main resolution again, re-detect by
+# inspecting a bottom-band crop.
+_OSD_REGION_MAIN = (650, 1469, 1370, 1517)
 
 
 @dataclass

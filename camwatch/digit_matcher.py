@@ -49,7 +49,10 @@ def _detect_char_boxes(
     text yields exactly one box. Sorted left-to-right."""
     h, w = osd_gray.shape
     _, binary = cv2.threshold(osd_gray, bright_thresh, 255, cv2.THRESH_BINARY)
-    kernel_h = max(3, h // 2)
+    # Vertical kernel as tall as the strip itself ensures colon dots merge
+    # into a single component on any OSD height; shorter kernels can leave
+    # the dots as two separate components.
+    kernel_h = max(3, h)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     n_comp, _labels, stats, _ = cv2.connectedComponentsWithStats(closed)
@@ -59,7 +62,11 @@ def _detect_char_boxes(
         y = int(stats[i, cv2.CC_STAT_TOP])
         cw = int(stats[i, cv2.CC_STAT_WIDTH])
         ch = int(stats[i, cv2.CC_STAT_HEIGHT])
-        if ch < h * 0.4:
+        # Real characters span ~full strip height after morph closing;
+        # 1-2px-wide streaks pass height check otherwise.
+        if ch < h * 0.8:
+            continue
+        if cw < 4:
             continue
         if cw > w * 0.15:
             continue

@@ -54,7 +54,11 @@ OUT_ROOT = Path("/tmp/digit_templates")
 # OSD region (x1, y1, x2, y2) for each stream — same regions used elsewhere
 # in the codebase. The Reolink E1 puts the OSD at the bottom of the frame.
 OSD_REGION_SUB = (175, 452, 500, 477)
-OSD_REGION_MAIN = (700, 1810, 2000, 1910)
+# Main is 2048x1536 (4:3). Auto-detection of bright-pixel runs in the
+# bottom band shows OSD timestamp at x=657..1360 with text height ~40px
+# vertically centered around y=1493. The "corner" caption is isolated
+# to x=1849+ and excluded.
+OSD_REGION_MAIN = (650, 1469, 1370, 1517)
 
 # Character layout of "MM/DD/YYYY HH:MM:SS DAY" — 23 positions.
 # 'd' = digit slot we want a template of; '/', ':', ' ' = skip; 'L' = letter
@@ -73,7 +77,11 @@ def _detect_char_boxes(osd_gray: np.ndarray, bright_thresh: int = 180) -> list[t
     very wide ones (background blobs that survive thresholding)."""
     h, w = osd_gray.shape
     _, binary = cv2.threshold(osd_gray, bright_thresh, 255, cv2.THRESH_BINARY)
-    kernel_h = max(3, h // 2)
+    # Vertical kernel as tall as the strip itself ensures colon dots merge
+    # into a single component on any OSD height. Anything shorter risks
+    # leaving a gap between the two dots when the strip is short and the
+    # gap between dots is proportionally large.
+    kernel_h = max(3, h)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     n_comp, _labels, stats, _ = cv2.connectedComponentsWithStats(closed)
@@ -83,8 +91,13 @@ def _detect_char_boxes(osd_gray: np.ndarray, bright_thresh: int = 180) -> list[t
         y = int(stats[i, cv2.CC_STAT_TOP])
         cw = int(stats[i, cv2.CC_STAT_WIDTH])
         ch = int(stats[i, cv2.CC_STAT_HEIGHT])
-        # Character heights are most of the strip; noise is short.
-        if ch < h * 0.4:
+        # Real characters span essentially the whole strip vertically
+        # (after morph closing). Anything shorter is a partial-height
+        # noise streak that survived thresholding.
+        if ch < h * 0.8:
+            continue
+        # Filter narrow streaks (width=1-2 pixels passing height check).
+        if cw < 4:
             continue
         # Stray giant blobs (e.g. background patches that crossed threshold).
         if cw > w * 0.15:
