@@ -106,8 +106,9 @@ camwatch/
 ├── preview.py         Latest-frame MJPEG buffer for the live preview.
 ├── db.py              SQLite (WAL) pass storage; single writer + many readers.
 ├── capture_worker.py  Web UI: long-running thread driving detect → crossing → recorder → DB.
-├── thumb_upgrader.py  Background main-stream thumbnail upgrader, OSD-time-keyed.
-├── ts_reader.py       OCRs the camera's burned-in OSD timestamp (Tesseract).
+├── thumb_upgrader.py  Background main-stream thumbnail upgrader, PTS-keyed.
+├── digit_matcher.py   Template-matching OCR for the camera's burned-in OSD timestamp.
+├── ts_reader.py       Legacy Tesseract-backed OSD reader (kept for diagnostic scripts).
 ├── server.py          FastAPI app + Jinja2/HTMX rendering.
 ├── calibrate.py       Interactive calibration CLI (subcommands below).
 ├── config.py          Loads config.yaml + .env into a typed dataclass.
@@ -115,9 +116,13 @@ camwatch/
 ```
 
 ### `capture.py`
-- `cv2.VideoCapture(url, CAP_FFMPEG)` with `CAP_PROP_BUFFERSIZE=1` to keep latency low.
-- Reconnect loop after consecutive read failures.
-- Yields `Frame(image, ts, seq)` where `ts` is the frame's **camera-side PTS** (`cv2.CAP_PROP_POS_MSEC`) re-anchored to `time.monotonic()` at startup. PTS is immune to ffmpeg's RTSP buffer-burst delivery, which we confirmed compresses `time.monotonic()` intervals badly enough to over-state speeds by 3× during traffic spikes. See `scripts/timing_probe.py` for the diagnostic that established this.
+- `cv2.VideoCapture(url, CAP_FFMPEG)`. Reconnect loop after consecutive read failures.
+- Yields `Frame(image, ts, seq, epoch)` where `ts` is the frame's **camera-side PTS** (`cv2.CAP_PROP_POS_MSEC`) re-anchored to `time.monotonic()` at the first frame of each session. PTS is immune to ffmpeg's RTSP buffer-burst delivery, which we confirmed compresses `time.monotonic()` intervals badly enough to over-state speeds by 3× during traffic spikes. See `scripts/timing_probe.py` for the diagnostic.
+- `epoch` increments on each reconnect. Anything that caches a value derived from `ts` (e.g. the thumb upgrader's cross-stream offset) must invalidate when the epoch advances.
+- Per-stream ffmpeg options:
+  - **Sub stream (live capture)** uses `nobuffer + low_delay + BUFFERSIZE=1 + queue_size=1`. Right for latency: detection sees fresh state.
+  - **Main stream (thumb upgrader)** opens with neither flag and `queue_size=200` (bounded deque). The reader retains every frame ffmpeg gives us during post-keyframe burst delivery, instead of single-slot-overwriting them before the consumer iterates.
+- `TimestampedFrameBuffer` (used by the thumb upgrader) samples main-stream frames at 0.1s of *camera time* (not monotonic), evicts by `latest_ts - max_age` (not `monotonic_now - max_age`). Both anchors prevent the buffer from shrinking artificially when the main stream's pipeline lag fluctuates between 1s and 25s.
 
 ### `detect.py`
 - Wraps `ultralytics.YOLO('yolo11n.pt').track(...)`.
@@ -139,6 +144,25 @@ camwatch/
   {"ts":"2026-05-04T21:45:12-04:00","track_id":47,"class":"car","direction":"N","speed_mph":43.2,"alert":true,"snapshot":"events/2026-05-04T21-45-12_id47_N_43mph.jpg"}
   ```
 - For events at or above the threshold, saves a JPG with the bbox and label drawn on, named with timestamp + track_id + direction + integer mph.
+
+### `thumb_upgrader.py` and `digit_matcher.py` — high-res thumbnail pipeline
+
+Each pass produces a sub-stream-derived thumbnail immediately. A separate worker tries to upgrade it to a high-resolution crop pulled from a parallel main-stream RTSP session. The chain:
+
+1. **Live trigger** in the sub-stream worker emits a `CrossingEvent` with `t_a` and `t_b` (PTS-anchored monotonic timestamps of each line crossing) and `direction`. The worker picks the *direction-appropriate exit-side line* as the lookup target — `t_b` for N-bound, `t_a` for S-bound — biased 0.3s earlier to compose the car cleanly inside the frame.
+
+2. **Cross-stream offset calibration** runs once per `(sub_epoch, main_epoch)` pair. Sub and main RTSP sessions each anchor their PTS independently at first frame, so the same camera-instant produces different `*_ts` values in each stream. We measure the constant offset by:
+   - Watching for an **OSD second-tick** in each stream (consecutive frames whose burned-in OSD digits differ by 1 second). The midpoint of those two frames' `ts` values gives the camera-instant of the tick at ±half-frame-interval precision.
+   - `drift_main = tick_main_ts − tick_wallclock_unix` (from main-stream OSD ticks)
+   - `drift_sub = tick_sub_ts − tick_wallclock_unix` (from sub-stream OSD ticks)
+   - `cross_stream_offset = drift_main − drift_sub`
+   The offset is then used as pure PTS arithmetic for every subsequent trigger: `target_main_ts = trigger.target_ts + offset`. No more OCR per-frame.
+
+3. **OSD reading** uses `digit_matcher.py`: a fixed-font template matcher that slides per-digit reference images (`templates/{sub,main}/digit_<X>.png`) against a binarized OSD strip and picks the 14 strongest non-overlapping peaks via NMS. Tesseract had ~30% misread rate on this small font (8↔6, 0↔O, 5↔3); template matching is near-deterministic. The reference templates are bootstrapped per camera installation by `scripts/collect_digit_templates.py` + `scripts/scan_digit_seconds.py`, with manual visual confirmation.
+
+4. **Lookup** in the main buffer uses `find_frame_at(target_main_ts, tolerance=±1.5s)`. The matched frame goes through YOLO again to find the focus track, projected from the sub bbox via aspect-ratio-aware width/height ratios. The crop is atomically renamed over the existing thumbnail.
+
+If anything fails (no main frame within tolerance, no detections, decode error, write error), the existing sub-stream thumbnail stays untouched.
 
 ---
 
@@ -388,6 +412,19 @@ REOLINK_USER=...
 REOLINK_PASS=...
 ```
 
+### Camera-side encode settings (Reolink E1)
+
+The thumbnail-upgrade pipeline benefits from the camera's main-stream encode being light enough that our `cap.read()` doesn't fall behind. Recommended Reolink E1 main-stream settings:
+
+- **Resolution: 2048×1536** (4:3, matches the sub-stream aspect — better bbox projection than 16:9)
+- **Frame rate: 4 fps** — enough for thumbnails (a 30mph car is at most ~11 ft from its trigger position in the matched frame), light decode load
+- **Bitrate: 4096 kbps** is fine
+- **I-frame interval**: shortest the UI allows. Long GOPs (~15s on E1 default) cause ~15s recovery gaps after any decoder hiccup. The E1 web UI doesn't expose this on every firmware; if yours doesn't, that's a known limitation.
+
+Higher resolutions (2560×1920) saturate the software H.264 decoder under live load (sub-stream YOLO + tracker + recorder run concurrently, holding the CPU and GIL); `cap.read()` swells from ~86ms in isolation to ~430ms under load and the consumer falls behind. See `scripts/probe_main_iter_cost.py` for the empirical measurement.
+
+After changing camera resolution, the `_OSD_REGION_MAIN` constant in `camwatch/thumb_upgrader.py` and `scripts/collect_digit_templates.py` needs updating, and the `templates/main/digit_*.png` library needs re-collection at the new pixel size. See the comments in those files; the bottom-band auto-detection in `scripts/probe_main_gaps.py` adjacent code can help find the new region.
+
 ---
 
 ## Project layout
@@ -426,14 +463,21 @@ camwatch/
 │       ├── _pass_row.html
 │       └── _histogram.html
 ├── scripts/
-│   ├── test_stream.py             # quick RTSP smoke test
-│   ├── regen_thumbs.py            # rebuild thumbnail JPEGs from existing clips
-│   ├── timing_probe.py            # compare monotonic vs PTS vs OSD ticks (timing diagnostic)
-│   └── verify_speed.py            # verify a stored pass's speed using OSD ticks in its clip
-├── camwatch.db                    # gitignored: SQLite db (created on first run)
-├── events/                        # gitignored: events.jsonl + alert snapshots (headless mode)
-├── recordings/                    # gitignored: clip mp4s + thumbnail jpgs
-└── models/                        # gitignored: yolo11n.pt downloaded by ultralytics
+│   ├── test_stream.py                # quick RTSP smoke test
+│   ├── regen_thumbs.py               # rebuild thumbnail JPEGs from existing clips
+│   ├── timing_probe.py               # compare monotonic vs PTS vs OSD ticks (timing diagnostic)
+│   ├── verify_speed.py               # verify a stored pass's speed using OSD ticks in its clip
+│   ├── collect_digit_templates.py    # bootstrap step 1: capture per-digit slot crops
+│   ├── scan_digit_seconds.py         # bootstrap step 2: sweep seconds digit through 0-9
+│   ├── probe_main_gaps.py            # measure main-stream fr.ts gap distribution
+│   └── probe_main_iter_cost.py       # measure cap.read() per-iteration cost on main
+├── templates/                        # OSD digit reference images (10 per stream)
+│   ├── sub/digit_0.png … digit_9.png
+│   └── main/digit_0.png … digit_9.png
+├── camwatch.db                       # gitignored: SQLite db (created on first run)
+├── events/                           # gitignored: events.jsonl + alert snapshots (headless mode)
+├── recordings/                       # gitignored: clip mp4s + thumbnail jpgs
+└── models/                           # gitignored: yolo11n.pt downloaded by ultralytics
 ```
 
 ---
@@ -444,6 +488,8 @@ camwatch/
 - **Single line pair, two lanes.** v1 uses one calibration distance per direction. Cars that drift across the lane width during a single crossing window will measure incorrectly. Rare in residential traffic.
 - **No retention policy.** `events.jsonl` and the snapshot folder grow forever. Clean up by hand for now.
 - **Camera must not move.** Calibration is tied to the specific pixel positions of line A and line B. If the camera is bumped or repositioned, redo `pick-lines` and the drives.
+- **Thumbnail upgrade is best-effort, not guaranteed.** ~70-80% of passes successfully upgrade to a main-stream high-res crop. Failures stem from `cv2.VideoCapture.read()` on the main stream taking 200-400ms per call under live-system load (concurrent sub-stream YOLO + tracker + recorder hold the CPU and GIL); when the consumer falls behind the camera's 4fps, ffmpeg accumulates a backlog and eventually dumps it in a burst, leaving multi-second gaps in the buffer's `main_ts` coverage. A trigger landing in such a gap can't be matched. The original sub-stream thumbnail remains in place when the upgrade fails — no data loss, just no high-res version. Structural fixes (HW-accelerated decode via VideoToolbox, or moving the main reader to a separate process) are deferred. Camera-side mitigations: use a 4:3 aspect on main to match sub (better bbox projection), set lower main fps and resolution, set a short I-frame interval if the camera UI allows it (Reolink E1 web UI does not).
+- **Camera-side OSD-render artifacts in transition frames.** When the burned-in OSD digit changes between two consecutive captured frames, the rendered timestamp can briefly show partial old/new digit overlap ("smeared on top"). This is a rare visual artifact in a single frame's OSD strip; calibration is robust to it because the tick-detection logic only needs *consecutive different OSD seconds*, not a perfectly clean glyph.
 
 ## v2 ideas
 
