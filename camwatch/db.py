@@ -21,15 +21,16 @@ DEFAULT_DB_PATH = Path("camwatch.db")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS passes (
-    id           INTEGER PRIMARY KEY,
-    captured_at  TEXT    NOT NULL,
-    track_id     INTEGER NOT NULL,
-    cls_name     TEXT,
-    direction    TEXT    NOT NULL CHECK (direction IN ('N','S')),
-    elapsed_s    REAL    NOT NULL,
-    known_mph    REAL,
-    clip_path    TEXT,
-    deleted      INTEGER NOT NULL DEFAULT 0
+    id                   INTEGER PRIMARY KEY,
+    captured_at          TEXT    NOT NULL,
+    track_id             INTEGER NOT NULL,
+    cls_name             TEXT,
+    direction            TEXT    NOT NULL CHECK (direction IN ('N','S')),
+    elapsed_s            REAL    NOT NULL,
+    known_mph            REAL,
+    clip_path            TEXT,
+    deleted              INTEGER NOT NULL DEFAULT 0,
+    thumb_upgrade_status TEXT  -- NULL=pending/none, 'ok'=upgraded, 'failed'=tried but failed
 );
 CREATE INDEX IF NOT EXISTS passes_captured_at_idx ON passes(captured_at);
 CREATE INDEX IF NOT EXISTS passes_deleted_idx ON passes(deleted);
@@ -47,9 +48,14 @@ class Pass:
     known_mph: float | None
     clip_path: str | None
     deleted: bool
+    thumb_upgrade_status: str | None  # None | 'ok' | 'failed'
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Pass:
+        # `thumb_upgrade_status` only exists on freshly bootstrapped tables;
+        # access via .keys() so we don't blow up against an old schema.
+        keys = row.keys() if hasattr(row, "keys") else []
+        upgrade_status = row["thumb_upgrade_status"] if "thumb_upgrade_status" in keys else None
         return cls(
             id=row["id"],
             captured_at=row["captured_at"],
@@ -60,6 +66,7 @@ class Pass:
             known_mph=row["known_mph"],
             clip_path=row["clip_path"],
             deleted=bool(row["deleted"]),
+            thumb_upgrade_status=upgrade_status,
         )
 
 
@@ -80,6 +87,12 @@ class Database:
                 conn.executescript(_SCHEMA)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
+                # Add columns to existing tables created before they existed.
+                for col, decl in [("thumb_upgrade_status", "TEXT")]:
+                    try:
+                        conn.execute(f"ALTER TABLE passes ADD COLUMN {col} {decl}")
+                    except sqlite3.OperationalError:
+                        pass  # already there
                 conn.commit()
             self._initialized = True
             log.info("db ready: %s", self.path.resolve())
@@ -114,6 +127,14 @@ class Database:
                 (captured_at, int(track_id), cls_name, direction, float(elapsed_s), clip_path),
             )
             return int(cur.lastrowid)
+
+    def set_thumb_upgrade_status(self, pass_id: int, status: str | None) -> None:
+        """Record whether the high-res thumbnail upgrade succeeded."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE passes SET thumb_upgrade_status = ? WHERE id = ?",
+                (status, int(pass_id)),
+            )
 
     def set_known_mph(self, pass_id: int, known_mph: float | None) -> None:
         with self.connect() as conn:

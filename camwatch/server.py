@@ -71,6 +71,7 @@ def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict
         "alert": (mph is not None and mph >= threshold and p.known_mph is None),
         "has_clip": has_clip,
         "has_thumb": has_thumb,
+        "thumb_upgrade_status": p.thumb_upgrade_status,
     }
 
 
@@ -152,7 +153,11 @@ def recompute_calibration(cfg: Config, db: Database) -> tuple[float, float]:
 
 # ---------- app factory ----------
 
-def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> FastAPI:
+def make_app(
+    cfg: Config | None = None,
+    db_path: Path = Path("camwatch.db"),
+    profile: bool = False,
+) -> FastAPI:
     cfg = cfg or load_config()
     db = Database(db_path)
 
@@ -160,7 +165,7 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        worker = CaptureWorker(cfg, db, preview=preview)
+        worker = CaptureWorker(cfg, db, preview=preview, profile=profile)
         worker.start()
         app.state.worker = worker
         app.state.cfg = cfg
@@ -255,11 +260,17 @@ def make_app(cfg: Config | None = None, db_path: Path = Path("camwatch.db")) -> 
         return FileResponse(path, media_type="video/mp4")
 
     @app.get("/passes/{pass_id}/thumb")
-    async def get_thumb(pass_id: int):
+    async def get_thumb(pass_id: int, big: bool = False):
         p = db.get_pass(pass_id)
         if p is None or not p.clip_path:
             raise HTTPException(status_code=404)
-        thumb_path = Path(p.clip_path.replace(".mp4", ".jpg"))
+        base = p.clip_path[:-4] if p.clip_path.endswith(".mp4") else p.clip_path
+        if big:
+            big_path = Path(base + "_big.jpg")
+            if big_path.exists():
+                return FileResponse(big_path, media_type="image/jpeg")
+            # Fall through to regular thumb when no _big variant on disk.
+        thumb_path = Path(base + ".jpg")
         if not thumb_path.exists():
             raise HTTPException(status_code=404)
         return FileResponse(thumb_path, media_type="image/jpeg")
@@ -436,6 +447,21 @@ def _build_histogram(
     return bars, total
 
 
+def _static_version() -> str:
+    """File-mtime-based cache buster so CSS/JS edits invalidate cached assets.
+
+    Mobile Safari is aggressive about reusing cached static files without
+    sending conditional GETs, which would otherwise leave users staring at
+    a stale stylesheet after we change it. Appending ?v=<mtime> on the
+    asset URLs gives each version a unique URL that bypasses the cache.
+    """
+    css = STATIC_DIR / "style.css"
+    try:
+        return str(int(css.stat().st_mtime))
+    except OSError:
+        return "0"
+
+
 def _render_index(request: Request, cfg: Config, db: Database):
     cal = cfg.load_calibration()
     dist_n = cal.line_distance_m_north if cal else 0
@@ -454,6 +480,7 @@ def _render_index(request: Request, cfg: Config, db: Database):
         request,
         "index.html",
         {
+            "static_v": _static_version(),
             "rows": rows,
             "dist_n": dist_n,
             "dist_s": dist_s,
@@ -575,11 +602,11 @@ def _render_status_panel(request: Request, cfg: Config, db: Database):
 
 # ---------- entrypoint ----------
 
-def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
+def serve(host: str = "127.0.0.1", port: int = 8000, profile: bool = False) -> None:
     import uvicorn
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    app = make_app()
+    app = make_app(profile=profile)
     uvicorn.run(app, host=host, port=port, log_level="info")

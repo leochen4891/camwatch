@@ -207,8 +207,7 @@ header {
 .preview-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   margin-bottom: 8px;
 }
 .setting-row {
@@ -426,12 +425,10 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   border-color: var(--accent);
 }
 
-/* Make active rows feel clickable; the row-click toggles inline playback. */
+/* Every active row is clickable: clicking expands inline image (and video
+   if there's a clip). */
 .pass-row:not(.deleted) { cursor: pointer; }
 .pass-row:not(.deleted):hover { border-color: var(--accent); }
-/* Rows without a clip aren't clickable — no playback to toggle. */
-.pass-row.no-clip:not(.deleted) { cursor: default; }
-.pass-row.no-clip:not(.deleted):hover { border-color: var(--border); }
 
 /* Deleted (soft) rows: minimized single-line view with a Revert button. */
 .pass-row.deleted {
@@ -467,7 +464,7 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
 }
 
 
-.thumb { grid-area: thumb; }
+.thumb { grid-area: thumb; position: relative; }
 .thumb img {
   display: block;
   width: 130px;
@@ -475,6 +472,29 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   object-fit: cover;
   border-radius: 4px;
   background: var(--surface-2);
+}
+.thumb-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  line-height: 1.4;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+.thumb-badge.ok {
+  background: rgba(74, 222, 128, 0.85);
+  color: #0d2417;
+}
+.thumb-badge.fail {
+  background: rgba(226, 59, 74, 0.9);
+  color: white;
+  width: 16px;
+  text-align: center;
+  padding: 1px 0;
 }
 .thumb-placeholder {
   width: 130px;
@@ -595,6 +615,36 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   border-radius: 4px;
   background: black;
 }
+.big-image-wrap { grid-area: bigimg; }
+.big-image-wrap img {
+  display: block;
+  width: 100%;
+  max-height: 480px;
+  object-fit: contain;
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+
+/* Expanded view, with a clip: 50:50 between the high-res image and the video. */
+.pass-row:not(.deleted):has(.video-wrap:not(.hidden)) {
+  grid-template-columns: 1fr 1fr;
+  grid-template-areas:
+    "meta    actions"
+    "bigimg  video"
+    "known   known";
+}
+.pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .thumb { display: none; }
+.pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .video-wrap video { max-width: none; }
+
+/* Expanded view, image only (no clip): big image takes the full row. */
+.pass-row:not(.deleted):has(.big-image-wrap:not(.hidden)):not(:has(.video-wrap:not(.hidden))) {
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "meta   actions"
+    "bigimg bigimg"
+    "known  known";
+}
+.pass-row:not(.deleted):has(.big-image-wrap:not(.hidden)):not(:has(.video-wrap:not(.hidden))) .thumb { display: none; }
 
 .hidden { display: none !important; }
 

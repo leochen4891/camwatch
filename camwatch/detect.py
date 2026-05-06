@@ -21,6 +21,14 @@ class Track:
     ground_point: tuple[float, float]
 
 
+@dataclass
+class Detection:
+    cls_idx: int
+    cls_name: str
+    bbox: tuple[float, float, float, float]
+    conf: float
+
+
 class Detector:
     def __init__(
         self,
@@ -95,6 +103,43 @@ class Detector:
                     bbox=(x1, y1, x2, y2),
                     conf=float(conf[i]),
                     ground_point=ground,
+                )
+            )
+        return out
+
+    def detect(self, frame: np.ndarray) -> list[Detection]:
+        """One-shot detection without tracker state.
+
+        Used by the thumbnail upgrader on a different (high-res) stream where
+        we don't care about IDs — we just need to find vehicles in the frame
+        so we can pick the one closest to the trigger's projected bbox.
+        """
+        results = self._model.predict(
+            frame,
+            classes=self._classes,
+            conf=self._conf,
+            iou=self._iou,
+            device=self._device,
+            verbose=False,
+        )
+        if not results:
+            return []
+        r = results[0]
+        boxes = r.boxes
+        if boxes is None or len(boxes) == 0:
+            return []
+        xyxy = boxes.xyxy.cpu().numpy()
+        cls = boxes.cls.int().cpu().numpy()
+        conf = boxes.conf.cpu().numpy()
+        out: list[Detection] = []
+        for i in range(len(boxes)):
+            x1, y1, x2, y2 = (float(v) for v in xyxy[i])
+            out.append(
+                Detection(
+                    cls_idx=int(cls[i]),
+                    cls_name=self._names.get(int(cls[i]), str(int(cls[i]))),
+                    bbox=(x1, y1, x2, y2),
+                    conf=float(conf[i]),
                 )
             )
         return out

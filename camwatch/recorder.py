@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import collections
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ class _ActiveClip:
     t_b: float
     speed_mph: float | None = None
     record_video: bool = True  # if False, only the thumbnail JPEG is written
+    on_finalize: Callable[[], None] | None = None  # invoked after _write_thumbnail
 
 
 _GRAY = (180, 180, 180)
@@ -113,6 +115,7 @@ class ClipRecorder:
         t_b: float,
         speed_mph: float | None = None,
         record_video: bool = True,
+        on_finalize: Callable[[], None] | None = None,
     ) -> str:
         if self._size is None:
             raise RuntimeError("trigger() called before any frames were pushed")
@@ -143,6 +146,7 @@ class ClipRecorder:
             t_b=t_b,
             speed_mph=speed_mph,
             record_video=record_video,
+            on_finalize=on_finalize,
         )
         self._active.append(clip)
         return path
@@ -191,6 +195,11 @@ class ClipRecorder:
             "clip closed: %s (%d frames, video=%s)",
             clip.path, len(clip.frames), clip.record_video,
         )
+        if clip.on_finalize is not None:
+            try:
+                clip.on_finalize()
+            except Exception as e:  # noqa: BLE001
+                log.warning("clip on_finalize callback raised: %s", e)
 
     def _write_thumbnail(self, clip: _ActiveClip) -> None:
         """Save a clean (no overlay) JPEG cropped tight to the focus car.
@@ -304,11 +313,13 @@ class ClipRecorder:
             bg=True,
         )
 
-        # Footer (bottom): time relative to t_a
+        # Footer (bottom): time relative to t_a. Kept short so it doesn't
+        # overlap the camera's burned-in OSD timestamp at bottom-center, which
+        # the verifier tool needs to read.
         rel_t = rec.ts - clip.t_a
         _stamp(
             img,
-            f"t = {rel_t:+.3f}s  (relative to line A)",
+            f"t={rel_t:+.3f}s",
             (10, h - 12),
             _WHITE,
             scale=0.6,

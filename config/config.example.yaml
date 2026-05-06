@@ -4,6 +4,9 @@ camera:
   path: /h264Preview_01_sub           # use the sub stream (640x480) for detection + clips.
                                       # Switch to /h264Preview_01_main if you want full-res but
                                       # accept higher CPU and ~10s of latency from buffer buildup.
+  path_thumb: /h264Preview_01_main    # optional. If set, every crossing's thumbnail is upgraded
+                                      # to a high-res crop derived from this stream. Adds a parallel
+                                      # RTSP read + one YOLO pass per pass; ~20-30% CPU overhead.
   # User and pass come from .env (REOLINK_USER, REOLINK_PASS)
 
 model:

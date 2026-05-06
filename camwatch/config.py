@@ -13,10 +13,10 @@ from dotenv import load_dotenv
 class CameraConfig:
     host: str
     port: int
-    path: str
+    path: str                       # primary detection stream (sub recommended)
     user: str
     password: str
-    path_sub: str | None = None  # optional low-res stream for detection
+    path_thumb: str | None = None   # optional high-res stream for thumbnail upgrades
 
     @property
     def rtsp_url(self) -> str:
@@ -25,12 +25,12 @@ class CameraConfig:
         return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path}"
 
     @property
-    def rtsp_url_sub(self) -> str | None:
-        if not self.path_sub:
+    def rtsp_url_thumb(self) -> str | None:
+        if not self.path_thumb:
             return None
         u = quote(self.user, safe="")
         p = quote(self.password, safe="")
-        return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path_sub}"
+        return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path_thumb}"
 
 
 @dataclass
@@ -127,7 +127,7 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
             host=cam["host"],
             port=int(cam["port"]),
             path=cam["path"],
-            path_sub=cam.get("path_sub"),
+            path_thumb=cam.get("path_thumb"),
             user=user,
             password=pw,
         ),

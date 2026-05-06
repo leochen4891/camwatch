@@ -27,6 +27,7 @@ from .db import Database
 from .detect import Detector, Track
 from .preview import PreviewBuffer
 from .recorder import ClipRecorder
+from .thumb_upgrader import ThumbUpgrader
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,52 @@ def _track_in_roi(t: Track, roi: tuple[int, int, int, int] | None) -> bool:
     return x1 <= gx <= x2 and y1 <= gy <= y2
 
 
+class _StageTimer:
+    """Per-stage runtime accumulator for the capture loop.
+
+    Why not cProfile: we already know the structure of the loop (YOLO →
+    filter → recorder → preview → crossing), so what we want is a direct
+    answer to "which stage's wall-clock time dominates?". cProfile gives
+    function-level breakdowns that take post-hoc analysis to interpret;
+    stage timing prints the answer in one log line.
+
+    Records `time.perf_counter()` deltas under named buckets and emits a
+    p50/p95/mean/max summary every `log_interval_s` seconds. Cleared
+    after each emission so each window is independent.
+    """
+
+    def __init__(self, log_interval_s: float = 30.0) -> None:
+        self._samples: dict[str, list[float]] = {}
+        self._interval = log_interval_s
+        self._next_log = time.monotonic() + log_interval_s
+
+    def record(self, name: str, dt_s: float) -> None:
+        self._samples.setdefault(name, []).append(dt_s)
+
+    def maybe_log(self) -> None:
+        now = time.monotonic()
+        if now < self._next_log:
+            return
+        self._next_log = now + self._interval
+        if not self._samples:
+            return
+        rows: list[str] = []
+        for name in sorted(self._samples):
+            xs = sorted(self._samples[name])
+            n = len(xs)
+            p50 = xs[n // 2] * 1000.0
+            p95 = xs[min(n - 1, int(n * 0.95))] * 1000.0
+            mean = (sum(xs) / n) * 1000.0
+            mx = xs[-1] * 1000.0
+            rows.append(
+                f"{name:18s} n={n:4d}  "
+                f"p50={p50:6.1f}ms  p95={p95:6.1f}ms  "
+                f"mean={mean:6.1f}ms  max={mx:6.1f}ms"
+            )
+        log.info("PROFILE (last %.0fs):\n  %s", self._interval, "\n  ".join(rows))
+        self._samples.clear()
+
+
 class CaptureWorker(threading.Thread):
     def __init__(
         self,
@@ -47,16 +94,19 @@ class CaptureWorker(threading.Thread):
         db: Database,
         recordings_dir: Path = Path("recordings"),
         preview: PreviewBuffer | None = None,
+        profile: bool = False,
     ) -> None:
         super().__init__(name="capture-worker", daemon=True)
         self._cfg = cfg
         self._db = db
         self._recordings_dir = Path(recordings_dir)
         self._preview = preview
+        self._profile = bool(profile)
         self._stop_evt = threading.Event()
         self._stream: RtspStream | None = None
         self._error: BaseException | None = None
         self._recorder: ClipRecorder | None = None
+        self._upgrader: ThumbUpgrader | None = None
 
     def update_clip_margin(self, seconds: float) -> None:
         """Apply a new pre/post-roll value to the running recorder, if any.
@@ -73,6 +123,8 @@ class CaptureWorker(threading.Thread):
         self._stop_evt.set()
         if self._stream is not None:
             self._stream.stop()
+        if self._upgrader is not None:
+            self._upgrader.stop()
 
     def run(self) -> None:
         try:
@@ -122,9 +174,28 @@ class CaptureWorker(threading.Thread):
         if self._preview is not None:
             self._preview.configure(cal.roi, cal.line_a_x, cal.line_b_x)
 
+        # Optional: parallel high-res stream for thumbnail upgrades.
+        # The OCR region is the pixel rectangle in the main stream where the
+        # camera's OSD timestamp sits. Hard-coded for the Reolink E1 main
+        # stream (2560x1920) with the OSD positioned at the bottom of the
+        # frame; if the stream resolution changes this needs to move with it.
+        thumb_url = self._cfg.camera.rtsp_url_thumb
+        if thumb_url:
+            self._upgrader = ThumbUpgrader(
+                rtsp_url=thumb_url,
+                model=self._cfg.model,
+                ocr_region=(700, 1810, 2000, 1910),
+                db=self._db,
+            )
+            self._upgrader.start()
+
         self._stream = RtspStream(self._cfg.camera.rtsp_url)
         last_purge = time.monotonic()
         purge_interval_s = 3600.0  # check retention once an hour
+        prof = _StageTimer() if self._profile else None
+        if prof is not None:
+            log.info("capture worker: --profile enabled, logging stage timings every 30s")
+        last_loop_t: float | None = None
 
         try:
             for fr in self._stream.frames():
@@ -146,17 +217,44 @@ class CaptureWorker(threading.Thread):
                         if n:
                             log.info("retention: purged %d passes older than %d days", n, days)
 
-                all_tracks = det.track(fr.image)
-                tracks = [t for t in all_tracks if _track_in_roi(t, cal.roi)]
+                loop_t = time.perf_counter() if prof else 0.0
+                if prof and last_loop_t is not None:
+                    # Wall-clock between successive frames reaching this point.
+                    # Lower-bounded by frame interval; if our work exceeds it,
+                    # this gap reflects the real consumer rate.
+                    prof.record("interframe_gap", loop_t - last_loop_t)
+                last_loop_t = loop_t
 
+                t0 = time.perf_counter() if prof else 0.0
+                all_tracks = det.track(fr.image)
+                if prof:
+                    prof.record("yolo_track", time.perf_counter() - t0)
+
+                t0 = time.perf_counter() if prof else 0.0
+                tracks = [t for t in all_tracks if _track_in_roi(t, cal.roi)]
+                if prof:
+                    prof.record("roi_filter", time.perf_counter() - t0)
+
+                t0 = time.perf_counter() if prof else 0.0
                 recorder.push(fr.image, fr.ts, tracks)
+                if prof:
+                    prof.record("recorder_push", time.perf_counter() - t0)
+
                 if self._preview is not None:
                     # Preview gets ALL detections (including outside ROI) so
                     # the user can see what YOLO is doing; the ROI rectangle
                     # is drawn for visual context.
+                    t0 = time.perf_counter() if prof else 0.0
                     self._preview.update(fr.image, all_tracks)
+                    if prof:
+                        prof.record("preview_update", time.perf_counter() - t0)
 
+                t0 = time.perf_counter() if prof else 0.0
                 events = crossing.update(tracks, fr.ts)
+                if prof:
+                    prof.record("crossing_update", time.perf_counter() - t0)
+                if prof:
+                    prof.maybe_log()
                 for ev in events:
                     captured_at = datetime.now().astimezone()
                     stamp = captured_at.strftime("%Y%m%dT%H%M%S")
@@ -187,6 +285,45 @@ class CaptureWorker(threading.Thread):
                             self._cfg.clip_capture_min_mph,
                             self._cfg.clip_capture_max_mph,
                         )
+                    # Capture sub-stream context for the optional thumbnail
+                    # upgrade. Done before trigger() so the closure below
+                    # binds to these specific values.
+                    sub_h, sub_w = fr.image.shape[:2]
+                    sub_bbox = ev.bbox
+                    upgrader = self._upgrader
+                    cls_name_for_upgrade = ev.cls_name
+                    target_dt = captured_at  # tz-aware; upgrader strips tzinfo
+
+                    # pass_id isn't known until insert_pass below, but
+                    # on_finalize fires later (after the recorder's post-roll
+                    # completes), so we plumb the pid in via a holder list
+                    # that gets populated immediately after insert_pass.
+                    pid_holder: list[int | None] = [None]
+                    on_finalize = None
+                    if upgrader is not None and sub_bbox is not None:
+                        thumb_path_pending = str(self._recordings_dir / (clip_name[:-4] + ".jpg"))
+
+                        def on_finalize(
+                            _path=thumb_path_pending,
+                            _cls=cls_name_for_upgrade,
+                            _bbox=sub_bbox,
+                            _size=(sub_w, sub_h),
+                            _up=upgrader,
+                            _dt=target_dt,
+                            _holder=pid_holder,
+                        ) -> None:
+                            pid = _holder[0]
+                            if pid is None:
+                                return
+                            _up.enqueue(
+                                pass_id=pid,
+                                thumb_path=_path,
+                                focus_cls_name=_cls,
+                                sub_bbox=_bbox,
+                                sub_frame_size=_size,
+                                target_dt=_dt,
+                            )
+
                     clip_path = recorder.trigger(
                         name=clip_name,
                         focus_track_id=ev.track_id,
@@ -196,6 +333,7 @@ class CaptureWorker(threading.Thread):
                         t_b=ev.t_b,
                         speed_mph=speed_mph,
                         record_video=in_range,
+                        on_finalize=on_finalize,
                     )
                     # We always set clip_path (the .mp4 base name) so the
                     # thumbnail can be located by stripping ".mp4" → ".jpg".
@@ -209,6 +347,7 @@ class CaptureWorker(threading.Thread):
                         elapsed_s=ev.elapsed_s,
                         clip_path=clip_path or None,
                     )
+                    pid_holder[0] = pid
                     log.info(
                         "pass id=%d track=%d %s %s elapsed=%.3fs clip=%s",
                         pid, ev.track_id, ev.cls_name, ev.direction,

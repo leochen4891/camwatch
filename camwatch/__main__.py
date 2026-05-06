@@ -16,9 +16,16 @@ def main() -> int:
         parser = argparse.ArgumentParser(prog="python -m camwatch serve")
         parser.add_argument("--host", default="127.0.0.1")
         parser.add_argument("--port", type=int, default=8000)
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Log per-stage capture-loop timings every 30s (yolo, roi, "
+                 "recorder, preview, crossing). Use during traffic to find "
+                 "what's eating per-frame budget.",
+        )
         args = parser.parse_args(sys.argv[2:])
         from camwatch.server import serve
-        serve(host=args.host, port=args.port)
+        serve(host=args.host, port=args.port, profile=args.profile)
         return 0
 
     from camwatch.main import main as run_headless

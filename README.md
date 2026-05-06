@@ -96,7 +96,7 @@ Modules:
 
 ```
 camwatch/
-├── capture.py         RTSP frame source with reconnect. Yields (frame, monotonic_ts).
+├── capture.py         RTSP frame source with reconnect. Yields (frame, pts_ts).
 ├── detect.py          YOLO + BotSORT wrapper. Returns Track records per frame.
 ├── crossing.py        Two-line crossing state machine (web UI source of truth).
 ├── speed.py           Parallel crossing detector retained for headless mode.
@@ -106,6 +106,8 @@ camwatch/
 ├── preview.py         Latest-frame MJPEG buffer for the live preview.
 ├── db.py              SQLite (WAL) pass storage; single writer + many readers.
 ├── capture_worker.py  Web UI: long-running thread driving detect → crossing → recorder → DB.
+├── thumb_upgrader.py  Background main-stream thumbnail upgrader, OSD-time-keyed.
+├── ts_reader.py       OCRs the camera's burned-in OSD timestamp (Tesseract).
 ├── server.py          FastAPI app + Jinja2/HTMX rendering.
 ├── calibrate.py       Interactive calibration CLI (subcommands below).
 ├── config.py          Loads config.yaml + .env into a typed dataclass.
@@ -115,7 +117,7 @@ camwatch/
 ### `capture.py`
 - `cv2.VideoCapture(url, CAP_FFMPEG)` with `CAP_PROP_BUFFERSIZE=1` to keep latency low.
 - Reconnect loop after consecutive read failures.
-- Yields `Frame(image, ts, seq)` where `ts` is `time.monotonic()` at read time.
+- Yields `Frame(image, ts, seq)` where `ts` is the frame's **camera-side PTS** (`cv2.CAP_PROP_POS_MSEC`) re-anchored to `time.monotonic()` at startup. PTS is immune to ffmpeg's RTSP buffer-burst delivery, which we confirmed compresses `time.monotonic()` intervals badly enough to over-state speeds by 3× during traffic spikes. See `scripts/timing_probe.py` for the diagnostic that established this.
 
 ### `detect.py`
 - Wraps `ultralytics.YOLO('yolo11n.pt').track(...)`.
@@ -306,6 +308,7 @@ Healthy result: errors within ±2-3 mph and roughly random in sign. If errors ar
 ```sh
 uv run python -m camwatch serve            # bind 127.0.0.1:8000
 uv run python -m camwatch serve --host 0.0.0.0 --port 8000   # LAN/phone access
+uv run python -m camwatch serve --profile  # log per-stage capture-loop timings every 30s
 ```
 
 Open `http://localhost:8000`. The page shows:
@@ -424,7 +427,9 @@ camwatch/
 │       └── _histogram.html
 ├── scripts/
 │   ├── test_stream.py             # quick RTSP smoke test
-│   └── regen_thumbs.py            # rebuild thumbnail JPEGs from existing clips
+│   ├── regen_thumbs.py            # rebuild thumbnail JPEGs from existing clips
+│   ├── timing_probe.py            # compare monotonic vs PTS vs OSD ticks (timing diagnostic)
+│   └── verify_speed.py            # verify a stored pass's speed using OSD ticks in its clip
 ├── camwatch.db                    # gitignored: SQLite db (created on first run)
 ├── events/                        # gitignored: events.jsonl + alert snapshots (headless mode)
 ├── recordings/                    # gitignored: clip mp4s + thumbnail jpgs

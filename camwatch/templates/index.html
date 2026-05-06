@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>camwatch</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ static_v }}">
   <script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
 </head>
 <body>
@@ -90,10 +90,10 @@
     <section class="preview-section">
       <div class="preview-header">
         <h2>Live preview</h2>
-        <button type="button" class="muted-btn" id="preview-toggle" onclick="togglePreview()">hide</button>
+        <button type="button" class="muted-btn" id="preview-toggle" onclick="togglePreview()">show</button>
       </div>
-      <div class="preview-frame" id="preview-frame">
-        <img src="/preview/stream" alt="live preview" id="preview-img">
+      <div class="preview-frame hidden" id="preview-frame">
+        <img alt="live preview" id="preview-img">
       </div>
     </section>
 
@@ -173,27 +173,53 @@
       document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
     }
 
-    // Toggle the inline video player open/closed for a pass row.
+    // Toggle the inline expanded view for a pass row: opens the big image
+    // (when there's a thumbnail) and the video player (when there's a clip),
+    // or closes both. Only one row is expanded at a time.
     function togglePlay(passId) {
       const row = document.getElementById(`pass-${passId}`);
       if (!row) return;
-      const wrap = row.querySelector(".video-wrap");
-      if (!wrap) return;
-      // Close any other open player (only one at a time).
-      document.querySelectorAll(".pass-row .video-wrap").forEach(w => {
-        if (w !== wrap && !w.classList.contains("hidden")) {
-          w.querySelector("video")?.pause();
-          w.innerHTML = "";
-          w.classList.add("hidden");
+      const videoWrap = row.querySelector(".video-wrap");
+      const imageWrap = row.querySelector(".big-image-wrap");
+      if (!videoWrap && !imageWrap) return;
+
+      // Close any other expanded row first.
+      document.querySelectorAll(".pass-row").forEach(other => {
+        if (other === row) return;
+        const ov = other.querySelector(".video-wrap");
+        const oi = other.querySelector(".big-image-wrap");
+        if (ov && !ov.classList.contains("hidden")) {
+          ov.querySelector("video")?.pause();
+          ov.innerHTML = "";
+          ov.classList.add("hidden");
+        }
+        if (oi && !oi.classList.contains("hidden")) {
+          oi.innerHTML = "";
+          oi.classList.add("hidden");
         }
       });
-      if (wrap.classList.contains("hidden")) {
-        wrap.innerHTML = `<video controls autoplay playsinline src="/passes/${passId}/clip"></video>`;
-        wrap.classList.remove("hidden");
+
+      const isOpen = (videoWrap && !videoWrap.classList.contains("hidden"))
+                  || (imageWrap && !imageWrap.classList.contains("hidden"));
+      if (isOpen) {
+        if (videoWrap) {
+          videoWrap.querySelector("video")?.pause();
+          videoWrap.innerHTML = "";
+          videoWrap.classList.add("hidden");
+        }
+        if (imageWrap) {
+          imageWrap.innerHTML = "";
+          imageWrap.classList.add("hidden");
+        }
       } else {
-        wrap.querySelector("video")?.pause();
-        wrap.innerHTML = "";
-        wrap.classList.add("hidden");
+        if (imageWrap) {
+          imageWrap.innerHTML = `<img src="/passes/${passId}/thumb?big=1" alt="">`;
+          imageWrap.classList.remove("hidden");
+        }
+        if (videoWrap) {
+          videoWrap.innerHTML = `<video controls autoplay playsinline src="/passes/${passId}/clip"></video>`;
+          videoWrap.classList.remove("hidden");
+        }
       }
     }
 
@@ -219,7 +245,8 @@
         event.target.closest(".row-actions") ||
         event.target.closest(".kebab-menu") ||
         event.target.closest(".known-input-wrap") ||
-        event.target.closest(".video-wrap")
+        event.target.closest(".video-wrap") ||
+        event.target.closest(".big-image-wrap")
       ) {
         return;
       }
@@ -233,27 +260,43 @@
     document.body.addEventListener("htmx:beforeRequest", (e) => {
       const elt = e.detail && e.detail.elt;
       if (!elt || elt.id !== "filter-form") return;
-      if (document.querySelector(".pass-row .video-wrap:not(.hidden)")) {
+      if (
+        document.querySelector(".pass-row .video-wrap:not(.hidden)") ||
+        document.querySelector(".pass-row .big-image-wrap:not(.hidden)")
+      ) {
         e.preventDefault();
       }
     });
 
-    function togglePreview() {
+    const PREVIEW_KEY = "camwatch.preview.visible";
+
+    function setPreviewVisible(visible) {
       const frame = document.getElementById("preview-frame");
       const img = document.getElementById("preview-img");
       const btn = document.getElementById("preview-toggle");
-      const hidden = frame.classList.toggle("hidden");
-      btn.textContent = hidden ? "show" : "hide";
+      if (!frame || !img || !btn) return;
+      frame.classList.toggle("hidden", !visible);
+      btn.textContent = visible ? "hide" : "show";
       // Detach src when hidden so we stop pulling MJPEG bytes.
-      if (hidden) {
-        img.dataset.src = img.src;
-        img.removeAttribute("src");
-      } else if (img.dataset.src) {
-        img.src = img.dataset.src;
+      if (visible) {
+        if (!img.getAttribute("src")) img.src = "/preview/stream";
       } else {
-        img.src = "/preview/stream";
+        img.removeAttribute("src");
       }
     }
+
+    function togglePreview() {
+      const visible = document.getElementById("preview-frame").classList.contains("hidden");
+      setPreviewVisible(visible);
+      try { localStorage.setItem(PREVIEW_KEY, visible ? "1" : "0"); } catch {}
+    }
+
+    // Restore the user's last choice; default to hidden on first visit.
+    document.addEventListener("DOMContentLoaded", () => {
+      let stored = null;
+      try { stored = localStorage.getItem(PREVIEW_KEY); } catch {}
+      setPreviewVisible(stored === "1");
+    });
   </script>
 </body>
 </html>

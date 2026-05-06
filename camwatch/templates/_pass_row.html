@@ -21,10 +21,15 @@
   </article>
 {% else %}
   <article class="pass-row {% if p.alert %}alert{% endif %}{% if not p.has_clip %} no-clip{% endif %}" id="pass-{{ p.id }}"
-           {% if p.has_clip %}onclick="rowClick(event, {{ p.id }})"{% endif %}>
+           {% if p.has_thumb or p.has_clip %}onclick="rowClick(event, {{ p.id }})"{% endif %}>
     <div class="thumb">
       {% if p.has_thumb %}
         <img src="/passes/{{ p.id }}/thumb" alt="" loading="lazy">
+        {% if p.thumb_upgrade_status == 'ok' %}
+          <span class="thumb-badge ok" title="High-res thumbnail (main stream)">HD</span>
+        {% elif p.thumb_upgrade_status == 'failed' %}
+          <span class="thumb-badge fail" title="Upgrade failed; this is the sub-stream thumbnail">!</span>
+        {% endif %}
       {% else %}
         <div class="thumb-placeholder">no thumb</div>
       {% endif %}
@@ -86,6 +91,9 @@
 
     {% if p.has_clip %}
     <div class="video-wrap hidden" onclick="event.stopPropagation()"></div>
+    {% endif %}
+    {% if p.has_thumb %}
+    <div class="big-image-wrap hidden" onclick="event.stopPropagation()"></div>
     {% endif %}
   </article>
 {% endif %}
