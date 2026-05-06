@@ -393,7 +393,16 @@ class CaptureWorker(threading.Thread):
                     #   sub_epoch        — bumps on each sub-stream reconnect;
                     #                      the upgrader uses this to detect
                     #                      that the cached offset is stale.
-                    target_ts = ev.t_b
+                    #
+                    # Pick the direction-appropriate "exit-side" line for the
+                    # thumbnail: N-bound exits on line B (right), S-bound
+                    # exits on line A (left). Subtracting a small bias
+                    # (0.3s) offsets the typical matched-frame lateness
+                    # (frame quantization at 4fps + tick-midpoint variance)
+                    # so the car lands at-or-before the exit line in the
+                    # matched frame instead of past it.
+                    exit_ts = ev.t_b if ev.direction == "N" else ev.t_a
+                    target_ts = exit_ts - 0.3
                     target_wallclock = captured_at
                     target_sub_epoch = fr.epoch
 
