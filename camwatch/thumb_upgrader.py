@@ -360,13 +360,19 @@ class ThumbUpgrader:
                     (dt - now_local).total_seconds(),
                 )
                 continue
-            wallclock_unix = dt.timestamp()
+            # OSD has 1-second resolution: when it shows "09:34:00", the
+            # actual frame capture wallclock is uniformly distributed in
+            # [09:34:00.000, 09:34:01.000). Use the midpoint as the
+            # unbiased wallclock estimate; without this correction the
+            # offset is biased ~+0.5s on average and worst-case +1s,
+            # which lands the matched main frame after the car has left.
+            wallclock_unix = dt.timestamp() + 0.5
             drift_main = main_ts - wallclock_unix
             drift_sub = job.target_ts - job.target_wallclock_unix
             offset = drift_main - drift_sub
             log.info(
                 "thumb upgrade: calibrated cross_stream_offset=%+.3fs "
-                "(drift_main=%.3f drift_sub=%.3f, OCR=%s)",
+                "(drift_main=%.3f drift_sub=%.3f, OCR=%s+0.5)",
                 offset, drift_main, drift_sub, dt.strftime("%H:%M:%S"),
             )
             return offset
