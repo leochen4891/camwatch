@@ -118,7 +118,12 @@ class ThumbUpgrader:
         self._buffer = TimestampedFrameBuffer(
             url=self._rtsp_url,
             max_age_s=30.0,
-            sample_interval_s=0.25,
+            # Tight sub-sampling so the buffer holds ~10 main frames per
+            # second of monotonic time. ffmpeg delivers frames in bursts;
+            # a coarser interval can leave 1+ second gaps in main_ts space
+            # exactly where a trigger lookup might land. 0.1s gives ~10
+            # samples per second with negligible CPU/memory cost.
+            sample_interval_s=0.1,
             name="thumb-stream",
         )
         self._buffer.start()
@@ -227,13 +232,35 @@ class ThumbUpgrader:
         # Main stream lags sub by ffmpeg buffer depth. Wait until the buffer
         # has reached target_main_ts before looking up.
         self._wait_until_matching_frame_available(target_main_ts, timeout_s=45.0)
-        match = self._buffer.find_frame_at(target_main_ts, tolerance_s=1.0)
+        # Tolerance allows for some sub-sampling jitter and any residual
+        # offset error. With cross_stream_offset now derived from OSD-tick
+        # midpoints on both streams, the residual should be <100ms; the
+        # 1.5s window mostly absorbs main-stream burst-delivery gaps in
+        # the sampled buffer.
+        match = self._buffer.find_frame_at(target_main_ts, tolerance_s=1.5)
         if match is None:
             latest = self._buffer.latest_indexed()
             latest_str = f"{latest[0]:.3f}" if latest else "n/a"
+            # Diagnostic: report the closest main_ts (without tolerance)
+            # so we can tell whether we missed by a hair or by a mile.
+            with self._buffer._lock:  # noqa: SLF001
+                current_epoch = self._buffer._latest_epoch  # noqa: SLF001
+                same_epoch_ts = [
+                    ts for ts, ep, _ in self._buffer._frames  # noqa: SLF001
+                    if ep == current_epoch
+                ]
+            closest = min(
+                same_epoch_ts, key=lambda t: abs(t - target_main_ts), default=None,
+            )
+            closest_str = (
+                f"{closest:.3f} (Δ={closest - target_main_ts:+.3f}s)"
+                if closest is not None else "n/a"
+            )
             log.info(
-                "thumb upgrade: no main frame matching ts=%.3f (latest=%s offset=%+.3fs) — %s",
-                target_main_ts, latest_str, self._cross_stream_offset, thumb_name,
+                "thumb upgrade: no main frame matching ts=%.3f within ±1.5s "
+                "(latest=%s closest=%s offset=%+.3fs) — %s",
+                target_main_ts, latest_str, closest_str,
+                self._cross_stream_offset, thumb_name,
             )
             self._db.set_thumb_upgrade_status(job.pass_id, "failed")
             return
