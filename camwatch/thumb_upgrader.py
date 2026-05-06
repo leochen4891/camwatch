@@ -4,19 +4,25 @@ Upgrades a pass's thumbnail from the sub-stream-derived crop to a
 higher-resolution crop pulled from a parallel high-res RTSP stream.
 The main stream's ffmpeg buffer can deliver frames seconds late, so we
 buffer sampled main frames keyed by their PTS-anchored monotonic ts
-(`Frame.ts` from `RtspStream`) and look up by the trigger's t_b/t_a —
-both timestamps live in the same monotonic domain because each stream's
-PTS is anchored to `time.monotonic()` at its own first frame.
+(`Frame.ts` from `RtspStream`) and look up by the trigger's t_b/t_a.
+
+Cross-stream offset: sub_ts and main_ts are each anchored to
+`time.monotonic()` at their stream's first frame. ffmpeg's initial RTSP
+buffer depth differs between streams, so the two ts spaces are offset
+by a constant (~+1-2s on Reolink E1, with main running ahead of sub).
+We learn the offset once via OCR on a recent main frame plus the first
+trigger's (sub_ts, wallclock) pair, cache it for the session, and add
+it to every subsequent trigger's target ts before lookup.
 
 Per pass:
 
-  1. Wait until the buffer holds a frame with ts ≥ trigger ts.
-  2. Find the buffered main frame whose ts is closest to the trigger
-     (within ±1.5s tolerance).
-  3. Run YOLO once on that frame.
-  4. Pick the detection of the focus track's class with highest IoU
+  1. Compute target_main_ts = trigger.sub_ts + cross_stream_offset.
+  2. Wait until the buffer holds a frame with ts ≥ target_main_ts.
+  3. Find the buffered main frame whose ts is closest within ±1.5s.
+  4. Run YOLO once on that frame.
+  5. Pick the detection of the focus track's class with highest IoU
      against the projected sub-stream bbox; fall back to nearest center.
-  5. Crop with padding, atomic-rename the JPEG over the existing
+  6. Crop with padding, atomic-rename the JPEG over the existing
      thumbnail.
 
 If anything fails (no matching frame, no detection of the right class,
@@ -29,6 +35,7 @@ import logging
 import queue
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -38,8 +45,14 @@ from .capture import TimestampedFrameBuffer
 from .config import ModelConfig
 from .db import Database
 from .detect import Detector
+from .ts_reader import read_timestamp
 
 log = logging.getLogger(__name__)
+
+# Pixel rectangle of the OSD timestamp on the Reolink E1 main stream
+# (2560x1920) with the OSD at bottom-center. Used only for the one-time
+# cross-stream offset calibration.
+_OSD_REGION_MAIN = (700, 1810, 2000, 1910)
 
 
 @dataclass
@@ -50,6 +63,7 @@ class _Job:
     sub_bbox: tuple[float, float, float, float]
     sub_frame_size: tuple[int, int]  # (w, h) of the sub-stream frame
     target_ts: float                  # sub-stream PTS-anchored monotonic ts at trigger
+    target_wallclock_unix: float      # unix seconds at trigger (for offset calibration)
 
 
 class ThumbUpgrader:
@@ -70,6 +84,9 @@ class ThumbUpgrader:
         self._thread: threading.Thread | None = None
         self._buffer: TimestampedFrameBuffer | None = None
         self._detector: Detector | None = None  # lazy
+        # cross_stream_offset = main_ts - sub_ts for the same camera-instant.
+        # Computed lazily on the first job by OCR'ing a recent main frame.
+        self._cross_stream_offset: float | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -102,7 +119,15 @@ class ThumbUpgrader:
         sub_bbox: tuple[float, float, float, float],
         sub_frame_size: tuple[int, int],
         target_ts: float,
+        target_wallclock: datetime,
     ) -> None:
+        # Strip tzinfo: OSD-derived datetimes are naive; we compare seconds-
+        # since-epoch only. .timestamp() works on both naive (assumes local)
+        # and aware datetimes.
+        if target_wallclock.tzinfo is None:
+            target_wallclock_unix = target_wallclock.timestamp()
+        else:
+            target_wallclock_unix = target_wallclock.timestamp()
         job = _Job(
             pass_id=pass_id,
             thumb_path=thumb_path,
@@ -110,6 +135,7 @@ class ThumbUpgrader:
             sub_bbox=sub_bbox,
             sub_frame_size=sub_frame_size,
             target_ts=target_ts,
+            target_wallclock_unix=target_wallclock_unix,
         )
         try:
             self._queue.put_nowait(job)
@@ -142,25 +168,44 @@ class ThumbUpgrader:
     def _process(self, job: _Job) -> None:
         assert self._buffer is not None
         thumb_name = Path(job.thumb_path).name
-        # The main stream lags the sub stream by ffmpeg buffer depth. Wait
-        # for a buffered frame whose ts has reached the trigger before
-        # looking up.
-        self._wait_until_matching_frame_available(job.target_ts, timeout_s=45.0)
-        match = self._buffer.find_frame_at(job.target_ts, tolerance_s=2.5)
+
+        # Lazy one-time calibration of cross_stream_offset using OCR on a
+        # recent main frame plus this trigger's (sub_ts, wallclock) pair.
+        # Subsequent jobs reuse the cached offset.
+        if self._cross_stream_offset is None:
+            self._cross_stream_offset = self._calibrate_offset(job)
+            if self._cross_stream_offset is None:
+                log.info(
+                    "thumb upgrade: cross-stream offset calibration failed for "
+                    "first job — %s; will retry on next pass",
+                    thumb_name,
+                )
+                self._db.set_thumb_upgrade_status(job.pass_id, "failed")
+                return
+
+        # Map sub-anchored target ts into main-anchored ts space.
+        target_main_ts = job.target_ts + self._cross_stream_offset
+
+        # Main stream lags sub by ffmpeg buffer depth. Wait until the buffer
+        # has reached target_main_ts before looking up.
+        self._wait_until_matching_frame_available(target_main_ts, timeout_s=45.0)
+        match = self._buffer.find_frame_at(target_main_ts, tolerance_s=1.0)
         if match is None:
             latest = self._buffer.latest_indexed()
             latest_str = f"{latest[0]:.3f}" if latest else "n/a"
             log.info(
-                "thumb upgrade: no main frame matching ts=%.3f (latest=%s) — %s",
-                job.target_ts, latest_str, thumb_name,
+                "thumb upgrade: no main frame matching ts=%.3f (latest=%s offset=%+.3fs) — %s",
+                target_main_ts, latest_str, self._cross_stream_offset, thumb_name,
             )
             self._db.set_thumb_upgrade_status(job.pass_id, "failed")
             return
         matched_ts, frame = match
         h, w = frame.shape[:2]
         log.info(
-            "thumb upgrade: matched main frame ts=%.3f for trigger ts=%.3f (Δ=%+.3fs %dx%d) — %s",
-            matched_ts, job.target_ts, matched_ts - job.target_ts, w, h, thumb_name,
+            "thumb upgrade: matched main ts=%.3f for trigger sub_ts=%.3f "
+            "(target_main=%.3f offset=%+.3f Δ=%+.3fs %dx%d) — %s",
+            matched_ts, job.target_ts, target_main_ts, self._cross_stream_offset,
+            matched_ts - target_main_ts, w, h, thumb_name,
         )
 
         if self._detector is None:
@@ -247,6 +292,45 @@ class ThumbUpgrader:
             thumb_name, best_iou, best.cls_name,
         )
         self._db.set_thumb_upgrade_status(job.pass_id, "ok")
+
+    def _calibrate_offset(self, job: _Job) -> float | None:
+        """Determine main_ts - sub_ts for the same camera-instant.
+
+        Uses one OCR'd main frame plus the calling job's (target_ts,
+        target_wallclock_unix) pair. Strategy:
+
+          drift_main = main_ts(F) - wallclock_unix(F)   from OCR'd main frame F
+          drift_sub  = job.target_ts - job.target_wallclock_unix
+          offset     = drift_main - drift_sub  (= main_ts - sub_ts at same instant)
+
+        Both drifts are constants for the session because each stream's
+        ts space is anchored once at first read. Returns None if no main
+        frame is OCR-readable yet (caller should retry on next job).
+        """
+        if self._buffer is None:
+            return None
+        latest = self._buffer.latest_indexed()
+        if latest is None:
+            return None
+        # Try OCR on the latest indexed main frame; fall back to scanning
+        # backwards through any older buffered frames if it fails.
+        with self._buffer._lock:  # noqa: SLF001
+            candidates = list(self._buffer._frames)  # noqa: SLF001
+        for main_ts, main_frame in reversed(candidates):
+            dt = read_timestamp(main_frame, _OSD_REGION_MAIN)
+            if dt is None:
+                continue
+            wallclock_unix = dt.timestamp()
+            drift_main = main_ts - wallclock_unix
+            drift_sub = job.target_ts - job.target_wallclock_unix
+            offset = drift_main - drift_sub
+            log.info(
+                "thumb upgrade: calibrated cross_stream_offset=%+.3fs "
+                "(drift_main=%.3f drift_sub=%.3f, OCR=%s)",
+                offset, drift_main, drift_sub, dt.strftime("%H:%M:%S"),
+            )
+            return offset
+        return None
 
     def _wait_until_matching_frame_available(
         self, target_ts: float, timeout_s: float

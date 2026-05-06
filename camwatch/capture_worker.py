@@ -288,12 +288,14 @@ class CaptureWorker(threading.Thread):
                     sub_bbox = ev.bbox
                     upgrader = self._upgrader
                     cls_name_for_upgrade = ev.cls_name
-                    # Use line-B crossing time (sub-stream PTS-anchored monotonic)
-                    # as the target ts for the main-stream lookup. Both streams'
-                    # PTS are anchored to time.monotonic() at their first frames,
-                    # so lookup by sub_ts directly into main buffer is valid as
-                    # long as the camera stamps PTS from a shared internal clock.
+                    # Trigger time in two domains for the upgrader:
+                    #   target_ts        — sub-stream PTS-anchored monotonic
+                    #                      (the time domain Frame.ts lives in)
+                    #   target_wallclock — datetime.now() at the trigger; used
+                    #                      ONCE to calibrate the cross-stream
+                    #                      offset against an OCR'd main frame.
                     target_ts = ev.t_b
+                    target_wallclock = captured_at
 
                     # pass_id isn't known until insert_pass below, but
                     # on_finalize fires later (after the recorder's post-roll
@@ -311,6 +313,7 @@ class CaptureWorker(threading.Thread):
                             _size=(sub_w, sub_h),
                             _up=upgrader,
                             _ts=target_ts,
+                            _wc=target_wallclock,
                             _holder=pid_holder,
                         ) -> None:
                             pid = _holder[0]
@@ -323,6 +326,7 @@ class CaptureWorker(threading.Thread):
                                 sub_bbox=_bbox,
                                 sub_frame_size=_size,
                                 target_ts=_ts,
+                                target_wallclock=_wc,
                             )
 
                     clip_path = recorder.trigger(
