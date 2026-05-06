@@ -275,15 +275,20 @@ class TimestampedFrameBuffer:
     def _run(self) -> None:
         last_status_log = 0.0
         n_sampled = 0
+        last_sampled_ts: float = -1e18  # so the first frame is always kept
         for fr in self._stream.frames():
             if self._stop_evt.is_set():
                 return
             now = time.monotonic()
-            # Sub-sample by wall-clock interval so the buffer stays bounded
-            # but still has multiple frames per second of camera time.
-            if now - self._last_sample_t < self._sample_interval:
+            # Sub-sample by *camera-time* (fr.ts) rather than monotonic.
+            # ffmpeg/RTSP buffer pumping delivers frames in bursts; sampling
+            # by monotonic skips most frames within a burst, leaving
+            # multi-second gaps in main_ts space exactly where lookups can
+            # land. Sampling by fr.ts guarantees ≤ sample_interval_s gaps
+            # in the buffer's ts coverage no matter how bursty delivery is.
+            if fr.ts - last_sampled_ts < self._sample_interval:
                 continue
-            self._last_sample_t = now
+            last_sampled_ts = fr.ts
             n_sampled += 1
             with self._lock:
                 if fr.epoch != self._latest_epoch and self._latest_epoch != 0:
