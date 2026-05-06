@@ -2,20 +2,21 @@
 
 Upgrades a pass's thumbnail from the sub-stream-derived crop to a
 higher-resolution crop pulled from a parallel high-res RTSP stream.
-Instead of trying to keep the main stream "live" (which ffmpeg's RTSP
-buffering makes unreliable), we lean on the camera's burned-in
-1-second-resolution wall clock: every sampled main frame is keyed by
-the datetime its OSD shows, and at trigger time we look up the frame
-that matches the trigger's wall clock.
+The main stream's ffmpeg buffer can deliver frames seconds late, so we
+buffer sampled main frames keyed by their PTS-anchored monotonic ts
+(`Frame.ts` from `RtspStream`) and look up by the trigger's t_b/t_a —
+both timestamps live in the same monotonic domain because each stream's
+PTS is anchored to `time.monotonic()` at its own first frame.
 
 Per pass:
 
-  1. Find the buffered main frame whose burned-in datetime matches the
-     trigger's `captured_at` (within ±1.5s).
-  2. Run YOLO once on that frame.
-  3. Pick the detection of the focus track's class with highest IoU
+  1. Wait until the buffer holds a frame with ts ≥ trigger ts.
+  2. Find the buffered main frame whose ts is closest to the trigger
+     (within ±1.5s tolerance).
+  3. Run YOLO once on that frame.
+  4. Pick the detection of the focus track's class with highest IoU
      against the projected sub-stream bbox; fall back to nearest center.
-  4. Crop with padding, atomic-rename the JPEG over the existing
+  5. Crop with padding, atomic-rename the JPEG over the existing
      thumbnail.
 
 If anything fails (no matching frame, no detection of the right class,
@@ -28,7 +29,6 @@ import logging
 import queue
 import threading
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -38,7 +38,6 @@ from .capture import TimestampedFrameBuffer
 from .config import ModelConfig
 from .db import Database
 from .detect import Detector
-from .ts_reader import read_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +49,7 @@ class _Job:
     focus_cls_name: str
     sub_bbox: tuple[float, float, float, float]
     sub_frame_size: tuple[int, int]  # (w, h) of the sub-stream frame
-    target_dt: datetime               # wall-clock at trigger (naive ok)
+    target_ts: float                  # sub-stream PTS-anchored monotonic ts at trigger
 
 
 class ThumbUpgrader:
@@ -58,14 +57,12 @@ class ThumbUpgrader:
         self,
         rtsp_url: str,
         model: ModelConfig,
-        ocr_region: tuple[int, int, int, int],
         db: Database,
         target_w: int = 320,
         queue_size: int = 8,
     ) -> None:
         self._rtsp_url = rtsp_url
         self._model_cfg = model
-        self._ocr_region = ocr_region
         self._db = db
         self._target_w = int(target_w)
         self._queue: queue.Queue[_Job] = queue.Queue(maxsize=queue_size)
@@ -79,8 +76,6 @@ class ThumbUpgrader:
             return
         self._buffer = TimestampedFrameBuffer(
             url=self._rtsp_url,
-            ocr_region=self._ocr_region,
-            ocr_fn=read_timestamp,
             max_age_s=15.0,
             sample_interval_s=0.25,
             name="thumb-stream",
@@ -88,7 +83,7 @@ class ThumbUpgrader:
         self._buffer.start()
         self._thread = threading.Thread(target=self._run, name="thumb-upgrader", daemon=True)
         self._thread.start()
-        log.info("thumb upgrader started (ocr_region=%s)", self._ocr_region)
+        log.info("thumb upgrader started (pure-PTS lookup)")
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -106,19 +101,15 @@ class ThumbUpgrader:
         focus_cls_name: str,
         sub_bbox: tuple[float, float, float, float],
         sub_frame_size: tuple[int, int],
-        target_dt: datetime,
+        target_ts: float,
     ) -> None:
-        # Strip tzinfo: the camera OSD is naive wall clock, our parsed
-        # timestamps are naive too. Comparing naive↔aware would error.
-        if target_dt.tzinfo is not None:
-            target_dt = target_dt.replace(tzinfo=None)
         job = _Job(
             pass_id=pass_id,
             thumb_path=thumb_path,
             focus_cls_name=focus_cls_name,
             sub_bbox=sub_bbox,
             sub_frame_size=sub_frame_size,
-            target_dt=target_dt,
+            target_ts=target_ts,
         )
         try:
             self._queue.put_nowait(job)
@@ -151,26 +142,25 @@ class ThumbUpgrader:
     def _process(self, job: _Job) -> None:
         assert self._buffer is not None
         thumb_name = Path(job.thumb_path).name
-        # The main stream is typically several seconds behind the sub stream
-        # because of ffmpeg buffering. Wait for a buffered frame whose OSD
-        # matches the trigger time before looking up.
-        self._wait_until_matching_frame_available(job.target_dt, timeout_s=45.0)
-        match = self._buffer.find_frame_at(job.target_dt, tolerance_s=2.5)
+        # The main stream lags the sub stream by ffmpeg buffer depth. Wait
+        # for a buffered frame whose ts has reached the trigger before
+        # looking up.
+        self._wait_until_matching_frame_available(job.target_ts, timeout_s=45.0)
+        match = self._buffer.find_frame_at(job.target_ts, tolerance_s=2.5)
         if match is None:
             latest = self._buffer.latest_indexed()
-            latest_str = latest[0].strftime("%H:%M:%S") if latest else "n/a"
+            latest_str = f"{latest[0]:.3f}" if latest else "n/a"
             log.info(
-                "thumb upgrade: no main frame matching %s (latest indexed=%s) — %s",
-                job.target_dt.strftime("%H:%M:%S"), latest_str, thumb_name,
+                "thumb upgrade: no main frame matching ts=%.3f (latest=%s) — %s",
+                job.target_ts, latest_str, thumb_name,
             )
             self._db.set_thumb_upgrade_status(job.pass_id, "failed")
             return
-        matched_dt, frame = match
+        matched_ts, frame = match
         h, w = frame.shape[:2]
         log.info(
-            "thumb upgrade: matched main frame at %s for trigger %s (%dx%d) — %s",
-            matched_dt.strftime("%H:%M:%S"), job.target_dt.strftime("%H:%M:%S"), w, h,
-            thumb_name,
+            "thumb upgrade: matched main frame ts=%.3f for trigger ts=%.3f (Δ=%+.3fs %dx%d) — %s",
+            matched_ts, job.target_ts, matched_ts - job.target_ts, w, h, thumb_name,
         )
 
         if self._detector is None:
@@ -259,19 +249,18 @@ class ThumbUpgrader:
         self._db.set_thumb_upgrade_status(job.pass_id, "ok")
 
     def _wait_until_matching_frame_available(
-        self, target_dt: datetime, timeout_s: float
+        self, target_ts: float, timeout_s: float
     ) -> bool:
-        """Block (with polling) until the buffer holds a frame whose OSD
-        is at or past `target_dt`, or until the timeout. Returns True if a
-        candidate was indexed within the window."""
+        """Block (with polling) until the buffer holds a frame whose ts is
+        at or past `target_ts`, or until the timeout. Returns True if a
+        candidate has been indexed within the window."""
         import time as _t
         deadline = _t.monotonic() + timeout_s
-        target_naive = target_dt.replace(tzinfo=None) if target_dt.tzinfo else target_dt
         while not self._stop_evt.is_set() and _t.monotonic() < deadline:
             if self._buffer is None:
                 return False
             latest = self._buffer.latest_indexed()
-            if latest is not None and latest[0] >= target_naive:
+            if latest is not None and latest[0] >= target_ts:
                 return True
             _t.sleep(0.25)
         return False

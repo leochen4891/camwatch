@@ -164,39 +164,43 @@ def _redact_url(url: str) -> str:
 
 
 class TimestampedFrameBuffer:
-    """Parallel high-res RTSP reader keyed by the camera's burned-in OSD time.
+    """Parallel high-res RTSP reader indexed by camera-side PTS.
 
-    The main stream's ffmpeg buffer is deep enough that the "latest" frame
-    we read can be many seconds behind the live event we're trying to
-    correlate with. Rather than fight that buffering, we lean on the fact
-    that the camera burns a 1-second-resolution wall clock into every
-    frame: we OCR each sampled frame's OSD, store it under that datetime
-    key, and let callers ask "give me the frame whose content was captured
-    at time T."
+    The main stream's ffmpeg buffer can deliver frames many seconds late
+    relative to the live event we want to correlate with. We use the
+    frame's PTS (`cv2.CAP_PROP_POS_MSEC`) anchored to `time.monotonic()`
+    at the first frame so each buffered frame's `ts` reflects its true
+    capture time. Callers look up by ts directly — same time domain as
+    `Frame.ts` from RtspStream, so a trigger event's t_a/t_b can be
+    passed straight in.
 
-    Frames are sub-sampled (`sample_interval_s`, default 1s) so OCR work
-    stays bounded; the buffer evicts entries older than `max_age_s`.
+    The PTS counter is stream-relative (resets on each RTSP session
+    open), so this stream's anchor is independent of the sub-stream's.
+    Pure-PTS matching across the two sessions assumes the camera stamps
+    PTS from a shared internal video clock, so two near-simultaneous
+    session opens produce offsets that cancel — empirically correct for
+    Reolink E1; if it ever drifts, swap to OCR-driven sync.
+
+    Frames are sub-sampled by interval (`sample_interval_s`, default
+    0.25s); the buffer evicts entries older than `max_age_s`.
     """
 
     def __init__(
         self,
         url: str,
-        ocr_region: tuple[int, int, int, int],
-        ocr_fn: "Callable[[np.ndarray, tuple[int,int,int,int]], object] | None" = None,
         max_age_s: float = 15.0,
-        sample_interval_s: float = 1.0,
+        sample_interval_s: float = 0.25,
         name: str = "ts-stream",
     ) -> None:
         self._stream = RtspStream(url)
-        self._region = ocr_region
-        self._ocr = ocr_fn
         self._max_age = float(max_age_s)
         self._sample_interval = float(sample_interval_s)
         self._name = name
         self._lock = threading.Lock()
-        # Indexed by datetime (second-resolution) -> (monotonic_ts, frame).
-        self._frames: "dict[Any, tuple[float, np.ndarray]]" = {}
-        self._latest_dt: Any = None
+        # Sorted-by-insertion list of (ts, frame). Sample interval is
+        # uniform-ish so insertion order matches ts order; we don't bisect.
+        self._frames: list[tuple[float, np.ndarray]] = []
+        self._latest_ts: float = 0.0
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
         self._last_sample_t: float = 0.0
@@ -215,95 +219,62 @@ class TimestampedFrameBuffer:
             self._thread = None
 
     def find_frame_at(
-        self, target_dt: Any, tolerance_s: float = 1.5
-    ) -> "tuple[Any, np.ndarray] | None":
-        """Return the (datetime, frame) closest to `target_dt` within tolerance."""
+        self, target_ts: float, tolerance_s: float = 1.5
+    ) -> "tuple[float, np.ndarray] | None":
+        """Return the (ts, frame) closest to `target_ts` within tolerance."""
         with self._lock:
-            best: tuple[float, Any, np.ndarray] | None = None
-            for dt, (_mono, frame) in self._frames.items():
-                # both naive datetimes; compute |delta|
-                if hasattr(target_dt, "tzinfo") and target_dt.tzinfo is not None:
-                    cmp = target_dt.replace(tzinfo=None)
-                else:
-                    cmp = target_dt
-                delta = abs((dt - cmp).total_seconds())
+            best: tuple[float, float, np.ndarray] | None = None
+            for ts, frame in self._frames:
+                delta = abs(ts - target_ts)
                 if delta > tolerance_s:
                     continue
                 if best is None or delta < best[0]:
-                    best = (delta, dt, frame)
+                    best = (delta, ts, frame)
         if best is None:
             return None
         return (best[1], best[2])
 
-    def latest_indexed(self) -> "tuple[Any, np.ndarray] | None":
-        """Most recent frame for which OCR succeeded (used for diagnostics)."""
+    def latest_indexed(self) -> "tuple[float, np.ndarray] | None":
+        """Most recent buffered frame (used for diagnostics)."""
         with self._lock:
-            if self._latest_dt is None or self._latest_dt not in self._frames:
+            if not self._frames:
                 return None
-            _mono, frame = self._frames[self._latest_dt]
-            return (self._latest_dt, frame)
+            return self._frames[-1]
 
     def _run(self) -> None:
         last_status_log = 0.0
-        ocr_attempts = 0
-        ocr_failures = 0
+        n_sampled = 0
         for fr in self._stream.frames():
             if self._stop_evt.is_set():
                 return
             now = time.monotonic()
-            # Sub-sample: at most one indexed frame per sample_interval.
+            # Sub-sample by wall-clock interval so the buffer stays bounded
+            # but still has multiple frames per second of camera time.
             if now - self._last_sample_t < self._sample_interval:
                 continue
-            if self._ocr is None:
-                continue
             self._last_sample_t = now
-            ocr_attempts += 1
-            dt = self._ocr(fr.image, self._region)
-            if dt is None:
-                ocr_failures += 1
-                # Periodically dump a failed crop for forensic inspection.
-                if ocr_failures <= 3 or ocr_failures % 50 == 0:
-                    import cv2 as _cv2
-                    x1, y1, x2, y2 = self._region
-                    _cv2.imwrite(
-                        f"/tmp/ts_fail_{ocr_failures:03d}.png",
-                        fr.image[y1:y2, x1:x2],
-                    )
-                continue
-            # Sanity: the camera clock should be sync'd with ours, and
-            # the main-stream RTSP buffer never drifts more than ~25s. Reject
-            # OCR readings outside (wall_clock - 60s, wall_clock + 5s).
-            # This catches Tesseract hallucinations like 36→55 in low light.
-            from datetime import datetime as _dt, timedelta as _td
-            now_naive = _dt.now().replace(microsecond=0)
-            if dt > now_naive + _td(seconds=5) or now_naive - dt > _td(seconds=60):
-                ocr_failures += 1
-                if ocr_failures % 25 == 0:
-                    log.info(
-                        "ts buffer: rejected OCR (wall-clock mismatch) osd=%s now=%s",
-                        dt.strftime("%H:%M:%S"), now_naive.strftime("%H:%M:%S"),
-                    )
-                continue
+            n_sampled += 1
             with self._lock:
-                self._frames[dt] = (now, fr.image)
-                self._latest_dt = dt
+                self._frames.append((fr.ts, fr.image))
+                self._latest_ts = fr.ts
                 self._evict_locked(now)
-            # Periodic diagnostic so we can see how far behind real time the
-            # main stream is running. Lag = (wall clock now) - (frame's OSD).
             if now - last_status_log >= 10.0:
                 last_status_log = now
-                from datetime import datetime as _dt
-                lag = (_dt.now().replace(microsecond=0) - dt).total_seconds()
+                lag = now - fr.ts
                 log.info(
-                    "ts buffer: latest osd=%s lag=%+.0fs n=%d ocr_ok=%d/%d",
-                    dt.strftime("%H:%M:%S"), lag, len(self._frames),
-                    ocr_attempts - ocr_failures, ocr_attempts,
+                    "ts buffer: latest_ts=%.3f lag=%+.2fs n=%d sampled=%d",
+                    fr.ts, lag, len(self._frames), n_sampled,
                 )
-                ocr_attempts = 0
-                ocr_failures = 0
+                n_sampled = 0
 
     def _evict_locked(self, now: float) -> None:
+        # ts is monotonic-anchored, so age = now - ts. Drop the prefix that's
+        # too old — list is in insertion (== ts) order.
         cutoff = now - self._max_age
-        stale = [k for k, (mono, _) in self._frames.items() if mono < cutoff]
-        for k in stale:
-            self._frames.pop(k, None)
+        i = 0
+        for ts, _ in self._frames:
+            if ts >= cutoff:
+                break
+            i += 1
+        if i > 0:
+            del self._frames[:i]

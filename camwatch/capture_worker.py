@@ -175,16 +175,12 @@ class CaptureWorker(threading.Thread):
             self._preview.configure(cal.roi, cal.line_a_x, cal.line_b_x)
 
         # Optional: parallel high-res stream for thumbnail upgrades.
-        # The OCR region is the pixel rectangle in the main stream where the
-        # camera's OSD timestamp sits. Hard-coded for the Reolink E1 main
-        # stream (2560x1920) with the OSD positioned at the bottom of the
-        # frame; if the stream resolution changes this needs to move with it.
+        # Indexing is purely PTS-anchored monotonic now; no OCR region needed.
         thumb_url = self._cfg.camera.rtsp_url_thumb
         if thumb_url:
             self._upgrader = ThumbUpgrader(
                 rtsp_url=thumb_url,
                 model=self._cfg.model,
-                ocr_region=(700, 1810, 2000, 1910),
                 db=self._db,
             )
             self._upgrader.start()
@@ -292,7 +288,12 @@ class CaptureWorker(threading.Thread):
                     sub_bbox = ev.bbox
                     upgrader = self._upgrader
                     cls_name_for_upgrade = ev.cls_name
-                    target_dt = captured_at  # tz-aware; upgrader strips tzinfo
+                    # Use line-B crossing time (sub-stream PTS-anchored monotonic)
+                    # as the target ts for the main-stream lookup. Both streams'
+                    # PTS are anchored to time.monotonic() at their first frames,
+                    # so lookup by sub_ts directly into main buffer is valid as
+                    # long as the camera stamps PTS from a shared internal clock.
+                    target_ts = ev.t_b
 
                     # pass_id isn't known until insert_pass below, but
                     # on_finalize fires later (after the recorder's post-roll
@@ -309,7 +310,7 @@ class CaptureWorker(threading.Thread):
                             _bbox=sub_bbox,
                             _size=(sub_w, sub_h),
                             _up=upgrader,
-                            _dt=target_dt,
+                            _ts=target_ts,
                             _holder=pid_holder,
                         ) -> None:
                             pid = _holder[0]
@@ -321,7 +322,7 @@ class CaptureWorker(threading.Thread):
                                 focus_cls_name=_cls,
                                 sub_bbox=_bbox,
                                 sub_frame_size=_size,
-                                target_dt=_dt,
+                                target_ts=_ts,
                             )
 
                     clip_path = recorder.trigger(
