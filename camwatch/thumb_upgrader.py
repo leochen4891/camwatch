@@ -341,9 +341,24 @@ class ThumbUpgrader:
                 (ts, frame) for ts, epoch, frame in self._buffer._frames  # noqa: SLF001
                 if epoch == current_epoch
             ]
+        # Sanity-check the OCR result against the current wallclock. Tesseract
+        # occasionally misreads digits in similar shapes (8↔6, 5↔3) and can
+        # produce a timestamp hours off, which would poison the cached offset.
+        # Reject any OCR'd datetime that's more than a minute from now and
+        # try the next candidate.
+        from datetime import datetime as _dt, timedelta as _td
+        now_local = _dt.now()
         for main_ts, main_frame in reversed(candidates):
             dt = read_timestamp(main_frame, _OSD_REGION_MAIN)
             if dt is None:
+                continue
+            if abs(dt - now_local) > _td(seconds=60):
+                log.info(
+                    "thumb upgrade: OCR sanity check failed (osd=%s now=%s, "
+                    "Δ=%+.0fs); trying next frame",
+                    dt.strftime("%H:%M:%S"), now_local.strftime("%H:%M:%S"),
+                    (dt - now_local).total_seconds(),
+                )
                 continue
             wallclock_unix = dt.timestamp()
             drift_main = main_ts - wallclock_unix
