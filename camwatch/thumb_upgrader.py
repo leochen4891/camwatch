@@ -240,13 +240,16 @@ class ThumbUpgrader:
             log.info("thumb upgrade: crop too small, skipping %s", thumb_name)
             self._db.set_thumb_upgrade_status(job.pass_id, "failed")
             return
+        # Atomic write: encoder is selected from the extension, so the temp
+        # path must keep the .jpg suffix. Insert ".tmp" before the suffix
+        # rather than appending it.
         out_path = Path(job.thumb_path)
-        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
         cv2.imwrite(str(tmp_path), thumb, [cv2.IMWRITE_JPEG_QUALITY, 82])
         tmp_path.replace(out_path)
         if big is not None:
             big_path = out_path.with_name(out_path.stem + "_big.jpg")
-            big_tmp = big_path.with_suffix(big_path.suffix + ".tmp")
+            big_tmp = big_path.with_name(big_path.stem + ".tmp" + big_path.suffix)
             cv2.imwrite(str(big_tmp), big, [cv2.IMWRITE_JPEG_QUALITY, 88])
             big_tmp.replace(big_path)
         log.info(
