@@ -202,7 +202,7 @@ class TimestampedFrameBuffer:
     def __init__(
         self,
         url: str,
-        max_age_s: float = 15.0,
+        max_age_s: float = 30.0,
         sample_interval_s: float = 0.25,
         name: str = "ts-stream",
     ) -> None:

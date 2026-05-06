@@ -99,7 +99,7 @@ class ThumbUpgrader:
             return
         self._buffer = TimestampedFrameBuffer(
             url=self._rtsp_url,
-            max_age_s=15.0,
+            max_age_s=30.0,
             sample_interval_s=0.25,
             name="thumb-stream",
         )
