@@ -292,10 +292,14 @@ class CaptureWorker(threading.Thread):
                     #   target_ts        — sub-stream PTS-anchored monotonic
                     #                      (the time domain Frame.ts lives in)
                     #   target_wallclock — datetime.now() at the trigger; used
-                    #                      ONCE to calibrate the cross-stream
-                    #                      offset against an OCR'd main frame.
+                    #                      ONCE per (sub_epoch, main_epoch) to
+                    #                      calibrate the cross-stream offset.
+                    #   sub_epoch        — bumps on each sub-stream reconnect;
+                    #                      the upgrader uses this to detect
+                    #                      that the cached offset is stale.
                     target_ts = ev.t_b
                     target_wallclock = captured_at
+                    target_sub_epoch = fr.epoch
 
                     # pass_id isn't known until insert_pass below, but
                     # on_finalize fires later (after the recorder's post-roll
@@ -314,6 +318,7 @@ class CaptureWorker(threading.Thread):
                             _up=upgrader,
                             _ts=target_ts,
                             _wc=target_wallclock,
+                            _ep=target_sub_epoch,
                             _holder=pid_holder,
                         ) -> None:
                             pid = _holder[0]
@@ -327,6 +332,7 @@ class CaptureWorker(threading.Thread):
                                 sub_frame_size=_size,
                                 target_ts=_ts,
                                 target_wallclock=_wc,
+                                sub_epoch=_ep,
                             )
 
                     clip_path = recorder.trigger(

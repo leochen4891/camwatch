@@ -44,6 +44,7 @@ class Frame:
     image: np.ndarray
     ts: float
     seq: int
+    epoch: int = 0  # Bumps on each RTSP reconnect; ts space resets per epoch.
 
 
 class RtspStream:
@@ -58,6 +59,17 @@ class RtspStream:
         self._max_failures = max_consecutive_read_failures
         self._cap: cv2.VideoCapture | None = None
         self._stop = False
+        # session_epoch increments on each reconnect (each new VideoCapture).
+        # Frames yielded from the same RTSP session share an epoch, and that
+        # epoch is the validity scope of their ts space — PTS is re-anchored
+        # to monotonic at the first frame of every session, so anything that
+        # caches a derived value (e.g. a cross-stream offset) must invalidate
+        # when the epoch advances.
+        self._session_epoch = 0
+
+    @property
+    def session_epoch(self) -> int:
+        return self._session_epoch
 
     def stop(self) -> None:
         self._stop = True
@@ -68,6 +80,8 @@ class RtspStream:
             self._open()
             cap = self._cap
             assert cap is not None
+            self._session_epoch += 1
+            current_epoch = self._session_epoch
 
             # Background reader fills a single-slot buffer with the latest frame.
             latest: list[tuple[np.ndarray, float] | None] = [None]
@@ -130,7 +144,7 @@ class RtspStream:
                         continue
                     image, ts = item
                     seq += 1
-                    yield Frame(image=image, ts=ts, seq=seq)
+                    yield Frame(image=image, ts=ts, seq=seq, epoch=current_epoch)
                     if not reader_thread.is_alive():
                         break
             finally:
@@ -197,10 +211,14 @@ class TimestampedFrameBuffer:
         self._sample_interval = float(sample_interval_s)
         self._name = name
         self._lock = threading.Lock()
-        # Sorted-by-insertion list of (ts, frame). Sample interval is
+        # Sorted-by-insertion list of (ts, epoch, frame). Sample interval is
         # uniform-ish so insertion order matches ts order; we don't bisect.
-        self._frames: list[tuple[float, np.ndarray]] = []
+        # Epoch is stored per-frame because RTSP reconnect resets the ts
+        # anchor, so a cached cross-stream offset is only valid against
+        # frames from the same epoch.
+        self._frames: list[tuple[float, int, np.ndarray]] = []
         self._latest_ts: float = 0.0
+        self._latest_epoch: int = 0
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
         self._last_sample_t: float = 0.0
@@ -221,10 +239,17 @@ class TimestampedFrameBuffer:
     def find_frame_at(
         self, target_ts: float, tolerance_s: float = 1.5
     ) -> "tuple[float, np.ndarray] | None":
-        """Return the (ts, frame) closest to `target_ts` within tolerance."""
+        """Return the (ts, frame) closest to `target_ts` within tolerance.
+
+        Only frames from the current (latest) epoch are considered — older
+        epochs hold ts values from a stale anchor and are not comparable.
+        """
         with self._lock:
+            current_epoch = self._latest_epoch
             best: tuple[float, float, np.ndarray] | None = None
-            for ts, frame in self._frames:
+            for ts, epoch, frame in self._frames:
+                if epoch != current_epoch:
+                    continue
                 delta = abs(ts - target_ts)
                 if delta > tolerance_s:
                     continue
@@ -239,7 +264,13 @@ class TimestampedFrameBuffer:
         with self._lock:
             if not self._frames:
                 return None
-            return self._frames[-1]
+            ts, _epoch, frame = self._frames[-1]
+            return (ts, frame)
+
+    def current_epoch(self) -> int:
+        """Latest RTSP session epoch the buffer has seen, or 0 if empty."""
+        with self._lock:
+            return self._latest_epoch
 
     def _run(self) -> None:
         last_status_log = 0.0
@@ -255,24 +286,33 @@ class TimestampedFrameBuffer:
             self._last_sample_t = now
             n_sampled += 1
             with self._lock:
-                self._frames.append((fr.ts, fr.image))
+                if fr.epoch != self._latest_epoch and self._latest_epoch != 0:
+                    log.info(
+                        "ts buffer: stream reconnected (epoch %d → %d); ts space reset",
+                        self._latest_epoch, fr.epoch,
+                    )
+                self._frames.append((fr.ts, fr.epoch, fr.image))
                 self._latest_ts = fr.ts
+                self._latest_epoch = fr.epoch
                 self._evict_locked(now)
             if now - last_status_log >= 10.0:
                 last_status_log = now
                 lag = now - fr.ts
                 log.info(
-                    "ts buffer: latest_ts=%.3f lag=%+.2fs n=%d sampled=%d",
-                    fr.ts, lag, len(self._frames), n_sampled,
+                    "ts buffer: latest_ts=%.3f lag=%+.2fs n=%d sampled=%d epoch=%d",
+                    fr.ts, lag, len(self._frames), n_sampled, fr.epoch,
                 )
                 n_sampled = 0
 
     def _evict_locked(self, now: float) -> None:
         # ts is monotonic-anchored, so age = now - ts. Drop the prefix that's
-        # too old — list is in insertion (== ts) order.
+        # too old — list is in insertion (== ts) order. Frames from a previous
+        # epoch are also dropped here as they age out: their ts isn't in the
+        # current epoch's space, but the prefix sweep doesn't care because
+        # those frames are necessarily older (by wall-clock) than current ones.
         cutoff = now - self._max_age
         i = 0
-        for ts, _ in self._frames:
+        for ts, _epoch, _frame in self._frames:
             if ts >= cutoff:
                 break
             i += 1

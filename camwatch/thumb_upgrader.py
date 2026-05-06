@@ -64,6 +64,7 @@ class _Job:
     sub_frame_size: tuple[int, int]  # (w, h) of the sub-stream frame
     target_ts: float                  # sub-stream PTS-anchored monotonic ts at trigger
     target_wallclock_unix: float      # unix seconds at trigger (for offset calibration)
+    sub_epoch: int                    # sub-stream session epoch when ts was captured
 
 
 class ThumbUpgrader:
@@ -86,7 +87,12 @@ class ThumbUpgrader:
         self._detector: Detector | None = None  # lazy
         # cross_stream_offset = main_ts - sub_ts for the same camera-instant.
         # Computed lazily on the first job by OCR'ing a recent main frame.
+        # The cached value is only valid for the (sub_epoch, main_epoch) pair
+        # under which it was calibrated; either stream reconnecting bumps an
+        # epoch and forces a recalibration on the next lookup.
         self._cross_stream_offset: float | None = None
+        self._cached_sub_epoch: int = -1
+        self._cached_main_epoch: int = -1
 
     def start(self) -> None:
         if self._thread is not None:
@@ -120,14 +126,9 @@ class ThumbUpgrader:
         sub_frame_size: tuple[int, int],
         target_ts: float,
         target_wallclock: datetime,
+        sub_epoch: int,
     ) -> None:
-        # Strip tzinfo: OSD-derived datetimes are naive; we compare seconds-
-        # since-epoch only. .timestamp() works on both naive (assumes local)
-        # and aware datetimes.
-        if target_wallclock.tzinfo is None:
-            target_wallclock_unix = target_wallclock.timestamp()
-        else:
-            target_wallclock_unix = target_wallclock.timestamp()
+        target_wallclock_unix = target_wallclock.timestamp()
         job = _Job(
             pass_id=pass_id,
             thumb_path=thumb_path,
@@ -136,6 +137,7 @@ class ThumbUpgrader:
             sub_frame_size=sub_frame_size,
             target_ts=target_ts,
             target_wallclock_unix=target_wallclock_unix,
+            sub_epoch=sub_epoch,
         )
         try:
             self._queue.put_nowait(job)
@@ -169,19 +171,35 @@ class ThumbUpgrader:
         assert self._buffer is not None
         thumb_name = Path(job.thumb_path).name
 
-        # Lazy one-time calibration of cross_stream_offset using OCR on a
-        # recent main frame plus this trigger's (sub_ts, wallclock) pair.
-        # Subsequent jobs reuse the cached offset.
-        if self._cross_stream_offset is None:
-            self._cross_stream_offset = self._calibrate_offset(job)
-            if self._cross_stream_offset is None:
+        # The cached cross_stream_offset is only valid for the (sub_epoch,
+        # main_epoch) pair under which it was computed. If either stream
+        # reconnected since calibration, the ts spaces are reset and the
+        # offset is meaningless — recalibrate.
+        main_epoch = self._buffer.current_epoch()
+        if (
+            self._cross_stream_offset is None
+            or job.sub_epoch != self._cached_sub_epoch
+            or main_epoch != self._cached_main_epoch
+        ):
+            if self._cross_stream_offset is not None:
                 log.info(
-                    "thumb upgrade: cross-stream offset calibration failed for "
-                    "first job — %s; will retry on next pass",
+                    "thumb upgrade: epoch changed (sub %d→%d, main %d→%d); "
+                    "recalibrating offset",
+                    self._cached_sub_epoch, job.sub_epoch,
+                    self._cached_main_epoch, main_epoch,
+                )
+            offset = self._calibrate_offset(job)
+            if offset is None:
+                log.info(
+                    "thumb upgrade: cross-stream offset calibration failed — "
+                    "%s; will retry on next pass",
                     thumb_name,
                 )
                 self._db.set_thumb_upgrade_status(job.pass_id, "failed")
                 return
+            self._cross_stream_offset = offset
+            self._cached_sub_epoch = job.sub_epoch
+            self._cached_main_epoch = main_epoch
 
         # Map sub-anchored target ts into main-anchored ts space.
         target_main_ts = job.target_ts + self._cross_stream_offset
@@ -303,19 +321,26 @@ class ThumbUpgrader:
           drift_sub  = job.target_ts - job.target_wallclock_unix
           offset     = drift_main - drift_sub  (= main_ts - sub_ts at same instant)
 
-        Both drifts are constants for the session because each stream's
-        ts space is anchored once at first read. Returns None if no main
-        frame is OCR-readable yet (caller should retry on next job).
+        Both drifts are constants for the (sub_epoch, main_epoch) pair
+        under which they're computed; reconnect bumps an epoch and forces
+        a fresh calibration. Only main frames from the buffer's current
+        epoch are eligible — frames from a previous session live in a
+        different ts space. Returns None if no current-epoch frame is
+        OCR-readable yet (caller should retry on next job).
         """
         if self._buffer is None:
             return None
         latest = self._buffer.latest_indexed()
         if latest is None:
             return None
-        # Try OCR on the latest indexed main frame; fall back to scanning
-        # backwards through any older buffered frames if it fails.
+        # Try OCR on the most recent main frames; ignore frames from prior
+        # epochs which don't share the current ts anchor.
         with self._buffer._lock:  # noqa: SLF001
-            candidates = list(self._buffer._frames)  # noqa: SLF001
+            current_epoch = self._buffer._latest_epoch  # noqa: SLF001
+            candidates = [
+                (ts, frame) for ts, epoch, frame in self._buffer._frames  # noqa: SLF001
+                if epoch == current_epoch
+            ]
         for main_ts, main_frame in reversed(candidates):
             dt = read_timestamp(main_frame, _OSD_REGION_MAIN)
             if dt is None:
