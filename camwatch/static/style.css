@@ -164,38 +164,36 @@ header {
 }
 .muted-btn:hover { border-color: var(--accent); }
 
-/* Side-by-side preview + (filters + histogram) on wide viewports.
-   Below 900px the children stack vertically (default flex-wrap). */
-.top-area {
-  display: flex;
-  flex-wrap: wrap;
-  border-bottom: 1px solid var(--border);
+/* Two-column shell: left = preview + filters + heatmap + speed histogram,
+   right = pass list. Below 1100px the right column flows below the left. */
+.app-shell {
+  display: grid;
+  grid-template-columns: minmax(560px, 0.8fr) minmax(560px, 1fr);
+  gap: 0;
+  align-items: start;
+}
+.app-shell-left {
+  border-right: 1px solid var(--border);
   background: var(--surface);
-}
-.top-area > .preview-section {
-  flex: 0 0 auto;
-  border-bottom: 0;
-}
-.top-area > .top-right {
-  flex: 1 1 360px;
   min-width: 0;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--border);
 }
-.top-area > .top-right > .controls,
-.top-area > .top-right > .histogram-section {
+.app-shell-left > .preview-section,
+.app-shell-left > .controls,
+.app-shell-left > .heatmap-section,
+.app-shell-left > .histogram-section {
   background: var(--surface);
 }
-.top-area > .top-right > .histogram-section {
+.app-shell-left > .histogram-section {
   border-bottom: 0;
-  flex: 1 1 auto;
 }
-@media (max-width: 899px) {
-  .top-area > .top-right {
-    flex-basis: 100%;
-    border-left: 0;
-    border-top: 1px solid var(--border);
+.app-shell-right { min-width: 0; }
+@media (max-width: 1099px) {
+  .app-shell {
+    display: block;
+  }
+  .app-shell-left {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
   }
 }
 
@@ -250,16 +248,6 @@ header {
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
 }
-.controls input[type="datetime-local"] {
-  background: var(--surface-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  padding: 4px 6px;
-  border-radius: 4px;
-  font-size: 13px;
-  color-scheme: dark;
-}
-
 .histogram-section {
   padding: 12px 20px 18px;
   border-bottom: 1px solid var(--border);
@@ -276,7 +264,7 @@ header {
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  min-height: 130px;
+  min-height: 170px;
 }
 .bar-wrap {
   display: flex;
@@ -332,9 +320,6 @@ header {
 }
 .controls form { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
 .controls label { display: flex; gap: 6px; align-items: center; font-size: 14px; color: var(--muted); white-space: nowrap; }
-/* Put each datetime-local filter on its own row so they don't overflow narrow columns. */
-.controls form label:has(> input[type="datetime-local"]) { flex-basis: 100%; }
-.controls form input[type="datetime-local"] { flex: 0 0 auto; width: auto; max-width: 220px; }
 .controls select {
   background: var(--surface-2);
   color: var(--text);
@@ -355,7 +340,27 @@ header {
 .controls button:hover { border-color: var(--accent); }
 .controls button.danger { border-color: var(--alert); color: var(--alert); }
 
-main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
+main { padding: 16px 20px 80px; }
+.app-shell-right > #pass-list { max-width: 900px; margin: 0 auto; }
+.list-toolbar {
+  max-width: 900px;
+  margin: 0 auto 8px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+.refresh-btn {
+  font-size: 22px;
+  line-height: 1;
+  padding: 8px 16px;
+  min-width: 48px;
+  min-height: 40px;
+}
+.refresh-btn.spinning { animation: refresh-spin 0.6s linear infinite; }
+@keyframes refresh-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
 
 .paginator {
   display: flex;
@@ -662,3 +667,94 @@ main { padding: 16px 20px 80px; max-width: 900px; margin: 0 auto; }
   .controls { flex-direction: column; align-items: stretch; }
   main { padding: 12px; }
 }
+
+/* ---------- heatmap (week-view time filter) ---------- */
+.heatmap-section {
+  padding: 12px 20px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.heatmap-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.heatmap-title .muted {
+  text-transform: none;
+  letter-spacing: 0;
+  margin-left: 6px;
+  font-size: 11px;
+}
+.heatmap-grid {
+  display: grid;
+  grid-template-columns: 56px repeat(7, minmax(28px, 1fr));
+  grid-template-rows: 36px;
+  grid-auto-rows: 12px;
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+.heatmap-corner,
+.heatmap-day-header,
+.heatmap-slot-header,
+.heatmap-cell {
+  background: var(--surface);
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+}
+.heatmap-corner {
+  font-size: 14px;
+  line-height: 1;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+}
+.heatmap-corner:hover { color: var(--accent); background: #2a3140; }
+.heatmap-day-header {
+  height: 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  background: var(--surface-2);
+}
+.heatmap-day-header .heatmap-weekday { color: var(--text); font-weight: 600; font-size: 12px; }
+.heatmap-day-header .heatmap-date { color: var(--muted); font-size: 10px; }
+.heatmap-day-header:hover { background: #2a3140; }
+.heatmap-slot-header {
+  font-size: 10px;
+  text-align: right;
+  padding-right: 6px;
+  background: var(--surface-2);
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  line-height: 1;
+}
+.heatmap-slot-header:hover { color: var(--accent); }
+.heatmap-cell {
+  position: relative;
+  border: 0;
+  background: #000; /* deselected = pure black */
+}
+/* Selected scale: clearly-visible gray (no data) → blue gradient (heat). */
+.heatmap-cell.selected.heat-0 { background: #3a3f4a; }
+.heatmap-cell.selected.heat-1 { background: #1f3a5e; }
+.heatmap-cell.selected.heat-2 { background: #295488; }
+.heatmap-cell.selected.heat-3 { background: #356eaf; }
+.heatmap-cell.selected.heat-4 { background: #4185d2; }
+.heatmap-cell.selected.heat-5 { background: var(--accent); }
+.heatmap-cell:hover { outline: 1px solid var(--text); z-index: 2; }
+

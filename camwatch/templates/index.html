@@ -86,20 +86,20 @@
     </form>
   </dialog>
 
-  <div class="top-area">
-    <section class="preview-section">
-      <div class="preview-header">
-        <h2>Live preview</h2>
-        <button type="button" class="muted-btn" id="preview-toggle" onclick="togglePreview()">show</button>
-      </div>
-      <div class="preview-frame hidden" id="preview-frame">
-        <img alt="live preview" id="preview-img">
-      </div>
-    </section>
+  <div class="app-shell">
+    <aside class="app-shell-left">
+      <section class="preview-section">
+        <div class="preview-header">
+          <h2>Live preview</h2>
+          <button type="button" class="muted-btn" id="preview-toggle" onclick="togglePreview()">show</button>
+        </div>
+        <div class="preview-frame hidden" id="preview-frame">
+          <img alt="live preview" id="preview-img">
+        </div>
+      </section>
 
-    <div class="top-right">
       <section class="controls">
-        <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram">
+        <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram, #heatmap">
           <label>direction
             <select name="direction">
               <option value="">all</option>
@@ -108,8 +108,6 @@
             </select>
           </label>
           <label class="checkbox"><input type="checkbox" name="alerts_only" value="true"> alerts only</label>
-          <label>from <input type="datetime-local" name="from_ts"></label>
-          <label>to <input type="datetime-local" name="to_ts"></label>
           <input type="hidden" name="page" value="{{ page }}" id="page-input">
         </form>
       </section>
@@ -118,17 +116,31 @@
                hx-get="/passes"
                hx-trigger="change"
                hx-target="#pass-list"
-               hx-include="#filter-form, #histogram">
+               hx-include="#filter-form, #histogram, #heatmap">
         {% include "_histogram.html" %}
       </section>
-    </div>
-  </div>
 
-  <main>
-    <div id="pass-list">
-      {% include "_pass_list.html" %}
-    </div>
-  </main>
+      <section id="heatmap" class="heatmap-section"
+               hx-get="/passes"
+               hx-trigger="change"
+               hx-target="#pass-list"
+               hx-include="#filter-form, #histogram, #heatmap">
+        {% include "_heatmap.html" %}
+        <input type="hidden" name="time_mask" id="time-mask" value="{{ time_mask }}" form="filter-form">
+        <input type="hidden" name="time_ref_date" id="time-ref-date" value="{{ time_ref_date }}" form="filter-form">
+      </section>
+    </aside>
+
+    <main class="app-shell-right">
+      <div class="list-toolbar">
+        <button type="button" class="muted-btn refresh-btn" id="refresh-list-btn"
+                title="Refresh list" aria-label="Refresh list">↻</button>
+      </div>
+      <div id="pass-list">
+        {% include "_pass_list.html" %}
+      </div>
+    </main>
+  </div>
 
   <script>
     function goToPage(n) {
@@ -138,18 +150,180 @@
       htmx.trigger("#filter-form", "change");
     }
 
-    // Reset to page 1 whenever a filter (other than page) changes.
-    document.addEventListener("DOMContentLoaded", () => {
-      const filterForm = document.getElementById("filter-form");
-      const histogram = document.getElementById("histogram");
-      const reset = () => {
+    // Reset to page 1 whenever a filter (other than page) changes. We delegate
+    // from document.body so the listeners survive HTMX OOB swaps of #histogram
+    // and #heatmap (which replace those nodes wholesale).
+    document.body.addEventListener("change", (e) => {
+      const t = e.target;
+      if (!t) return;
+      if (t.closest("#filter-form")) {
+        if (t.name && t.name !== "page" && t.name !== "time_mask" && t.name !== "time_ref_date") {
+          const input = document.getElementById("page-input");
+          if (input) input.value = "1";
+        }
+        return;
+      }
+      if (t.closest("#histogram") || t.id === "heatmap" || t.closest("#heatmap")) {
         const input = document.getElementById("page-input");
         if (input) input.value = "1";
-      };
-      filterForm?.addEventListener("change", (e) => {
-        if (e.target && e.target.name && e.target.name !== "page") reset();
+      }
+    });
+
+    // ---------- heatmap (week-view time filter) ----------
+    const HEATMAP_SLOTS_PER_DAY = 32;       // 06:00-22:00 in 30-min steps
+    const HEATMAP_DAYS_IN_WEEK = 7;
+    const HEATMAP_TOTAL_SLOTS = HEATMAP_SLOTS_PER_DAY * HEATMAP_DAYS_IN_WEEK;
+    let heatmapMask = new Array(HEATMAP_TOTAL_SLOTS).fill(true);
+
+    function readHeatmapMaskFromInput() {
+      const input = document.getElementById("time-mask");
+      const s = input ? input.value : "";
+      if (s.length !== HEATMAP_TOTAL_SLOTS) {
+        return new Array(HEATMAP_TOTAL_SLOTS).fill(true);
+      }
+      return Array.from(s, c => c === "1");
+    }
+
+    function writeHeatmapMaskToInput() {
+      const input = document.getElementById("time-mask");
+      if (input) input.value = heatmapMask.map(b => b ? "1" : "0").join("");
+    }
+
+    function applyHeatmapMaskToDOM() {
+      document.querySelectorAll("#heatmap .heatmap-cell").forEach(cell => {
+        const i = parseInt(cell.dataset.index, 10);
+        cell.classList.toggle("selected", !!heatmapMask[i]);
       });
-      histogram?.addEventListener("change", reset);
+    }
+
+    function fireHeatmapChange() {
+      const heatmap = document.getElementById("heatmap");
+      if (heatmap) heatmap.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+
+    function setHeatmapSlots(indices, value) {
+      let changed = false;
+      for (const i of indices) {
+        if (heatmapMask[i] !== value) {
+          heatmapMask[i] = value;
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      writeHeatmapMaskToInput();
+      applyHeatmapMaskToDOM();
+      fireHeatmapChange();
+    }
+
+    function toggleHeatmapSlots(indices) {
+      const allSelected = indices.every(i => heatmapMask[i]);
+      setHeatmapSlots(indices, !allSelected);
+    }
+
+    function heatmapIndicesForDay(day) {
+      const out = new Array(HEATMAP_SLOTS_PER_DAY);
+      for (let s = 0; s < HEATMAP_SLOTS_PER_DAY; s++) out[s] = day * HEATMAP_SLOTS_PER_DAY + s;
+      return out;
+    }
+
+    function heatmapIndicesForSlot(slot) {
+      const out = new Array(HEATMAP_DAYS_IN_WEEK);
+      for (let d = 0; d < HEATMAP_DAYS_IN_WEEK; d++) out[d] = d * HEATMAP_SLOTS_PER_DAY + slot;
+      return out;
+    }
+
+    function heatmapAllIndices() {
+      const out = new Array(HEATMAP_TOTAL_SLOTS);
+      for (let i = 0; i < HEATMAP_TOTAL_SLOTS; i++) out[i] = i;
+      return out;
+    }
+
+    // Click handler for corner + headers (cells are handled via mousedown/drag).
+    document.body.addEventListener("click", (e) => {
+      if (!e.target.closest("#heatmap")) return;
+      const corner = e.target.closest("#heatmap-toggle-all");
+      if (corner) { toggleHeatmapSlots(heatmapAllIndices()); return; }
+      const dayHdr = e.target.closest(".heatmap-day-header");
+      if (dayHdr) {
+        toggleHeatmapSlots(heatmapIndicesForDay(parseInt(dayHdr.dataset.day, 10)));
+        return;
+      }
+      const slotHdr = e.target.closest(".heatmap-slot-header");
+      if (slotHdr) {
+        toggleHeatmapSlots(heatmapIndicesForSlot(parseInt(slotHdr.dataset.slot, 10)));
+        return;
+      }
+    });
+
+    // Press-and-drag toggle: at mousedown on a cell, decide a paint mode (the
+    // inverse of that cell's current state). As the cursor enters other cells
+    // while the button is held, paint them to the same mode. Fire HTMX once
+    // on mouseup so a drag across N cells is a single GET.
+    let heatmapDragActive = false;
+    let heatmapDragMode = false;
+    let heatmapDragChanged = false;
+
+    function paintHeatmapCell(cell, value) {
+      const i = parseInt(cell.dataset.index, 10);
+      if (heatmapMask[i] !== value) {
+        heatmapMask[i] = value;
+        cell.classList.toggle("selected", value);
+        heatmapDragChanged = true;
+      }
+    }
+
+    document.body.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      if (!e.target.closest("#heatmap")) return;
+      const cell = e.target.closest(".heatmap-cell");
+      if (!cell) return;
+      e.preventDefault(); // suppress text-selection while dragging
+      const i = parseInt(cell.dataset.index, 10);
+      heatmapDragActive = true;
+      heatmapDragMode = !heatmapMask[i];
+      heatmapDragChanged = false;
+      paintHeatmapCell(cell, heatmapDragMode);
+    });
+
+    document.body.addEventListener("mouseover", (e) => {
+      if (!heatmapDragActive) return;
+      const cell = e.target.closest(".heatmap-cell");
+      if (cell) paintHeatmapCell(cell, heatmapDragMode);
+    });
+
+    document.addEventListener("mouseup", () => {
+      if (!heatmapDragActive) return;
+      heatmapDragActive = false;
+      if (heatmapDragChanged) {
+        writeHeatmapMaskToInput();
+        fireHeatmapChange();
+      }
+    });
+
+    // After a #heatmap OOB swap, re-sync the JS mask from the freshly-rendered
+    // hidden input so JS state matches whatever the server actually used.
+    document.body.addEventListener("htmx:afterSwap", (e) => {
+      if (e.target && e.target.id === "heatmap") {
+        heatmapMask = readHeatmapMaskFromInput();
+      }
+    });
+
+    document.addEventListener("DOMContentLoaded", () => {
+      heatmapMask = readHeatmapMaskFromInput();
+    });
+
+    // Refresh button: re-trigger the filter-form to refetch /passes immediately.
+    document.body.addEventListener("click", (e) => {
+      if (!e.target.closest("#refresh-list-btn")) return;
+      const btn = document.getElementById("refresh-list-btn");
+      if (btn) btn.classList.add("spinning");
+      htmx.trigger("#filter-form", "change");
+    });
+    document.body.addEventListener("htmx:afterRequest", (e) => {
+      const elt = e.detail && e.detail.elt;
+      if (!elt || elt.id !== "filter-form") return;
+      const btn = document.getElementById("refresh-list-btn");
+      if (btn) btn.classList.remove("spinning");
     });
 
     function toggleMenu(btn) {
