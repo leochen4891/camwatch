@@ -1,500 +1,160 @@
 # camwatch
 
-Local traffic-speed monitor. Pulls a live RTSP feed from a Reolink IP camera, detects passing cars with YOLO, estimates each car's speed using a two-line crossing method, and writes an alert when the speed exceeds a threshold (default 40 mph).
+Local traffic-speed monitor for a residential street. Pulls a live RTSP feed from a Reolink IP camera, detects passing cars with YOLO, projects each detection through a calibrated homography into road-plane meters, fits a line to the trajectory to derive speed, and records every pass to a SQLite database with a video clip and a thumbnail.
 
-Two ways to run it:
+> Background reading:
+> - [Building CamWatch with Claude Code](https://leidevs.com/blog/camwatch/) — the original two-day end-to-end build.
+> - [Rebuilding camwatch's speed engine](https://leidevs.com/blog/camwatch-2/) — replacing the 2-line method with homography-based trajectory regression. Validated against ground-truth drives at 15 / 25 / 35 mph.
 
-- **Web UI** (recommended): `uv run python -m camwatch serve` starts an always-on capture worker plus a FastAPI/HTMX web app at `http://localhost:8000`. Browse passes, play overlay-rendered clips, set known speeds inline, batch-delete, configure threshold.
-- **Headless**: `uv run python -m camwatch` runs the live alert pipeline and writes events.jsonl + alert JPGs.
-
-Both modes write into the same SQLite database (`camwatch.db`).
-
----
+![Live preview with the calibrated grid overlay (top) and per-pass speed chart with regression window highlighted (bottom).](docs/images/camwatch-grid-overlay.png)
 
 ## What it does
 
 ```
-RTSP stream  →  YOLO detect  →  BotSORT track  →  two-line speed math  →  events.jsonl + JPG
+RTSP → YOLO detect → BotSORT track → homography projection
+                                          │
+                                          ▼
+                                  grid entry/exit trigger
+                                          │
+                                          ▼
+                               Y(t) regression → speed
+                                          │
+                                          ▼
+                              passes table + clip + thumb
 ```
 
-For every car in the camera's view:
-1. **Detect**: YOLO11n picks out cars/trucks/buses/motorcycles in each frame.
-2. **Track**: BotSORT assigns a stable `track_id` so the same car is followed across frames.
-3. **Time the crossing**: when a tracked car's bbox bottom-center crosses two pre-defined vertical screen lines, the elapsed time between crossings is recorded. Linear interpolation between adjacent frames cancels most of the frame-quantization noise.
-4. **Convert to mph**: divide a calibrated real-world distance by the elapsed time. The distance is calibrated separately for each direction (see "Why per-direction" below).
-5. **Log + alert**: every pass appends a JSON line to `events/events.jsonl`. Passes at or above the threshold also save a bbox-annotated JPG snapshot.
+For each car: detect, track, project bbox bottom-center through the homography matrix `H` to get `(X, Y)` meters on the road. A "pass" is a track entering the calibrated grid and later exiting it. Reported speed is the slope of a linear fit to `Y(t)` over a centered window — primary ±15 ft (where the homography is most accurate), widened to ±25 ft (full grid) when the primary has too few samples.
 
----
+The web UI lets you browse passes, play clips with the calibrated grid overlaid, and click into a per-pass speed chart that visualizes which samples contributed to the headline number.
 
-## How the speed math works
-
-### The two-line crossing method
-
-Pick two vertical lines on a still frame from the camera, line A on the left and line B on the right. Both lines are at fixed pixel x-coordinates. For each tracked car, watch when its ground point (the bottom-center of its bounding box, where the wheels meet the road) crosses each line:
-
-```
-                 line A           line B
-                   │                │
-   ───────────────────────────────────────────  far lane (N→S)
-   ───────────────────────────────────────────  near lane (S→N)
-                   │                │
-                   x_A              x_B
-                   t_A              t_B   ← interpolated crossing times
-```
-
-Then `speed = distance_between_lines / |t_B − t_A|`.
-
-The crossing times are interpolated linearly between adjacent frames so timing precision isn't quantized to the camera's frame interval. At ~10 fps that interpolation typically gives ~10 ms of timing precision per crossing, about ±0.4 mph at 30 mph and ±1.6 mph at 60 mph. Frame rate is **not** the practical bottleneck at residential speeds.
-
-### Why per-direction calibration
-
-The two lanes of the road are at different distances from the camera. A vertical line in screen space (constant x in pixels) hits the near lane and the far lane at different real-world points, so the actual road distance between line A and line B is different for each direction:
-
-```
-camera ─┐
-        │
-        ▼
-═════════════════  far lane (N→S)   ← distance ≈  9 m between lines
-═════════════════  near lane (S→N)  ← distance ≈ 11 m between lines
-```
-
-Ignoring this would produce a 10-25% per-direction error. So calibration stores two distances:
-
-```yaml
-line_distance_m_north: 11.5    # used when a car crosses A then B (left→right)
-line_distance_m_south:  9.1    # used when a car crosses B then A (right→left)
-```
-
-The live system picks the right distance based on which line was crossed first.
-
-### How calibration finds those distances
-
-Mathematically, `distance = speed × time`. So if you drive past at a known GPS-confirmed speed and the system measures elapsed time between line A and line B, the implied real-world distance is just `(known_mph in m/s) × elapsed_s`.
-
-You drive multiple passes per direction, each at a known GPS speed. The tool records elapsed times automatically. You then label each pass with the speed you were driving (skipping any other cars that happened to pass during the recording window). The averaged implied distance per direction goes into `calibration.yaml`.
-
-A typical calibration plan: 20, 30, 40 mph in each direction, two passes each = 12 passes total, ~10 minutes.
-
----
-
-## Architecture
-
-Two pipelines share most of the building blocks:
-
-**Headless** (`python -m camwatch`):
-```
-RTSP → detect → speed (crossing) → sink (events.jsonl + alert JPGs)
-```
-
-**Web UI** (`python -m camwatch serve`):
-```
-RTSP → detect → crossing → recorder (mp4 + thumb) → SQLite (passes)
-                       └→ preview buffer → FastAPI → browser
-```
-
-Modules:
-
-```
-camwatch/
-├── capture.py         RTSP frame source with reconnect. Yields (frame, pts_ts).
-├── detect.py          YOLO + BotSORT wrapper. Returns Track records per frame.
-├── crossing.py        Two-line crossing state machine (web UI source of truth).
-├── speed.py           Parallel crossing detector retained for headless mode.
-├── sink.py            Headless: append events.jsonl, save annotated JPG on alert.
-├── main.py            Headless wiring; handles SIGINT.
-├── recorder.py        Rolling ring buffer; on trigger writes a .mp4 (+ overlay) and a .jpg thumb.
-├── preview.py         Latest-frame MJPEG buffer for the live preview.
-├── db.py              SQLite (WAL) pass storage; single writer + many readers.
-├── capture_worker.py  Web UI: long-running thread driving detect → crossing → recorder → DB.
-├── thumb_upgrader.py  Background main-stream thumbnail upgrader, PTS-keyed.
-├── digit_matcher.py   Template-matching OCR for the camera's burned-in OSD timestamp.
-├── ts_reader.py       Legacy Tesseract-backed OSD reader (kept for diagnostic scripts).
-├── server.py          FastAPI app + Jinja2/HTMX rendering.
-├── calibrate.py       Interactive calibration CLI (subcommands below).
-├── config.py          Loads config.yaml + .env into a typed dataclass.
-└── __main__.py        Dispatches `python -m camwatch [serve]`.
-```
-
-### `capture.py`
-- `cv2.VideoCapture(url, CAP_FFMPEG)`. Reconnect loop after consecutive read failures.
-- Yields `Frame(image, ts, seq, epoch)` where `ts` is the frame's **camera-side PTS** (`cv2.CAP_PROP_POS_MSEC`) re-anchored to `time.monotonic()` at the first frame of each session. PTS is immune to ffmpeg's RTSP buffer-burst delivery, which we confirmed compresses `time.monotonic()` intervals badly enough to over-state speeds by 3× during traffic spikes. See `scripts/timing_probe.py` for the diagnostic.
-- `epoch` increments on each reconnect. Anything that caches a value derived from `ts` (e.g. the thumb upgrader's cross-stream offset) must invalidate when the epoch advances.
-- Per-stream ffmpeg options:
-  - **Sub stream (live capture)** uses `nobuffer + low_delay + BUFFERSIZE=1 + queue_size=1`. Right for latency: detection sees fresh state.
-  - **Main stream (thumb upgrader)** opens with neither flag and `queue_size=200` (bounded deque). The reader retains every frame ffmpeg gives us during post-keyframe burst delivery, instead of single-slot-overwriting them before the consumer iterates.
-- `TimestampedFrameBuffer` (used by the thumb upgrader) samples main-stream frames at 0.1s of *camera time* (not monotonic), evicts by `latest_ts - max_age` (not `monotonic_now - max_age`). Both anchors prevent the buffer from shrinking artificially when the main stream's pipeline lag fluctuates between 1s and 25s.
-
-### `detect.py`
-- Wraps `ultralytics.YOLO('yolo11n.pt').track(...)`.
-- Filters to COCO classes `[2 car, 3 motorcycle, 5 bus, 7 truck]`.
-- Tracker: BotSORT (Ultralytics built-in, default).
-- Runs on Apple Silicon MPS by default.
-- Returns `Track(track_id, cls_idx, cls_name, bbox, conf, ground_point)` where `ground_point = ((x1+x2)/2, y2)`. That's the bbox bottom-center, the most stable feature for road-crossing geometry.
-
-### `speed.py`
-- Per `track_id`, holds the most recent `(t, x)` sample.
-- On each new sample, checks whether x has crossed line A or line B since the previous sample. A crossing is detected by sign change in `(x_prev − line_x) × (x_curr − line_x)`.
-- Linear interpolation between the two adjacent samples gives the precise crossing time.
-- When both A and B have been crossed, emits a `SpeedEvent` and clears state for that track.
-- Stale tracks (no update for `max_track_age_s`, default 5s) are GC'd silently. They didn't complete a full crossing.
-
-### `sink.py`
-- Appends one JSON line per `SpeedEvent`:
-  ```json
-  {"ts":"2026-05-04T21:45:12-04:00","track_id":47,"class":"car","direction":"N","speed_mph":43.2,"alert":true,"snapshot":"events/2026-05-04T21-45-12_id47_N_43mph.jpg"}
-  ```
-- For events at or above the threshold, saves a JPG with the bbox and label drawn on, named with timestamp + track_id + direction + integer mph.
-
-### `thumb_upgrader.py` and `digit_matcher.py` — high-res thumbnail pipeline
-
-Each pass produces a sub-stream-derived thumbnail immediately. A separate worker tries to upgrade it to a high-resolution crop pulled from a parallel main-stream RTSP session. The chain:
-
-1. **Live trigger** in the sub-stream worker emits a `CrossingEvent` with `t_a` and `t_b` (PTS-anchored monotonic timestamps of each line crossing) and `direction`. The worker picks the *direction-appropriate exit-side line* as the lookup target — `t_b` for N-bound, `t_a` for S-bound — biased 0.3s earlier to compose the car cleanly inside the frame.
-
-2. **Cross-stream offset calibration** runs once per `(sub_epoch, main_epoch)` pair. Sub and main RTSP sessions each anchor their PTS independently at first frame, so the same camera-instant produces different `*_ts` values in each stream. We measure the constant offset by:
-   - Watching for an **OSD second-tick** in each stream (consecutive frames whose burned-in OSD digits differ by 1 second). The midpoint of those two frames' `ts` values gives the camera-instant of the tick at ±half-frame-interval precision.
-   - `drift_main = tick_main_ts − tick_wallclock_unix` (from main-stream OSD ticks)
-   - `drift_sub = tick_sub_ts − tick_wallclock_unix` (from sub-stream OSD ticks)
-   - `cross_stream_offset = drift_main − drift_sub`
-   The offset is then used as pure PTS arithmetic for every subsequent trigger: `target_main_ts = trigger.target_ts + offset`. No more OCR per-frame.
-
-3. **OSD reading** uses `digit_matcher.py`: a fixed-font template matcher that slides per-digit reference images (`templates/{sub,main}/digit_<X>.png`) against a binarized OSD strip and picks the 14 strongest non-overlapping peaks via NMS. Tesseract had ~30% misread rate on this small font (8↔6, 0↔O, 5↔3); template matching is near-deterministic. The reference templates are bootstrapped per camera installation by `scripts/collect_digit_templates.py` + `scripts/scan_digit_seconds.py`, with manual visual confirmation.
-
-4. **Lookup** in the main buffer uses `find_frame_at(target_main_ts, tolerance=±1.5s)`. The matched frame goes through YOLO again to find the focus track, projected from the sub bbox via aspect-ratio-aware width/height ratios. The crop is atomically renamed over the existing thumbnail.
-
-If anything fails (no main frame within tolerance, no detections, decode error, write error), the existing sub-stream thumbnail stays untouched.
-
----
-
-## Prerequisites
-
-- macOS, Apple Silicon (the project runs on MPS for inference)
-- Reolink camera with **RTSP enabled** (Reolink mobile app → Settings → Network → Advanced → Port Settings → enable RTSP)
-- Homebrew packages: `brew install uv ffmpeg`
-
----
+![Per-pass speed chart: each detection plotted as a v_inst dot, regression-window samples highlighted, orange best-fit line through them.](docs/images/camwatch-speed-chart.png)
 
 ## Setup
 
 ```sh
 git clone git@github.com:leochen4891/camwatch.git
 cd camwatch
-uv venv --python 3.12
-uv sync
+uv venv --python 3.12 && uv sync
 
-cp .env.example .env                        # edit: REOLINK_USER, REOLINK_PASS
+cp .env.example .env                      # edit: REOLINK_USER, REOLINK_PASS
 cp config/config.example.yaml config/config.yaml
-cp config/calibration.example.yaml config/calibration.yaml
+
+uv run python scripts/test_stream.py      # smoke test: ~10-25 fps to /tmp/
 ```
 
-Quick smoke test against the camera:
+Prerequisites: macOS Apple Silicon (uses MPS for inference), Reolink camera with RTSP enabled, `brew install uv ffmpeg`.
 
-```sh
-uv run python scripts/test_stream.py
-```
+## Calibration
 
-Expected: ~10-25 fps printed and one frame written to `/tmp/camwatch_test.jpg`.
+The runtime needs one artifact: `config/homography.yaml` — a 3×3 matrix mapping sub-stream pixels to road-plane meters. Producing it is a physical step plus a one-shot script run.
 
----
+![13 painted asphalt anchors (1-11 along the east curb at 5-foot spacings, 12-13 at the west curb corners) with the homography grid projected over them.](docs/images/camwatch-calibration-dots.png)
 
-## Calibration walkthrough
+1. **Paint 13 anchors on the road** with a tape measure: 4 corners (NE/SE/NW/SW curbs) of a 30 ft × 50 ft rectangle, plus 9 along the east curb at exact 5-foot intervals (`Y = +25, +20, ..., −20, −25 ft`, all at `X = 0`). The 9-along-the-curb anchors fix the Y scale absolutely, so reported speed doesn't depend on the road-width measurement.
 
-Five subcommands, run in order. The first three involve you doing something physical; the last two are pure analysis.
+2. **Capture a clean frame** with all 13 dots visible (any frame-grab tool works).
 
-### 1. `pick-lines`: pick the two screen lines
+3. **Click each dot in order**:
+   ```sh
+   uv run python scripts/mark_rectangle.py path/to/frame.jpg
+   ```
+   Writes `config/marked_points.yaml`.
 
-```sh
-uv run python -m camwatch.calibrate pick-lines
-```
+4. **Build the homography**:
+   ```sh
+   uv run python scripts/build_homography_from_marks.py
+   ```
+   Reads `marked_points.yaml`, fits via `cv2.findHomography`, writes `config/homography.yaml`. Prints per-anchor reprojection error — a healthy fit is < 10 cm mean and < 20 cm max.
 
-Opens a live still from the camera in a window. **Click line A (left), then line B (right).** Press `s` to save, `r` to reset, `q` to quit. The pixel x-coordinates of A and B (mapped back to the source resolution) get written to `config/calibration.yaml`.
+5. **Verify** in the web UI by toggling Settings → Live preview → Show measurement grid on the preview.
 
-Pick lines that are clearly perpendicular to the road and far enough apart that even a fast-moving car spends a noticeable fraction of a second between them. ~30-60% of the frame width is a good target.
-
-### 1b. `pick-roi`: limit YOLO to the road belt (optional but recommended)
-
-```sh
-uv run python -m camwatch.calibrate pick-roi
-```
-
-Opens the same still and lets you drag a rectangle around just the road. **Click the top-left corner, then the bottom-right corner of the road belt.** The two crossing lines from `pick-lines` are drawn on the frame so you can verify they fall inside the rectangle.
-
-The ROI is the only region YOLO sees; lawn / sky / driveways outside it cannot generate detections. Two benefits:
-- Faster inference (often 2-3x): YOLO processes a smaller image.
-- Fewer false positives: parked cars in driveways stop appearing as tracks.
-
-The full frame is still saved in clips and shown in any future security view; ROI only affects what the detector looks at. Saved as `roi_x1/y1/x2/y2` in `calibration.yaml`. Leave it un-set (all zeros) to feed the full frame to YOLO.
-
-### 2. `capture`: record calibration drives
-
-```sh
-uv run python -m camwatch.calibrate capture --secs 600
-```
-
-Watches the live stream for 600 seconds. For every car that crosses both lines, the tool:
-1. Records a short mp4 clip into `recordings/cal_<timestamp>_id<id>_<dir>.mp4` covering `clip.margin_s` seconds before the first line crossing through the same after the last. With the default sub stream (640×480) no downscaling is needed; from a higher-res source the recorder caps the saved frame width to keep file size sane. The clip is rendered with a debugging overlay:
-   - both vertical lines (line A in green, line B in blue), drawn dim before the focus car has crossed them and bright after, with the crossing timestamp labelled next to each
-   - the focus car's bounding box in red, with `id=N` label, plus a red dot at its `ground_point` (bbox bottom-center, the feature the speed math anchors to)
-   - any other detected cars in the frame in gray (faint bbox + small dot), so you can see when the tracker confused two cars
-   - a top header strip with the focus track ID and the total span (`B - A`)
-   - a bottom strip with `t = +X.XXXs (relative to line A)`, so you can scrub the clip and see exactly when each crossing fires
-2. Prints a line including the wall-clock time and the clip name.
-3. Appends a `passes:` entry to `calibration.yaml`.
-
-```
-[06:59:52] pass: id=47 car N elapsed=0.823s -> cal_20260505T065952_id47_N.mp4
-[06:59:54] pass: id=48 car S elapsed=1.105s -> cal_20260505T065954_id48_S.mp4
-```
-
-While this is running, **drive past at GPS-confirmed speeds** in both directions. A reasonable plan, ~10 min:
-
-| Direction | Speeds | Passes per speed |
-|---|---|---|
-| S → N | 20, 30, 40 mph | 2 |
-| N → S | 20, 30, 40 mph | 2 |
-
-Tips:
-- Use a phone GPS speedometer (Waze, Google Maps, etc.). Far more accurate than a car speedometer.
-- Hold a steady speed from before line A all the way past line B. Don't accelerate or decelerate during the crossing window.
-- Stay in a consistent lane position across passes. Don't hug the curb on one pass and the centerline on the next.
-- Stagger your passes by ~15 seconds so they don't overlap with each other or with random traffic.
-- Keep a paper note: `21:46 S→N 20 mph`, `21:48 N→S 20 mph`, etc. You'll match these against `track_id`s in the next step.
-
-The tool can't tell which passes are you and which are random other cars on the road; they all get recorded with `known_mph: null`.
-
-### 3. `annotate`: label each pass
-
-```sh
-uv run python -m camwatch.calibrate annotate
-```
-
-Walks through every unannotated pass, one at a time. Each prompt shows the elapsed time, the wall-clock timestamp, and the clip path:
-
-```
-[1/14] track_id=47 dir=N elapsed=1.214s captured_at=2026-05-04T21:46:12-04:00
-  clip: recordings/cal_20260504T214612_id47_N.mp4
-  > 20
-[2/14] track_id=48 dir=S elapsed=1.105s captured_at=2026-05-04T21:46:54-04:00
-  clip: recordings/cal_20260504T214654_id48_S.mp4
-  > open
-  > skip
-```
-
-At each prompt:
-- Type a number to record the GPS speed in mph.
-- Type `open` to play the clip in the default video player, then re-prompt.
-- Type `skip` (or `s`) to discard the pass (not your car, or a tracker artifact).
-- Type `q` to stop annotating now; already-typed answers are saved.
-
-The clip preview makes it easy to filter out tracker re-ID artifacts (a single car split into two `track_id`s by BotSORT mid-crossing). Those show up as suspiciously short elapsed times (e.g. 0.3 sec across a span that should take 0.8 sec).
-
-### 4. `compute`: average the implied distances
-
-```sh
-uv run python -m camwatch.calibrate compute
-```
-
-For each annotated pass, computes `implied_distance_m = (known_mph in m/s) × elapsed_s`. Averages those per direction and writes:
-
-```yaml
-line_distance_m_north: 11.483
-line_distance_m_south:  9.142
-```
-
-### 5. `report`: sanity check
-
-```sh
-uv run python -m camwatch.calibrate report
-```
-
-Re-runs each annotated pass through the same speed math the live system will use. You should see something like:
-
-```
-calibrated distances: N=11.483m  S=9.142m
-
-idx  dir  elapsed   known    pred    err
-  1    N    1.214    20.0    21.2   +1.2
-  2    N    0.821    30.0    31.4   +1.4
-  3    N    0.621    40.0    41.5   +1.5
-  4    S    1.105    20.0    18.5   -1.5
-  5    S    0.731    30.0    28.0   -2.0
-  6    S    0.547    40.0    37.4   -2.6
-```
-
-Healthy result: errors within ±2-3 mph and roughly random in sign. If errors are systematically biased one way (e.g. all N too high, all S too low), revisit the drives. Usually that's lane-position drift.
-
----
+If the camera moves, redo step 3 onward.
 
 ## Run
 
-### Web UI (recommended)
-
 ```sh
-uv run python -m camwatch serve            # bind 127.0.0.1:8000
-uv run python -m camwatch serve --host 0.0.0.0 --port 8000   # LAN/phone access
-uv run python -m camwatch serve --profile  # log per-stage capture-loop timings every 30s
+uv run python -m camwatch serve                       # http://127.0.0.1:8000
+uv run python -m camwatch serve --host 0.0.0.0        # LAN/phone access
+uv run python -m camwatch serve --profile             # log per-stage timings
 ```
 
-Open `http://localhost:8000`. The page shows:
+The web UI shows the live preview, a filterable pass list with thumbnails, a 5-mph speed histogram, and a settings dialog (alarm threshold, clip margin, retention, preview grid overlay, pause-at-night). The status pill at the top reads **● live** during the day, **⏸ paused (night)** in amber when the camera switches to IR mode and the gate kicks in.
 
-- **Status panel**: live capture indicator, current per-direction calibration, # known points, alert threshold (editable inline).
-- **Filters**: by direction, alerts-only.
-- **Filters**: by direction, alerts-only, time range (from/to), and speed bucket via the histogram.
-- **Speed histogram**: 5-mph buckets summarising the filtered set. Click a bar to narrow the list to that bucket.
-- **Pass list**: each row has a thumbnail, timestamp, direction, speed (blank until calibration is set), inline ▶ play, ✕ delete (revertable), and a `⋯` menu for "Set known mph". Click anywhere on the row to toggle inline playback.
-- **Settings dialog**: alarm threshold, live-preview lines toggle, clip margin (pre/post-roll seconds), clip capture speed range (passes outside still get a thumbnail but no .mp4), and storage retention in days.
+For remote access: Tailscale for personal use, Cloudflare Tunnel + Access for shareable URLs. The UI has no built-in auth.
 
-Setting a known mph automatically recomputes per-direction calibration (writes `line_distance_m_north` / `line_distance_m_south` into `config/calibration.yaml`). All other passes in that direction immediately re-display computed mph on next render.
+There's also a legacy headless mode (`uv run python -m camwatch`, uses the original 2-line speed math) that writes events.jsonl + alert JPGs. Useful for diagnostics; the web UI is the canonical runtime.
 
-### Headless
+## Architecture
 
-```sh
-uv run python -m camwatch
+The hot path is a single capture-worker thread driving everything per frame:
+
+```
+camwatch/
+├── capture.py          RTSP frame source. Yields (frame, pts_ts) re-anchored
+│                       to monotonic time at first frame of each session.
+├── detect.py           YOLO11n + BotSORT wrapper.
+├── homography.py       Loads H from config/homography.yaml. Exposes project()
+│                       and centered_speed_y_regression().
+├── grid_crossing.py    "Pass" = track enters the grid then exits (or ages
+│                       out while inside). Replaces the old 2-line trigger.
+├── capture_worker.py   Detect → on-road filter (in-grid check) → trajectory
+│                       accumulator → grid trigger → tiered regression →
+│                       recorder + DB. Includes stationary-track gate
+│                       (parked-curb suppression) and night-mode (IR) gate.
+├── recorder.py         Ring buffer; on trigger writes a clip with the grid
+│                       drawn on top + a thumbnail. Caps clip duration at
+│                       last_in_grid_ts + post-roll, so late-firing triggers
+│                       don't pad with dead air.
+├── thumb_upgrader.py   Background main-stream thumb upgrade (PTS-keyed).
+├── preview.py          MJPEG buffer + optional grid overlay.
+├── db.py               SQLite (WAL): passes table with speed_mph + speed_method.
+├── server.py           FastAPI + Jinja2/HTMX.
+└── crossing.py, speed.py, sink.py, main.py, calibrate.py
+                        Legacy 2-line code path kept for headless mode.
 ```
 
-Foreground process, logs to stderr, appends events to `events/events.jsonl`, saves snapshots in `events/` for alerts. Ctrl-C to stop.
+Three things make the speed measurement work:
 
-### Remote access (outside your LAN)
-
-The web UI binds to `0.0.0.0:8000` by default, so it's reachable on any network interface the host has. To reach it from your phone away from home, you have two reasonable options:
-
-- **Tailscale** (recommended for personal use). Install Tailscale on the host Mac and on your phone/laptop. Both devices show up on a private mesh network with `*.ts.net` hostnames; the camwatch UI is reachable at `http://<host>.ts.net:8000` from any logged-in device. Nothing is exposed to the public internet, no port forwarding, no DNS to manage. Free for personal use.
-
-- **Cloudflare Tunnel** (use if you want a public URL). Run `cloudflared` on the host; it opens an outbound connection to Cloudflare's edge and routes a hostname like `camwatch.yourdomain.com` to `localhost:8000`. No inbound port opened on your router; HTTPS terminates at Cloudflare's edge. **The camwatch UI has no auth**, so you should layer Cloudflare Access (free, email/Google login) on top before exposing it publicly.
-
-For a single-user "check it from my phone" use case, Tailscale is simpler and more private. Use Cloudflare Tunnel only when you need to share a URL with someone whose device you don't control.
-
----
+- **Homography** maps pixels to metric road coordinates exactly (the road is a flat plane). Once you're in meters, perspective and lane choice stop mattering for speed.
+- **PTS-anchored timestamps**, not wall-clock. RTSP buffers in bursts; the H.264 stream's PTS is the camera's ground truth for when a frame was captured. This was the bug that made the original speeds 3× too high before being found.
+- **Centered-window regression** anchors the measurement at the part of the road where reprojection error is smallest, and tiers (widening to ±25 ft when needed) keep speed available even on short trajectories.
 
 ## Configuration
 
-All defaults live in `config/config.yaml`:
+`config/config.yaml`:
 
 ```yaml
-camera:
-  host: 192.168.0.227
-  port: 554
-  path: /h264Preview_01_sub        # 640x480 sub stream — recommended for detection + clips.
-                                   # _main is full-res but pushes CPU and adds latency.
-
-model:
-  weights: yolo11n.pt              # nano. Bump to yolo11s.pt for more accuracy.
-  device: mps                      # mps / cuda / cpu
-  conf: 0.35                       # daytime default
-  iou: 0.5
-  classes: [2, 3, 5, 7]            # COCO: car, motorcycle, bus, truck
-
-alert:
-  threshold_mph: 40
-
-paths:
-  events_dir: events
-  calibration: config/calibration.yaml
-
-speed:
-  max_track_age_s: 5.0
-
-retention:
-  days: 7                          # auto-delete passes older than this. 0 disables.
-
-clip:
-  margin_s: 0.5                    # pre/post-roll seconds around each crossing
-  capture_min_mph: 0               # passes outside [min, max] are logged with a thumb only
-  capture_max_mph: 999
+camera:        { host, port, path, path_thumb }   # path = sub stream
+model:         { weights: yolo11n.pt, device: mps, conf: 0.35 }
+alert:         { threshold_mph: 40 }
+speed:         { max_track_age_s: 5.0 }
+retention:     { days: 7 }
+clip:          { margin_s: 0.5, capture_min_mph: 0, capture_max_mph: 999 }
+preview:       { show_grid: true }
+capture:       { pause_at_night: true }
 ```
 
-The `retention.*`, `clip.*`, and `alert.threshold_mph` keys are also editable in the in-app Settings dialog; saving there persists back to `config.yaml`.
-
-Camera credentials live in `.env`:
-
-```
-REOLINK_USER=...
-REOLINK_PASS=...
-```
-
-### Camera-side encode settings (Reolink E1)
-
-The thumbnail-upgrade pipeline benefits from the camera's main-stream encode being light enough that our `cap.read()` doesn't fall behind. Recommended Reolink E1 main-stream settings:
-
-- **Resolution: 2048×1536** (4:3, matches the sub-stream aspect — better bbox projection than 16:9)
-- **Frame rate: 4 fps** — enough for thumbnails (a 30mph car is at most ~11 ft from its trigger position in the matched frame), light decode load
-- **Bitrate: 4096 kbps** is fine
-- **I-frame interval**: shortest the UI allows. Long GOPs (~15s on E1 default) cause ~15s recovery gaps after any decoder hiccup. The E1 web UI doesn't expose this on every firmware; if yours doesn't, that's a known limitation.
-
-Higher resolutions (2560×1920) saturate the software H.264 decoder under live load (sub-stream YOLO + tracker + recorder run concurrently, holding the CPU and GIL); `cap.read()` swells from ~86ms in isolation to ~430ms under load and the consumer falls behind. See `scripts/probe_main_iter_cost.py` for the empirical measurement.
-
-After changing camera resolution, the `_OSD_REGION_MAIN` constant in `camwatch/thumb_upgrader.py` and `scripts/collect_digit_templates.py` needs updating, and the `templates/main/digit_*.png` library needs re-collection at the new pixel size. See the comments in those files; the bottom-band auto-detection in `scripts/probe_main_gaps.py` adjacent code can help find the new region.
-
----
+Most are also editable in-app. Camera credentials in `.env` (`REOLINK_USER`, `REOLINK_PASS`).
 
 ## Project layout
 
 ```
-camwatch/
-├── README.md
-├── pyproject.toml
-├── uv.lock
-├── .env.example                   ← .env (gitignored) holds the real creds
-├── .gitignore
-├── config/
-│   ├── config.example.yaml        ← config.yaml (gitignored) is the live one
-│   └── calibration.example.yaml   ← calibration.yaml (gitignored) is the live one
-├── camwatch/
-│   ├── __init__.py
-│   ├── __main__.py                # entrypoint: dispatches headless vs `serve`
-│   ├── config.py                  # YAML + .env loader, typed dataclasses
-│   ├── capture.py                 # RTSP frame source with reconnect
-│   ├── detect.py                  # YOLO + BotSORT wrapper
-│   ├── crossing.py                # Two-line crossing state machine (web UI source of truth)
-│   ├── speed.py                   # Crossing detector for headless mode (parallel to crossing.py)
-│   ├── sink.py                    # Headless: events.jsonl + alert JPGs
-│   ├── main.py                    # Headless wiring (capture → detect → speed → sink)
-│   ├── calibrate.py               # Interactive calibration CLI
-│   ├── recorder.py                # Rolling clip recorder + thumbnail writer
-│   ├── preview.py                 # Live preview MJPEG buffer
-│   ├── db.py                      # SQLite (WAL) pass storage
-│   ├── capture_worker.py          # Always-on capture thread for the web UI
-│   ├── server.py                  # FastAPI app + render helpers
-│   ├── static/style.css
-│   └── templates/                 # Jinja2 partials for the HTMX frontend
-│       ├── index.html
-│       ├── _status.html
-│       ├── _pass_list.html
-│       ├── _pass_row.html
-│       └── _histogram.html
-├── scripts/
-│   ├── test_stream.py                # quick RTSP smoke test
-│   ├── regen_thumbs.py               # rebuild thumbnail JPEGs from existing clips
-│   ├── timing_probe.py               # compare monotonic vs PTS vs OSD ticks (timing diagnostic)
-│   ├── verify_speed.py               # verify a stored pass's speed using OSD ticks in its clip
-│   ├── collect_digit_templates.py    # bootstrap step 1: capture per-digit slot crops
-│   ├── scan_digit_seconds.py         # bootstrap step 2: sweep seconds digit through 0-9
-│   ├── probe_main_gaps.py            # measure main-stream fr.ts gap distribution
-│   └── probe_main_iter_cost.py       # measure cap.read() per-iteration cost on main
-├── templates/                        # OSD digit reference images (10 per stream)
-│   ├── sub/digit_0.png … digit_9.png
-│   └── main/digit_0.png … digit_9.png
-├── camwatch.db                       # gitignored: SQLite db (created on first run)
-├── events/                           # gitignored: events.jsonl + alert snapshots (headless mode)
-├── recordings/                       # gitignored: clip mp4s + thumbnail jpgs
-└── models/                           # gitignored: yolo11n.pt downloaded by ultralytics
+camwatch/                 # runtime source (modules above)
+config/                   # config.yaml, calibration.yaml (gitignored);
+                          # marked_points.yaml + homography.yaml (tracked)
+scripts/                  # mark_rectangle.py, build_homography_from_marks.py,
+                          # verify_homography.py, test_stream.py, OSD-template
+                          # collectors, timing diagnostics
+templates/                # OSD digit reference images for the thumb upgrader
+docs/images/              # README screenshots
 ```
 
----
+Gitignored at runtime: `camwatch.db`, `events/`, `recordings/`, `models/yolo11n.pt`.
 
 ## Scope and limitations
 
-- **Daytime only.** Night and dawn/dusk are out of scope. Motion blur in low light makes the bbox bottom-center jitter by enough to introduce ±3-8 mph noise per pass, and the IR-cut filter transition at dawn/dusk drops frames and breaks tracker IDs.
-- **Single line pair, two lanes.** v1 uses one calibration distance per direction. Cars that drift across the lane width during a single crossing window will measure incorrectly. Rare in residential traffic.
-- **No retention policy.** `events.jsonl` and the snapshot folder grow forever. Clean up by hand for now.
-- **Camera must not move.** Calibration is tied to the specific pixel positions of line A and line B. If the camera is bumped or repositioned, redo `pick-lines` and the drives.
-- **Thumbnail upgrade is best-effort, not guaranteed.** ~70-80% of passes successfully upgrade to a main-stream high-res crop. Failures stem from `cv2.VideoCapture.read()` on the main stream taking 200-400ms per call under live-system load (concurrent sub-stream YOLO + tracker + recorder hold the CPU and GIL); when the consumer falls behind the camera's 4fps, ffmpeg accumulates a backlog and eventually dumps it in a burst, leaving multi-second gaps in the buffer's `main_ts` coverage. A trigger landing in such a gap can't be matched. The original sub-stream thumbnail remains in place when the upgrade fails — no data loss, just no high-res version. Structural fixes (HW-accelerated decode via VideoToolbox, or moving the main reader to a separate process) are deferred. Camera-side mitigations: use a 4:3 aspect on main to match sub (better bbox projection), set lower main fps and resolution, set a short I-frame interval if the camera UI allows it (Reolink E1 web UI does not).
-- **Camera-side OSD-render artifacts in transition frames.** When the burned-in OSD digit changes between two consecutive captured frames, the rendered timestamp can briefly show partial old/new digit overlap ("smeared on top"). This is a rare visual artifact in a single frame's OSD strip; calibration is robust to it because the tick-detection logic only needs *consecutive different OSD seconds*, not a perfectly clean glyph.
-
-## v2 ideas
-
-- Email alerts (SMTP / Gmail app password)
-- launchd daemon for unattended operation
-- Per-lane (not just per-direction) calibration
-- Persist filter/pagination state across reloads
-- SSE-based pass list updates (push instead of 10s poll)
+- **One camera, one road segment.** Multi-camera or multi-road setups need separate homographies and trigger logic.
+- **Camera must not move.** Calibration is tied to the painted-anchor pixel positions. If the camera is bumped, redo the click step.
+- **Auto-paused at night.** When the camera switches to IR illumination (frames go monochrome), detection pauses. Toggle off in settings if you want to capture night data, with the understanding that headlight-only readings have much higher error.
+- **Tracker splits lower confidence.** When BotSORT briefly loses a car (occlusion, YOLO confidence dip) the same physical vehicle gets two track IDs. The tiered regression handles this and flags the pass with a `?` chip; a larger YOLO model would reduce the rate.
+- **Best-effort high-res thumbnails.** The main-stream upgrade succeeds ~70-80% of the time. The fallback sub-stream thumbnail is always present.
