@@ -650,6 +650,23 @@ class CaptureWorker(threading.Thread):
                         bb = tuple(float(x) for x in tr.bbox)
                         traj.append((fr.ts, float(gx), float(gy), bb))
 
+                # Stationary-track gate at the trajectory layer. When a track
+                # has been sitting still for _STATIONARY_WINDOW_FRAMES samples
+                # — a car parked inside the grid — clear its trajectory and
+                # reset its grid-crossing entry. Without this, a car that
+                # parks in the grid and eventually drives away fires a single
+                # pass with elapsed_s = parked_duration + motion_duration
+                # (e.g., 697 s for a van that parks then leaves 11 minutes
+                # later), and the recorder can't pull entry-time frames from
+                # its 7 s ring buffer. Resetting here means the next motion
+                # is treated as a fresh pass with a recent entry_ts and a
+                # trajectory containing only the moving samples.
+                for tr in tracks:
+                    tid = int(tr.track_id)
+                    if self._is_stationary(tid):
+                        self._trajectories.pop(tid, None)
+                        crossing.reset_in_grid_entry(tid)
+
                 t0 = time.perf_counter() if prof else 0.0
                 recorder.push(fr.image, fr.ts, tracks)
                 if prof:
@@ -775,31 +792,62 @@ class CaptureWorker(threading.Thread):
                     # upgrade. Done before trigger() so the closure below
                     # binds to these specific values.
                     sub_h, sub_w = fr.image.shape[:2]
-                    sub_bbox = ev.bbox
                     upgrader = self._upgrader
                     cls_name_for_upgrade = ev.cls_name
-                    # Trigger time in two domains for the upgrader:
-                    #   target_ts        — sub-stream PTS-anchored monotonic
-                    #                      (the time domain Frame.ts lives in)
-                    #   target_wallclock — datetime.now() at the trigger; used
-                    #                      ONCE per (sub_epoch, main_epoch) to
-                    #                      calibrate the cross-stream offset.
-                    #   sub_epoch        — bumps on each sub-stream reconnect;
-                    #                      the upgrader uses this to detect
-                    #                      that the cached offset is stale.
-                    #
-                    # Target the moment of grid exit for the high-res thumbnail.
-                    # In the grid-based event, ev.t_b is always the chronological
-                    # exit time (regardless of direction) and ev.bbox is the bbox
-                    # captured at that same moment, so the cropped region of the
-                    # matched main-stream frame lines up with the actual vehicle.
-                    # The 0.3s bias absorbs typical frame-quantization lateness
-                    # (main stream is ~4 fps + tick-midpoint variance), so the
-                    # car lands at-or-before grid exit in the matched frame
-                    # instead of past it.
-                    target_ts = ev.t_b - 0.3
+
+                    # Pick the upgrade target temporally (target_ts) and
+                    # spatially (upgrade_bbox). Two strategies, chosen per
+                    # pass:
+                    #   1. (default) **Midpoint of the in-grid trajectory**.
+                    #      The midpoint is most likely to be in an
+                    #      unoccluded portion of the road and is far from
+                    #      grid-edge bbox-jitter. Both target_ts and the
+                    #      bbox come from the *same* frame, so the high-
+                    #      res match's crop region is temporally aligned
+                    #      with where the car actually is.
+                    #   2. **Skip the upgrade entirely** if the trajectory
+                    #      was visibly truncated — the track was lost
+                    #      well short of any grid Y boundary, almost
+                    #      always because of an occluder (a parked car at
+                    #      the south curb is the canonical case). In that
+                    #      situation the high-res match would land on the
+                    #      occluder rather than the moving car. Better to
+                    #      keep the sub-stream thumbnail in place.
+                    midpoint_ts: float | None = None
+                    midpoint_bbox: tuple[float, float, float, float] | None = None
+                    truncated = False
+                    last_in_grid_Y: float = 0.0
+                    if self._homog is not None and traj_for_speed:
+                        in_grid_idx: list[int] = []
+                        for i, (_ts, u, v, _bb) in enumerate(traj_for_speed):
+                            X, Y = self._homog.project(u, v)
+                            if _in_grid(X, Y):
+                                in_grid_idx.append(i)
+                                last_in_grid_Y = Y
+                        if in_grid_idx:
+                            mid_pos = len(in_grid_idx) // 2
+                            mid_i = in_grid_idx[mid_pos]
+                            mid_ts, _, _, mid_bb = traj_for_speed[mid_i]
+                            midpoint_ts = float(mid_ts)
+                            midpoint_bbox = mid_bb
+                            # Truncation: did the last in-grid sample reach
+                            # a grid Y boundary? Boundary is ±7.62 m; well
+                            # short of either side (here, |Y| < 6 m) means
+                            # the track ended in mid-grid, almost certainly
+                            # because of occlusion.
+                            if abs(last_in_grid_Y) < 6.0:
+                                truncated = True
+
+                    target_ts = midpoint_ts if midpoint_ts is not None else (ev.t_b - 0.3)
+                    upgrade_bbox = midpoint_bbox if midpoint_bbox is not None else ev.bbox
                     target_wallclock = captured_at
                     target_sub_epoch = fr.epoch
+                    if truncated:
+                        log.info(
+                            "track %d: trajectory truncated at Y=%.2f (likely occluded); "
+                            "skipping high-res thumb upgrade",
+                            ev.track_id, last_in_grid_Y,
+                        )
 
                     # pass_id isn't known until insert_pass below, but
                     # on_finalize fires later (after the recorder's post-roll
@@ -807,13 +855,13 @@ class CaptureWorker(threading.Thread):
                     # that gets populated immediately after insert_pass.
                     pid_holder: list[int | None] = [None]
                     on_finalize = None
-                    if upgrader is not None and sub_bbox is not None:
+                    if upgrader is not None and upgrade_bbox is not None and not truncated:
                         thumb_path_pending = str(self._recordings_dir / (clip_name[:-4] + ".jpg"))
 
                         def on_finalize(
                             _path=thumb_path_pending,
                             _cls=cls_name_for_upgrade,
-                            _bbox=sub_bbox,
+                            _bbox=upgrade_bbox,
                             _size=(sub_w, sub_h),
                             _up=upgrader,
                             _ts=target_ts,

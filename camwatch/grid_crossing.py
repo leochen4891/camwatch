@@ -94,6 +94,22 @@ class GridCrossingDetector:
     def _in_grid(self, X: float, Y: float) -> bool:
         return self._x_min <= X <= self._x_max and self._y_min <= Y <= self._y_max
 
+    def reset_in_grid_entry(self, track_id: int) -> None:
+        """Drop any in-progress 'in grid' state for this track. Called by
+        the stationary-track gate when a parked car's track is detected
+        as sitting still: we clear its current entry so the *next* motion
+        starts a fresh pass with a recent entry_ts, instead of carrying
+        forward the moment the car parked. Without this, a car that
+        parks inside the grid and eventually drives away would fire one
+        massive pass spanning the entire parked duration + the
+        drive-away motion (with elapsed_s in the hundreds of seconds and
+        a recorder that can't reach the entry-time frames)."""
+        st = self._state.get(track_id)
+        if st is not None and st.in_grid:
+            st.in_grid = False
+            st.entry_ts = None
+            st.fired = False
+
     def update(self, tracks: list[Any], t: float) -> list[CrossingEvent]:
         events: list[CrossingEvent] = []
         seen: set[int] = set()
