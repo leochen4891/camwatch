@@ -11,16 +11,17 @@ Local traffic-speed monitor for a residential street. Pulls a live RTSP feed fro
 ## What it does
 
 ```
-RTSP → YOLO detect → BotSORT track → homography projection
-                                          │
-                                          ▼
-                                  grid entry/exit trigger
-                                          │
-                                          ▼
-                               Y(t) regression → speed
-                                          │
-                                          ▼
-                              passes table + clip + thumb
+RTSP frames
+   ↓
+YOLO detect + BotSORT track
+   ↓
+homography projection (pixels → road-plane meters)
+   ↓
+grid entry/exit trigger
+   ↓
+Y(t) regression → speed
+   ↓
+passes table + clip + thumb
 ```
 
 For each car: detect, track, project bbox bottom-center through the homography matrix `H` to get `(X, Y)` meters on the road. A "pass" is a track entering the calibrated grid and later exiting it. Reported speed is the slope of a linear fit to `Y(t)` over a centered window — primary ±15 ft (where the homography is most accurate), widened to ±25 ft (full grid) when the primary has too few samples.
