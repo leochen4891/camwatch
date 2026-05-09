@@ -9,6 +9,18 @@ build/
 config/config.yaml
 config/calibration.yaml
 
+# Calibration backups / superseded versions / verification renders.
+# config/homography.yaml and config/marked_points.yaml ARE tracked
+# (the active homography source); these others are local workspace cruft.
+config/homography.before_*.yaml
+config/homography.gps_v*.yaml
+config/marked_points_asphalt.yaml
+config/marked_points_overlay*.jpg
+config/homography_grid.jpg
+config/homography_verify.jpg
+config/homography_v2_verify.jpg
+config/visual_grid_verify.jpg
+
 events/
 recordings/
 models/

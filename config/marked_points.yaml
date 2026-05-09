@@ -1,0 +1,64 @@
+marked_points:
+  source_image: events/calibration_main_frame.jpg
+  frame_size:
+  - 2048
+  - 1536
+  # Note: east-curb anchors (idx 1-11) all snapped to v=793 (median of original
+  # clicks 786-800). The original click v-trend was a smooth 0.5° slope from
+  # north to south — likely a mix of click jitter and minor camera-mount roll —
+  # so we force them onto a single image-y to make the X=0 line project as a
+  # truly horizontal segment in the camera view. The west-curb corners
+  # (idx 12, 13) are left untouched: they're on the far curb at a different v.
+  points:
+  - idx: 1
+    pixel:
+    - 1855
+    - 793
+  - idx: 2
+    pixel:
+    - 1701
+    - 793
+  - idx: 3
+    pixel:
+    - 1542
+    - 793
+  - idx: 4
+    pixel:
+    - 1379
+    - 793
+  - idx: 5
+    pixel:
+    - 1204
+    - 793
+  - idx: 6
+    pixel:
+    - 1027
+    - 793
+  - idx: 7
+    pixel:
+    - 858
+    - 793
+  - idx: 8
+    pixel:
+    - 676
+    - 793
+  - idx: 9
+    pixel:
+    - 518
+    - 793
+  - idx: 10
+    pixel:
+    - 344
+    - 793
+  - idx: 11
+    pixel:
+    - 196
+    - 793
+  - idx: 12
+    pixel:
+    - 1592
+    - 662
+  - idx: 13
+    pixel:
+    - 462
+    - 659

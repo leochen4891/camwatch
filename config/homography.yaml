@@ -1,0 +1,145 @@
+homography:
+  H:
+  - - 4.4310245410071355e-05
+    - -0.15422330367396878
+    - 38.204195550624064
+  - - -0.03013897620283101
+    - 0.00010629375379721175
+    - 9.690172981912701
+  - - 5.133046483104763e-05
+    - -0.008307998450726132
+    - 1.0
+  frame_size_sub:
+  - 640
+  - 480
+  frame_size_main:
+  - 2048
+  - 1536
+  main_to_sub_scale: 3.2
+  origin: "point 6 \u2014 east curb, camera's perpendicular"
+  axes: +X = east (toward camera); +Y = along road toward point 1 (north-ish)
+  road_width_ft: 30.0
+  spacing_ft: 5.0
+  method: 13-anchor (4 corners + 9 raw east-curb clicks) least-squares fit
+  max_reprojection_error_m: 0.1649908414904328
+  mean_reprojection_error_m: 0.0660030498211285
+  pixel_pts_sub:
+  - idx: 1
+    u: 579.6875
+    v: 247.8125
+  - idx: 2
+    u: 531.5625
+    v: 247.8125
+  - idx: 3
+    u: 481.875
+    v: 247.8125
+  - idx: 4
+    u: 430.9375
+    v: 247.8125
+  - idx: 5
+    u: 376.25
+    v: 247.8125
+  - idx: 6
+    u: 320.9375
+    v: 247.8125
+  - idx: 7
+    u: 268.125
+    v: 247.8125
+  - idx: 8
+    u: 211.25
+    v: 247.8125
+  - idx: 9
+    u: 161.875
+    v: 247.8125
+  - idx: 10
+    u: 107.5
+    v: 247.8125
+  - idx: 11
+    u: 61.25
+    v: 247.8125
+  - idx: 12
+    u: 497.5
+    v: 206.875
+  - idx: 13
+    u: 144.375
+    v: 205.9375
+  pixel_pts_main:
+  - idx: 1
+    u: 1855
+    v: 793
+  - idx: 2
+    u: 1701
+    v: 793
+  - idx: 3
+    u: 1542
+    v: 793
+  - idx: 4
+    u: 1379
+    v: 793
+  - idx: 5
+    u: 1204
+    v: 793
+  - idx: 6
+    u: 1027
+    v: 793
+  - idx: 7
+    u: 858
+    v: 793
+  - idx: 8
+    u: 676
+    v: 793
+  - idx: 9
+    u: 518
+    v: 793
+  - idx: 10
+    u: 344
+    v: 793
+  - idx: 11
+    u: 196
+    v: 793
+  - idx: 12
+    u: 1592
+    v: 662
+  - idx: 13
+    u: 462
+    v: 659
+  meter_pts:
+  - idx: 1
+    X: 0.0
+    Y: 7.62
+  - idx: 2
+    X: 0.0
+    Y: 6.096
+  - idx: 3
+    X: 0.0
+    Y: 4.572
+  - idx: 4
+    X: 0.0
+    Y: 3.048
+  - idx: 5
+    X: 0.0
+    Y: 1.524
+  - idx: 6
+    X: 0.0
+    Y: 0.0
+  - idx: 7
+    X: 0.0
+    Y: -1.524
+  - idx: 8
+    X: 0.0
+    Y: -3.048
+  - idx: 9
+    X: 0.0
+    Y: -4.572
+  - idx: 10
+    X: 0.0
+    Y: -6.096
+  - idx: 11
+    X: 0.0
+    Y: -7.62
+  - idx: 12
+    X: -9.144
+    Y: 7.62
+  - idx: 13
+    X: -9.144
+    Y: -7.62
