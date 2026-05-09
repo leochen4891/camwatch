@@ -5,7 +5,7 @@
       Speed distribution
       <span class="muted">({{ histogram_total }} pass{{ "" if histogram_total == 1 else "es" }})</span>
     </div>
-    <div class="bars">
+    <div class="bars{% if histogram_all_default %} all-default{% endif %}">
       {% for b in histogram %}
         <label class="bar-wrap" title="{{ b.label }} mph: {{ b.count }}">
           <input type="checkbox" name="buckets" form="filter-form" value="{{ b.idx }}"

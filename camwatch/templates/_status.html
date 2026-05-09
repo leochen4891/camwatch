@@ -1,10 +1,9 @@
 <div class="status">
   <div class="cal">
-    cal:
-    <span>N = {{ "%.2f m" | format(dist_n) if dist_n else "—" }}</span>
-    &nbsp;|&nbsp;
-    <span>S = {{ "%.2f m" | format(dist_s) if dist_s else "—" }}</span>
-    &nbsp;<span class="muted">({{ known_count }} known {{ "point" if known_count == 1 else "points" }})</span>
-    &nbsp;<span class="muted">·</span>&nbsp;<span class="muted">Alarm speed = {{ threshold | int }} mph</span>
+    {% if homog_n_pts %}
+    <span>homography: {{ homog_n_pts }} anchors, mean err {{ "%.1f cm" | format(homog_mean_err_cm) }}</span>
+    &nbsp;<span class="muted">·</span>&nbsp;
+    {% endif %}
+    <span class="muted">Alarm speed = {{ threshold | int }} mph</span>
   </div>
 </div>

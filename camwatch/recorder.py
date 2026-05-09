@@ -98,7 +98,12 @@ class ClipRecorder:
 
         completed: list[_ActiveClip] = []
         for clip in self._active:
-            clip.frames.append(rec)
+            # Drop any frame past target_end_ts so a late-firing trigger
+            # (e.g., grid-detector age-out, which fires up to max_track_age_s
+            # after the car has actually left) doesn't pad the clip with
+            # post-exit dead air.
+            if rec.ts <= clip.target_end_ts:
+                clip.frames.append(rec)
             if rec.ts >= clip.target_end_ts:
                 completed.append(clip)
         for clip in completed:
@@ -134,7 +139,11 @@ class ClipRecorder:
             desired_end = midpoint + self._max_clip / 2.0
 
         path = str(self._dir / name)
-        pre_frames = [r for r in self._ring if r.ts >= desired_start]
+        # Clamp pre_frames to BOTH ends of the desired window. A late-firing
+        # trigger (e.g., grid-detector age-out 5 s after the actual exit)
+        # would otherwise sweep up the entire ring buffer's worth of post-
+        # exit dead air and bake it into the clip.
+        pre_frames = [r for r in self._ring if desired_start <= r.ts <= desired_end]
         clip = _ActiveClip(
             path=path,
             frames=pre_frames,
@@ -270,18 +279,11 @@ class ClipRecorder:
         h, w = img.shape[:2]
         s = self._scale
 
-        # Lines: dim before this frame's ts crossed them, bright after.
-        a_crossed = rec.ts >= clip.t_a
-        b_crossed = rec.ts >= clip.t_b
-        line_a_color = _GREEN_BRIGHT if a_crossed else _DIM
-        line_b_color = _BLUE_BRIGHT if b_crossed else _DIM
-        cv2.line(img, (clip.line_a_x, 0), (clip.line_a_x, h), line_a_color, 2)
-        cv2.line(img, (clip.line_b_x, 0), (clip.line_b_x, h), line_b_color, 2)
-        # Crossing timestamps next to each line (relative to t_a).
-        a_label = f"A  +{(clip.t_a - clip.t_a):.3f}s"
-        b_label = f"B  +{(clip.t_b - clip.t_a):.3f}s"
-        _stamp(img, a_label, (clip.line_a_x + 6, 22), line_a_color)
-        _stamp(img, b_label, (clip.line_b_x + 6, 22), line_b_color)
+        # Line A / Line B vertical markers were drawn here historically for
+        # the 2-line speed-measurement debug view. The grid overlay rendered
+        # by the web player now provides equivalent (and more informative)
+        # spatial reference, so the burned-in lines are no longer drawn on
+        # the clip itself.
 
         # Bboxes + ground points
         for d in rec.detections:
@@ -301,26 +303,14 @@ class ClipRecorder:
                 cv2.rectangle(img, (x1, y1), (x2, y2), _GRAY, 1)
                 cv2.circle(img, (gx, gy), 3, _GRAY, -1)
 
-        # Header (top): focus id + total span
-        span = clip.t_b - clip.t_a
+        # Single header line: per-frame PTS timestamp. The camera's burned-
+        # in wallclock OSD already lives at the bottom of the frame; the PTS
+        # gives us a stream-anchored monotonic clock that drift-calibration
+        # and offline analysis can key off of.
         _stamp(
             img,
-            f"focus id={clip.focus_track_id}   span (B-A) = {span:.3f}s",
+            f"PTS time = {rec.ts:.3f}s",
             (10, 22),
-            _WHITE,
-            scale=0.6,
-            thickness=2,
-            bg=True,
-        )
-
-        # Time relative to t_a, placed on a second line under the header so
-        # it doesn't overlap the camera's burned-in OSD at the bottom of the
-        # frame (the verifier tool needs to read those digits).
-        rel_t = rec.ts - clip.t_a
-        _stamp(
-            img,
-            f"t={rel_t:+.3f}s",
-            (10, 46),
             _WHITE,
             scale=0.6,
             thickness=2,

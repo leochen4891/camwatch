@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS passes (
     known_mph            REAL,
     clip_path            TEXT,
     deleted              INTEGER NOT NULL DEFAULT 0,
-    thumb_upgrade_status TEXT  -- NULL=pending/none, 'ok'=upgraded, 'failed'=tried but failed
+    thumb_upgrade_status TEXT,  -- NULL=pending/none, 'ok'=upgraded, 'failed'=tried but failed
+    speed_mph            REAL,  -- single source of truth for displayed speed (homography)
+    speed_method         TEXT   -- 'regression' (high confidence) | 'median_fallback' (low confidence) | NULL (no speed)
 );
 CREATE INDEX IF NOT EXISTS passes_captured_at_idx ON passes(captured_at);
 CREATE INDEX IF NOT EXISTS passes_deleted_idx ON passes(deleted);
@@ -49,13 +51,18 @@ class Pass:
     clip_path: str | None
     deleted: bool
     thumb_upgrade_status: str | None  # None | 'ok' | 'failed'
+    speed_mph: float | None  # canonical displayed speed (homography-based for new rows)
+    speed_method: str | None  # 'regression' | 'median_fallback' | None — confidence indicator for the UI
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Pass:
-        # `thumb_upgrade_status` only exists on freshly bootstrapped tables;
-        # access via .keys() so we don't blow up against an old schema.
+        # `thumb_upgrade_status`, `speed_mph`, `speed_method` only exist on
+        # freshly bootstrapped tables; access via .keys() so we don't blow
+        # up against an old schema.
         keys = row.keys() if hasattr(row, "keys") else []
         upgrade_status = row["thumb_upgrade_status"] if "thumb_upgrade_status" in keys else None
+        speed_mph = row["speed_mph"] if "speed_mph" in keys else None
+        speed_method = row["speed_method"] if "speed_method" in keys else None
         return cls(
             id=row["id"],
             captured_at=row["captured_at"],
@@ -67,6 +74,8 @@ class Pass:
             clip_path=row["clip_path"],
             deleted=bool(row["deleted"]),
             thumb_upgrade_status=upgrade_status,
+            speed_mph=speed_mph,
+            speed_method=speed_method,
         )
 
 
@@ -88,11 +97,22 @@ class Database:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 # Add columns to existing tables created before they existed.
-                for col, decl in [("thumb_upgrade_status", "TEXT")]:
+                for col, decl in [
+                    ("thumb_upgrade_status", "TEXT"),
+                    ("speed_mph", "REAL"),
+                    ("speed_method", "TEXT"),
+                ]:
                     try:
                         conn.execute(f"ALTER TABLE passes ADD COLUMN {col} {decl}")
                     except sqlite3.OperationalError:
                         pass  # already there
+                # Backfill speed_mph for legacy passes that pre-date the
+                # column. We use the old 2-line formula
+                # (line_distance_m_* / elapsed_s) so historical passes still
+                # display sensibly with the new single-source-of-truth read.
+                # We can only do this once we know the line distances, so the
+                # actual backfill happens via backfill_legacy_speed() called
+                # after Config is loaded.
                 conn.commit()
             self._initialized = True
             log.info("db ready: %s", self.path.resolve())
@@ -117,16 +137,53 @@ class Database:
         direction: str,
         elapsed_s: float,
         clip_path: str | None,
+        speed_mph: float | None = None,
+        speed_method: str | None = None,
     ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO passes (captured_at, track_id, cls_name, direction, elapsed_s, clip_path)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO passes
+                    (captured_at, track_id, cls_name, direction, elapsed_s,
+                     clip_path, speed_mph, speed_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (captured_at, int(track_id), cls_name, direction, float(elapsed_s), clip_path),
+                (captured_at, int(track_id), cls_name, direction,
+                 float(elapsed_s), clip_path,
+                 None if speed_mph is None else float(speed_mph),
+                 speed_method),
             )
             return int(cur.lastrowid)
+
+    def backfill_legacy_speed(
+        self,
+        line_distance_m_north: float,
+        line_distance_m_south: float,
+    ) -> int:
+        """One-time migration: populate speed_mph for legacy passes that
+        pre-date the column, using the old 2-line formula. Idempotent — only
+        touches rows where speed_mph IS NULL. Returns the number of rows
+        updated."""
+        if line_distance_m_north <= 0 and line_distance_m_south <= 0:
+            return 0
+        mps_to_mph = 2.2369362920544
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE passes
+                SET speed_mph = CASE
+                    WHEN direction = 'N' AND ? > 0 AND elapsed_s > 0
+                        THEN (? / elapsed_s) * ?
+                    WHEN direction = 'S' AND ? > 0 AND elapsed_s > 0
+                        THEN (? / elapsed_s) * ?
+                    ELSE NULL
+                END
+                WHERE speed_mph IS NULL
+                """,
+                (line_distance_m_north, line_distance_m_north, mps_to_mph,
+                 line_distance_m_south, line_distance_m_south, mps_to_mph),
+            )
+            return cur.rowcount
 
     def set_thumb_upgrade_status(self, pass_id: int, status: str | None) -> None:
         """Record whether the high-res thumbnail upgrade succeeded."""
@@ -197,24 +254,27 @@ class Database:
         alerts_only: bool = False,
         limit: int = 200,
         threshold_mph: float | None = None,
-        line_distance_m_north: float | None = None,
-        line_distance_m_south: float | None = None,
+        line_distance_m_north: float | None = None,  # noqa: ARG002 (legacy, unused)
+        line_distance_m_south: float | None = None,  # noqa: ARG002 (legacy, unused)
         include_deleted: bool = False,
-        from_ts: str | None = None,
-        to_ts: str | None = None,
+        time_ranges: list[tuple[str, str]] | None = None,
         offset: int = 0,
     ) -> list[Pass]:
+        # time_ranges semantics: None = no time filter; [] = no rows match;
+        # otherwise OR-joined half-open ranges [start, end).
+        if time_ranges is not None and not time_ranges:
+            return []
         sql = "SELECT * FROM passes" if include_deleted else "SELECT * FROM passes WHERE deleted = 0"
         params: list[Any] = []
         if direction in ("N", "S"):
             sql += (" AND " if "WHERE" in sql else " WHERE ") + "direction = ?"
             params.append(direction)
-        if from_ts:
-            sql += (" AND " if "WHERE" in sql else " WHERE ") + "captured_at >= ?"
-            params.append(from_ts)
-        if to_ts:
-            sql += (" AND " if "WHERE" in sql else " WHERE ") + "captured_at <= ?"
-            params.append(to_ts)
+        if time_ranges:
+            clause = " OR ".join(["(captured_at >= ? AND captured_at < ?)"] * len(time_ranges))
+            sql += (" AND " if "WHERE" in sql else " WHERE ") + f"({clause})"
+            for start, end in time_ranges:
+                params.append(start)
+                params.append(end)
         sql += " ORDER BY captured_at DESC LIMIT ? OFFSET ?"
         params.append(int(limit))
         params.append(int(offset))
@@ -222,18 +282,11 @@ class Database:
             rows = [Pass.from_row(r) for r in conn.execute(sql, params)]
 
         if alerts_only and threshold_mph is not None:
-            mps_to_mph = 2.2369362920544
             kept: list[Pass] = []
             for p in rows:
-                d = (
-                    line_distance_m_north
-                    if p.direction == "N"
-                    else line_distance_m_south
-                )
-                if not d or d <= 0 or p.elapsed_s <= 0:
+                if p.speed_mph is None or p.speed_mph <= 0:
                     continue
-                mph = (d / p.elapsed_s) * mps_to_mph
-                if mph >= threshold_mph:
+                if p.speed_mph >= threshold_mph:
                     kept.append(p)
             rows = kept
         return rows

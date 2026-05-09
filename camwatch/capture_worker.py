@@ -14,18 +14,135 @@ and produces phantom detections on road texture.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
+_MPH_PER_MPS = 2.2369362920544
+_FT_TO_M = 0.3048
+# Bounds of the calibrated grid (the rectangle defined by the 4 corner anchor
+# points). Speed is only meaningful for trajectory frames whose projected
+# (X, Y) falls inside this rectangle — outside it, the homography is
+# extrapolating and the v_inst values are unreliable.
+#
+# `_GRID_TOLERANCE_M` is the slack zone that absorbs bbox-detection jitter
+# at the boundary. Without it, a car driving close to the east curb (X ≈ 0)
+# sees individual frames flicker in/out of the grid as the bbox center
+# wobbles by a few cm, producing visible gaps in the speed line on the
+# chart even though the car is plainly on the road. The actual unreliable
+# extrapolation tails sit several meters beyond the grid (e.g., Y = -9.87 m
+# when the south boundary is -7.62 m), so a 0.5 m slack still excludes
+# them while keeping the in-grid portion continuous.
+_GRID_X_MIN = -35.0 * _FT_TO_M  # 5 ft west of the actual west curb (-30 ft)
+_GRID_X_MAX = 0.0               # east curb (camera-side; tight is fine)
+_GRID_Y_MIN = -25.0 * _FT_TO_M  # south
+_GRID_Y_MAX = +25.0 * _FT_TO_M  # north
+_GRID_TOLERANCE_M = 0.5
+# West edge is extended past the physical curb because the bbox bottom-
+# center for far-lane cars sometimes projects past the curb in world X
+# due to perspective compression at the top of the trapezoid (small v,
+# ~206 px). A few pixels of bbox jitter there translate to >1 m in
+# world X. Cars physically stay on the asphalt, so this slack zone only
+# catches projection artifacts — no real off-road traffic lives there.
+
+# Stationary-track gate. A track whose projected ground point has stayed
+# inside a tight box for at least N consecutive samples is treated as
+# parked: any crossing event it produces is suppressed (no pass row, no
+# clip, no thumbnail). Even a 5 mph driver covers >2 m across 30 sub-stream
+# frames (~3 s), well beyond the 0.5 m spread, so legitimate passes never
+# trip this gate. Without it, bbox jitter on a parked curb car can
+# occasionally satisfy the 2-line crossing condition and produce a phantom
+# pass at unrealistically slow speeds.
+_STATIONARY_WINDOW_FRAMES = 30
+_STATIONARY_SPREAD_M = 0.5
+
+# Centered Y-vs-t regression window for the canonical reported speed.
+# Samples whose projected Y is within ±_CENTERED_HALF_WINDOW_M of Y=0 (the
+# camera's perpendicular line) are used to fit Y = m·t + b; speed = |m|.
+# Anchoring at Y=0 puts the measurement in the part of the grid with the
+# smallest homography reprojection error.
+#
+# Tiered widening: try the primary (±15 ft) window first. When there are
+# too few samples in it for a stable fit — fast vehicles, frame drops, or
+# tracker splits — expand to ±25 ft (the full grid). Wider samples include
+# the noisier grid edges where homography reprojection is largest, so we
+# only fall back to the wider window when the primary one isn't enough.
+# A single noisy fast pass should be smoothed by more samples; a clean
+# slow pass with plenty of in-window samples stays on the tighter fit.
+_CENTERED_HALF_WINDOW_M = 15.0 * _FT_TO_M  # primary: ±15 ft = ±4.572 m
+_WIDER_HALF_WINDOW_M    = 25.0 * _FT_TO_M  # fallback: ±25 ft = full grid Y-extent
+_MIN_PRIMARY_SAMPLES    = 6                # widen when primary window has < this
+
+# Night-mode (IR) gate. The Reolink E1 switches to monochrome IR illumination
+# in low light; speed measurements from those frames are unreliable because
+# only headlights/taillights are bright enough to detect, the bbox represents
+# a motion-blurred light source rather than the wheel-on-road position, and
+# the homography assumption (bbox bottom-center ↔ ground point) breaks down.
+#
+# Detection is content-based: in IR mode every pixel has R = G = B. We sample
+# the center region of each frame and average the per-pixel channel deviation
+# `|R-G| + |G-B| + |R-B|` over a sliding window of frames. A small threshold
+# distinguishes IR (≈0) from color frames (typically ≫ 5) without false
+# triggering on, e.g., a uniformly-grey overcast scene that still has some
+# faint chroma in the lawn and asphalt.
+_NIGHT_DEVIATION_THRESHOLD = 3.0
+_NIGHT_WINDOW_FRAMES = 30           # ~2 s at 14 fps; smooths dawn/dusk flicker
+
+
+class _NightModeDetector:
+    """Per-frame grayscale-vs-color check with hysteresis.
+
+    Computes the mean per-pixel channel deviation over a center crop of each
+    frame, averaged across a sliding window so a single noisy frame can't
+    flip the mode. Logs a single line on each transition so the operator can
+    see when the gate kicks in/out.
+    """
+
+    def __init__(self, window: int = _NIGHT_WINDOW_FRAMES,
+                 threshold: float = _NIGHT_DEVIATION_THRESHOLD) -> None:
+        self._window = int(window)
+        self._threshold = float(threshold)
+        self._deviations: deque[float] = deque(maxlen=self._window)
+        self._is_night: bool = False
+
+    def update(self, frame) -> bool:
+        h, w = frame.shape[:2]
+        crop = frame[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
+        b = crop[:, :, 0].astype(np.float32)
+        g = crop[:, :, 1].astype(np.float32)
+        r = crop[:, :, 2].astype(np.float32)
+        dev = float((np.abs(r - g) + np.abs(g - b) + np.abs(r - b)).mean())
+        self._deviations.append(dev)
+        if len(self._deviations) < self._window:
+            return self._is_night  # warm-up: hold previous state
+        mean_dev = sum(self._deviations) / len(self._deviations)
+        new_state = mean_dev < self._threshold
+        if new_state != self._is_night:
+            log.info(
+                "night-mode %s (mean channel deviation = %.2f, threshold = %.2f)",
+                "ENGAGED" if new_state else "RELEASED", mean_dev, self._threshold,
+            )
+            self._is_night = new_state
+        return self._is_night
+
+
+def _in_grid(X: float, Y: float) -> bool:
+    return (_GRID_X_MIN - _GRID_TOLERANCE_M <= X <= _GRID_X_MAX + _GRID_TOLERANCE_M
+            and _GRID_Y_MIN - _GRID_TOLERANCE_M <= Y <= _GRID_Y_MAX + _GRID_TOLERANCE_M)
+
 from .capture import RtspStream
 from .config import Config
-from .crossing import CrossingDetector
 from .db import Database
 from .detect import Detector, Track
 from .digit_matcher import DigitMatcher
+from .grid_crossing import GridCrossingDetector
+from .homography import Homography
 from .preview import PreviewBuffer
 from .recorder import ClipRecorder
 from .thumb_upgrader import ThumbUpgrader
@@ -38,13 +155,20 @@ _OSD_REGION_SUB = (175, 452, 500, 477)
 log = logging.getLogger(__name__)
 
 
-def _track_in_roi(t: Track, roi: tuple[int, int, int, int] | None) -> bool:
-    """Keep tracks whose ground_point falls inside the ROI rectangle."""
-    if roi is None:
+def _track_on_road(t: Track, homog: Homography | None) -> bool:
+    """Keep tracks whose ground_point projects inside the calibrated grid.
+
+    Replaces the old pixel-rectangle ROI: the grid IS the road by
+    construction (its corners are the curbs from calibration), so a
+    homography-projected in-grid check is strictly more accurate than a
+    hand-tuned axis-aligned pixel rectangle and is symmetric across lanes.
+    Falls back to "accept all" if homography is missing — there is no
+    sensible road definition without it.
+    """
+    if homog is None:
         return True
-    x1, y1, x2, y2 = roi
-    gx, gy = t.ground_point
-    return x1 <= gx <= x2 and y1 <= gy <= y2
+    X, Y = homog.project(t.ground_point[0], t.ground_point[1])
+    return _in_grid(X, Y)
 
 
 class _StageTimer:
@@ -113,6 +237,10 @@ class CaptureWorker(threading.Thread):
         self._error: BaseException | None = None
         self._recorder: ClipRecorder | None = None
         self._upgrader: ThumbUpgrader | None = None
+        # Night-mode state, written by the capture loop and read by request
+        # handlers (e.g., the live status badge endpoint). Booleans are
+        # atomic in CPython, so no lock is needed.
+        self._night_mode: bool = False
         # Sub-stream drift calibration state. drift_sub = sub_ts(T) - wallclock_unix(T)
         # for any camera-instant T; constant within an RTSP session, but
         # invalidates on reconnect. We learn it by OCR'ing live sub frames
@@ -133,6 +261,53 @@ class CaptureWorker(threading.Thread):
                 "datetime.now()-based pipeline-lag bias", e,
             )
             self._sub_matcher = None
+        # Homography-based parallel speed measurement. Loaded from
+        # config/homography.yaml; if missing, the parallel speed is silently
+        # skipped (the existing 2-line method continues unaffected).
+        self._homog: Homography | None = Homography.load(
+            Path("config/homography.yaml")
+        )
+        if self._homog is not None:
+            log.info(
+                "homography loaded for parallel speed (mean reproj err=%.1fcm, max=%.1fcm)",
+                self._homog.mean_reproj_err_m * 100,
+                self._homog.max_reproj_err_m * 100,
+            )
+        # Per-track ground-point trajectory: track_id → deque of
+        # (ts, ground_u, ground_v, (bbox_x1, bbox_y1, bbox_x2, bbox_y2)).
+        # Bounded per-track memory; whole-dict pruning happens on track GC
+        # mirrored to the CrossingDetector's max_age window.
+        self._trajectories: dict[
+            int,
+            deque[tuple[float, float, float, tuple[float, float, float, float]]],
+        ] = {}
+
+    def is_night_mode(self) -> bool:
+        """Latest night-mode state computed by the capture loop. Read by
+        the live-status badge endpoint to flip "live" → "paused" when the
+        camera switches to IR illumination and the gate is active."""
+        return bool(self._night_mode)
+
+    def _is_stationary(self, track_id: int) -> bool:
+        """True iff this track has at least _STATIONARY_WINDOW_FRAMES
+        recent samples whose projected (X, Y) ground points all fall
+        inside a _STATIONARY_SPREAD_M × _STATIONARY_SPREAD_M box."""
+        if self._homog is None:
+            return False
+        traj = self._trajectories.get(track_id)
+        if traj is None or len(traj) < _STATIONARY_WINDOW_FRAMES:
+            return False
+        recent = list(traj)[-_STATIONARY_WINDOW_FRAMES:]
+        Xs: list[float] = []
+        Ys: list[float] = []
+        for _ts, u, v, _bb in recent:
+            X, Y = self._homog.project(u, v)
+            Xs.append(X)
+            Ys.append(Y)
+        return (
+            (max(Xs) - min(Xs)) < _STATIONARY_SPREAD_M
+            and (max(Ys) - min(Ys)) < _STATIONARY_SPREAD_M
+        )
 
     def update_clip_margin(self, seconds: float) -> None:
         """Apply a new pre/post-roll value to the running recorder, if any.
@@ -211,6 +386,107 @@ class CaptureWorker(threading.Thread):
             ts_old, ts_new, ts_new - ts_old,
         )
 
+    def _save_pass_trajectory_jsonl(
+        self,
+        *,
+        pid: int,
+        ev,
+        traj: list[tuple[float, float, float, tuple[float, float, float, float]]],
+        speed_mph: float | None,
+        speed_method: str | None = None,
+        half_window_used_m: float = _CENTERED_HALF_WINDOW_M,
+    ) -> None:
+        """Write per-frame trajectory + per-frame v_inst to events/pass_<pid>.jsonl.
+
+        Format:
+          line 0: manifest dict with pass-level metadata
+          line 1+: one dict per frame in the track's trajectory, with the
+                   real-PTS-anchored timestamp, ground-point pixel, full bbox,
+                   homography-projected (X, Y), and the instantaneous speed
+                   computed from this frame and the previous one.
+
+        v_inst on the first frame is null (no prior frame to diff against).
+        """
+        if self._homog is None or not traj:
+            return
+        out_dir = self._recordings_dir.parent / "events"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"pass_{pid}.jsonl"
+
+        # Project each frame's ground-point through H, then derive v_inst from
+        # consecutive (X, Y, t) triples. Done here once rather than per-frame
+        # in the hot loop.
+        projected: list[tuple[float, float, float, tuple, float, float]] = []
+        for ts, u, v, bb in traj:
+            X, Y = self._homog.project(u, v)
+            projected.append((float(ts), float(u), float(v), bb, float(X), float(Y)))
+
+        rows: list[dict] = []
+        t0 = projected[0][0]
+        for i, (ts, u, v, bb, X, Y) in enumerate(projected):
+            in_grid = _in_grid(X, Y)
+            v_inst_mph: float | None = None
+            # Only compute / publish v_inst when BOTH this frame and the prior
+            # frame lie inside the calibrated grid. Outside the grid the
+            # homography is extrapolating and the velocity reading would be
+            # unreliable, so we suppress it from the chart.
+            if i > 0 and in_grid:
+                ts_p, _, _, _, X_p, Y_p = projected[i - 1]
+                if _in_grid(X_p, Y_p):
+                    dt = ts - ts_p
+                    if dt > 0:
+                        d = ((X - X_p) ** 2 + (Y - Y_p) ** 2) ** 0.5
+                        v_inst_mph = (d / dt) * _MPH_PER_MPS
+            in_speed_window = abs(Y) <= half_window_used_m
+            rows.append({
+                "frame": i,
+                "ts": ts,
+                "t_rel": ts - t0,
+                "u": u,
+                "v": v,
+                "bbox": list(bb),
+                "X": X,
+                "Y": Y,
+                "in_grid": in_grid,
+                "in_speed_window": in_speed_window,
+                "v_inst_mph": v_inst_mph,
+            })
+
+        # Clip start = first crossing minus pre-roll. The recorder writes the
+        # clip's first frame at this PTS, so video.currentTime (browser-side)
+        # maps directly to (frame_ts - clip_start_ts) in real time.
+        clip_pre_roll_s = float(self._cfg.clip_margin_s)
+        clip_post_roll_s = float(self._cfg.clip_margin_s)
+        clip_start_ts = float(min(ev.t_a, ev.t_b)) - clip_pre_roll_s
+        clip_end_ts = float(max(ev.t_a, ev.t_b)) + clip_post_roll_s
+        manifest = {
+            "type": "manifest",
+            "pass_id": int(pid),
+            "track_id": int(ev.track_id),
+            "cls_name": str(ev.cls_name),
+            "direction": str(ev.direction),
+            "elapsed_s": float(ev.elapsed_s),
+            "t_a_pts": float(ev.t_a),
+            "t_b_pts": float(ev.t_b),
+            "clip_start_ts": clip_start_ts,
+            "clip_end_ts": clip_end_ts,
+            "clip_pre_roll_s": clip_pre_roll_s,
+            "clip_post_roll_s": clip_post_roll_s,
+            # v_homog_mph is kept for compatibility with the existing JS chart
+            # legend that reads from manifest. Same canonical speed.
+            "v_homog_mph": speed_mph if speed_mph is not None else float("nan"),
+            "speed_mph": speed_mph,
+            "speed_method": speed_method,  # 'regression' | 'median_fallback' | None
+            "speed_window_half_m": float(half_window_used_m),
+            "n_frames": len(rows),
+            "frame_size_sub": list(self._homog.frame_size_sub),
+        }
+
+        with open(out_path, "w") as f:
+            f.write(json.dumps(manifest) + "\n")
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
     def run(self) -> None:
         try:
             self._run()
@@ -231,12 +507,14 @@ class CaptureWorker(threading.Thread):
             return
 
         log.info(
-            "capture worker starting (lines a=%d b=%d, threshold=%.1f mph, roi=%s)",
-            cal.line_a_x, cal.line_b_x, self._cfg.alert_threshold_mph, cal.roi,
+            "capture worker starting (threshold=%.1f mph, lines a=%d b=%d for clip annotation only, "
+            "trigger=grid-entry/exit)",
+            self._cfg.alert_threshold_mph, cal.line_a_x, cal.line_b_x,
         )
 
-        # YOLO sees the full frame; ROI is enforced as a post-detection filter
-        # on each track's ground point. See module docstring for why.
+        # YOLO sees the full frame. Tracks are filtered by an in-grid check
+        # (homography-projected ground point) before reaching the detector
+        # and recorder; the grid covers the whole road by construction.
         det = Detector(
             weights=self._cfg.model.weights,
             device=self._cfg.model.device,
@@ -251,13 +529,27 @@ class CaptureWorker(threading.Thread):
             post_seconds_after_b=self._cfg.clip_margin_s,
         )
         self._recorder = recorder
-        crossing = CrossingDetector(
-            line_a_x=cal.line_a_x,
-            line_b_x=cal.line_b_x,
+        if self._homog is None:
+            log.error(
+                "homography missing; grid-based trigger cannot run. "
+                "Build it with scripts/build_homography_from_marks.py."
+            )
+            return
+        crossing = GridCrossingDetector(
+            homography=self._homog,
+            grid_x_min=_GRID_X_MIN, grid_x_max=_GRID_X_MAX,
+            grid_y_min=_GRID_Y_MIN, grid_y_max=_GRID_Y_MAX,
+            tolerance_m=_GRID_TOLERANCE_M,
             max_track_age_s=self._cfg.max_track_age_s,
         )
         if self._preview is not None:
             self._preview.configure(cal.roi, cal.line_a_x, cal.line_b_x)
+            self._preview.set_grid(
+                self._homog,
+                _GRID_X_MIN, _GRID_X_MAX,
+                _GRID_Y_MIN, _GRID_Y_MAX,
+            )
+            self._preview.set_show_grid(self._cfg.preview_show_grid)
 
         # Optional: parallel high-res stream for thumbnail upgrades.
         # Indexing is purely PTS-anchored monotonic now; no OCR region needed.
@@ -277,6 +569,7 @@ class CaptureWorker(threading.Thread):
         if prof is not None:
             log.info("capture worker: --profile enabled, logging stage timings every 30s")
         last_loop_t: float | None = None
+        night_detector = _NightModeDetector()
 
         try:
             for fr in self._stream.frames():
@@ -317,15 +610,45 @@ class CaptureWorker(threading.Thread):
                 ):
                     self._maybe_calibrate_sub_drift(fr)
 
+                # Night-mode gate. The Reolink E1 switches to monochrome IR
+                # in low light, where speed measurements are unreliable
+                # (headlight-only detections, motion blur, bbox bottom no
+                # longer at the wheel-on-road position). When enabled and
+                # active, skip YOLO/trigger/recorder for this frame and
+                # update the preview with the raw IR feed (no annotations).
+                self._night_mode = night_detector.update(fr.image)
+                if self._night_mode and self._cfg.pause_at_night:
+                    if self._preview is not None:
+                        self._preview.update(fr.image, [])
+                    last_loop_t = loop_t
+                    continue
+
                 t0 = time.perf_counter() if prof else 0.0
                 all_tracks = det.track(fr.image)
                 if prof:
                     prof.record("yolo_track", time.perf_counter() - t0)
 
                 t0 = time.perf_counter() if prof else 0.0
-                tracks = [t for t in all_tracks if _track_in_roi(t, cal.roi)]
+                tracks = [t for t in all_tracks if _track_on_road(t, self._homog)]
                 if prof:
-                    prof.record("roi_filter", time.perf_counter() - t0)
+                    prof.record("on_road_filter", time.perf_counter() - t0)
+
+                # Per-track trajectory accumulation for homography-based speed
+                # AND for the per-pass JSONL trajectory log. Each entry stores
+                # ts (real PTS-anchored monotonic), the ground point, and the
+                # full bbox — the bbox isn't used for speed, but is captured
+                # so future visualization tools can render the box back over
+                # the clip frame. Bounded by deque(maxlen=200) per track;
+                # whole-track GC is piggybacked on the crossing detector's
+                # stale-track logic.
+                if self._homog is not None:
+                    for tr in tracks:
+                        traj = self._trajectories.setdefault(
+                            int(tr.track_id), deque(maxlen=200),
+                        )
+                        gx, gy = tr.ground_point
+                        bb = tuple(float(x) for x in tr.bbox)
+                        traj.append((fr.ts, float(gx), float(gy), bb))
 
                 t0 = time.perf_counter() if prof else 0.0
                 recorder.push(fr.image, fr.ts, tracks)
@@ -341,23 +664,94 @@ class CaptureWorker(threading.Thread):
                     if prof:
                         prof.record("preview_update", time.perf_counter() - t0)
 
+                # GridCrossingDetector needs to see EVERY YOLO track, not
+                # just in-grid ones, so it can observe the in-grid → out-of-
+                # grid transition and fire the event immediately. Feeding it
+                # the on-road-filtered list would hide the exit, forcing the
+                # event to wait for the 5 s age-out path and triggering the
+                # recorder several seconds after the car was already gone.
                 t0 = time.perf_counter() if prof else 0.0
-                events = crossing.update(tracks, fr.ts)
+                events = crossing.update(all_tracks, fr.ts)
                 if prof:
                     prof.record("crossing_update", time.perf_counter() - t0)
                 if prof:
                     prof.maybe_log()
                 for ev in events:
+                    # Stationary-track gate. Bbox jitter on a parked curb car
+                    # can occasionally satisfy the 2-line crossing condition;
+                    # we drop those events here so they never become passes.
+                    if self._is_stationary(ev.track_id):
+                        log.info(
+                            "ignoring crossing event for stationary track id=%d "
+                            "(parked or detection-jitter)",
+                            ev.track_id,
+                        )
+                        self._trajectories.pop(ev.track_id, None)
+                        continue
                     captured_at = datetime.now().astimezone()
                     stamp = captured_at.strftime("%Y%m%dT%H%M%S")
                     clip_name = f"cal_{stamp}_id{ev.track_id}_{ev.direction}.mp4"
-                    distance = (
-                        cal.line_distance_m_north if ev.direction == "N"
-                        else cal.line_distance_m_south
-                    )
+
+                    # Reported speed: linear regression of Y vs t over samples
+                    # whose projected Y is within ±15 ft of Y=0 (the camera's
+                    # perpendicular line, where reprojection error is smallest).
+                    # The slope of the fit IS the velocity component along the
+                    # road; we report its magnitude as the speed of the pass.
+                    # We also compute the legacy Method A (median of v_inst over
+                    # the full grid) for side-by-side comparison while the
+                    # methods are vetted; it's only logged, not stored.
+                    # Speed estimation: Y-vs-t regression with a tiered
+                    # window. The primary ±15 ft window gives the highest-
+                    # accuracy fit (homography error is smallest near Y=0).
+                    # When that window has fewer samples than _MIN_PRIMARY_-
+                    # SAMPLES — fast vehicles, frame drops, tracker splits,
+                    # or trajectories that start mid-grid — widen to ±25 ft
+                    # (the full grid) to gather more points. Same math, just
+                    # over a larger set. Both paths are "regression"; the
+                    # window size is recorded so the UI can flag widened
+                    # passes as lower confidence.
                     speed_mph: float | None = None
-                    if distance > 0 and ev.elapsed_s > 0:
-                        speed_mph = (distance / ev.elapsed_s) * 2.2369362920544
+                    speed_method: str | None = None
+                    n_speed_samples = 0
+                    speed_r2 = 0.0
+                    half_window_used_m = _CENTERED_HALF_WINDOW_M
+                    method_a_mph = float("nan")
+                    method_a_n = 0
+                    if self._homog is not None:
+                        traj_for_speed = list(self._trajectories.get(ev.track_id, ()))
+                        speed_samples = [(t, u, v) for (t, u, v, _bb) in traj_for_speed]
+                        method_a_mph, method_a_n = self._homog.median_speed_in_grid(
+                            speed_samples,
+                            grid_x_min=_GRID_X_MIN, grid_x_max=_GRID_X_MAX,
+                            grid_y_min=_GRID_Y_MIN, grid_y_max=_GRID_Y_MAX,
+                            tolerance_m=_GRID_TOLERANCE_M,
+                        )
+
+                        # Tier 1: primary ±15 ft window
+                        primary_mph, primary_r2, primary_n = self._homog.centered_speed_y_regression(
+                            speed_samples,
+                            half_window_m=_CENTERED_HALF_WINDOW_M,
+                        )
+                        if (not (primary_mph != primary_mph)
+                                and primary_n >= _MIN_PRIMARY_SAMPLES):
+                            speed_mph = float(primary_mph)
+                            speed_method = "regression"
+                            speed_r2 = primary_r2
+                            n_speed_samples = primary_n
+                            half_window_used_m = _CENTERED_HALF_WINDOW_M
+                        else:
+                            # Tier 2: widen to ±25 ft (the full grid)
+                            wide_mph, wide_r2, wide_n = self._homog.centered_speed_y_regression(
+                                speed_samples,
+                                half_window_m=_WIDER_HALF_WINDOW_M,
+                            )
+                            if not (wide_mph != wide_mph) and wide_n >= 3:
+                                speed_mph = float(wide_mph)
+                                speed_method = "regression_wide"
+                                speed_r2 = wide_r2
+                                n_speed_samples = wide_n
+                                half_window_used_m = _WIDER_HALF_WINDOW_M
+                            # else: speed remains None (true insufficient data)
                     # Gate VIDEO recording on the configured capture-speed range.
                     # Thumbnails are always written so the list shows a preview
                     # for every pass. If speed is unknown (no calibration), we
@@ -394,15 +788,16 @@ class CaptureWorker(threading.Thread):
                     #                      the upgrader uses this to detect
                     #                      that the cached offset is stale.
                     #
-                    # Pick the direction-appropriate "exit-side" line for the
-                    # thumbnail: N-bound exits on line B (right), S-bound
-                    # exits on line A (left). Subtracting a small bias
-                    # (0.3s) offsets the typical matched-frame lateness
-                    # (frame quantization at 4fps + tick-midpoint variance)
-                    # so the car lands at-or-before the exit line in the
-                    # matched frame instead of past it.
-                    exit_ts = ev.t_b if ev.direction == "N" else ev.t_a
-                    target_ts = exit_ts - 0.3
+                    # Target the moment of grid exit for the high-res thumbnail.
+                    # In the grid-based event, ev.t_b is always the chronological
+                    # exit time (regardless of direction) and ev.bbox is the bbox
+                    # captured at that same moment, so the cropped region of the
+                    # matched main-stream frame lines up with the actual vehicle.
+                    # The 0.3s bias absorbs typical frame-quantization lateness
+                    # (main stream is ~4 fps + tick-midpoint variance), so the
+                    # car lands at-or-before grid exit in the matched frame
+                    # instead of past it.
+                    target_ts = ev.t_b - 0.3
                     target_wallclock = captured_at
                     target_sub_epoch = fr.epoch
 
@@ -464,13 +859,52 @@ class CaptureWorker(threading.Thread):
                         direction=ev.direction,
                         elapsed_s=ev.elapsed_s,
                         clip_path=clip_path or None,
+                        speed_mph=speed_mph,
+                        speed_method=speed_method,
                     )
                     pid_holder[0] = pid
+                    if speed_mph is not None:
+                        method_a_str = (
+                            f"{method_a_mph:.2f}" if method_a_mph == method_a_mph else "—"
+                        )
+                        window_ft = int(round(half_window_used_m / _FT_TO_M))
+                        wide_tag = " WIDENED" if speed_method == "regression_wide" else ""
+                        speed_str = (
+                            f"{speed_mph:.2f} mph "
+                            f"(regression{wide_tag} on {n_speed_samples} samples, ±{window_ft} ft, "
+                            f"r²={speed_r2:.3f}; Method A median={method_a_str} mph over {method_a_n})"
+                        )
+                    else:
+                        speed_str = (
+                            f"speed unavailable (insufficient trajectory samples)"
+                        )
                     log.info(
-                        "pass id=%d track=%d %s %s elapsed=%.3fs clip=%s",
+                        "pass id=%d track=%d %s %s %s  elapsed=%.3fs  clip=%s",
                         pid, ev.track_id, ev.cls_name, ev.direction,
-                        ev.elapsed_s, clip_name,
+                        speed_str, ev.elapsed_s, clip_name,
                     )
+                    # Persist the full per-frame trajectory + computed v_inst
+                    # to events/pass_<pid>.jsonl so the chart and any future
+                    # offline analysis has real-PTS-anchored timing. Also
+                    # records the canonical speed_mph in the manifest.
+                    if self._homog is not None:
+                        traj = list(self._trajectories.get(ev.track_id, ()))
+                        try:
+                            self._save_pass_trajectory_jsonl(
+                                pid=pid, ev=ev, traj=traj,
+                                speed_mph=speed_mph,
+                                speed_method=speed_method,
+                                half_window_used_m=half_window_used_m,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            log.warning(
+                                "pass id=%d: failed to write trajectory JSONL: %s",
+                                pid, e,
+                            )
+                        # We've consumed the trajectory for this pass; drop it
+                        # so subsequent unrelated re-uses of this track_id (rare,
+                        # but possible after BotSORT recycles IDs) start fresh.
+                        self._trajectories.pop(ev.track_id, None)
         finally:
             recorder.flush()
             log.info("capture worker stopped")

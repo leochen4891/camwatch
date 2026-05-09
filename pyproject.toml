@@ -15,6 +15,7 @@ dependencies = [
     "jinja2>=3.1",
     "python-multipart>=0.0.20",
     "pytesseract>=0.3.13",
+    "av>=17.0.1",
 ]
 
 [build-system]

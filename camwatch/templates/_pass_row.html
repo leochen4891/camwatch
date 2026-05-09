@@ -41,6 +41,9 @@
       <div class="speed">
         {% if p.computed_mph is not none %}
           <strong>{{ "%.0f" | format(p.computed_mph) }} mph</strong>
+          {% if p.speed_method == 'regression_wide' or p.speed_method == 'median_fallback' %}
+            <span class="low-confidence" title="Lower confidence: regression used a widened ±25 ft window because the primary ±15 ft window had too few samples (typically a fast vehicle, frame drops, or a tracker split).">?</span>
+          {% endif %}
           {% if p.alert %}<span class="alert-icon">🚨</span>{% endif %}
         {% else %}
           <span class="muted">—</span>
@@ -90,10 +93,10 @@
     </div>
 
     {% if p.has_clip %}
-    <div class="video-wrap hidden" onclick="event.stopPropagation()"></div>
+    <div class="video-wrap hidden" onclick="rowClick(event, {{ p.id }})"></div>
     {% endif %}
     {% if p.has_thumb %}
-    <div class="big-image-wrap hidden" onclick="event.stopPropagation()"></div>
+    <div class="big-image-wrap hidden" onclick="rowClick(event, {{ p.id }})"></div>
     {% endif %}
   </article>
 {% endif %}

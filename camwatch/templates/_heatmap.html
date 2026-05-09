@@ -1,0 +1,49 @@
+{# context vars: heatmap_cells, heatmap_day_headers, heatmap_slot_headers,
+   heatmap_max_count, heatmap_max_avg_mph, heatmap_max_top_mph,
+   time_mask, time_ref_date #}
+<div class="heatmap-title">
+  <span class="heatmap-title-text">Activity heatmap</span>
+  <span class="muted">(trailing 7 days · 6am-10pm rows + edge overflow)</span>
+  <span class="heatmap-mode" role="group" aria-label="Color by">
+    <button type="button" class="heatmap-mode-btn active" data-mode="count">Count</button>
+    <button type="button" class="heatmap-mode-btn" data-mode="speed">Speed</button>
+  </span>
+</div>
+<div class="heatmap-grid">
+  <button type="button" class="heatmap-corner" id="heatmap-toggle-all"
+          title="Toggle all slots"
+          style="grid-column: 1; grid-row: 1;">⊞</button>
+  {% for h in heatmap_day_headers %}
+  <button type="button" class="heatmap-day-header" data-day="{{ h.day }}"
+          title="Toggle {{ h.weekday }} {{ h.label }}"
+          style="grid-column: {{ h.day + 2 }}; grid-row: 1;">
+    <span class="heatmap-weekday">{{ h.weekday }}</span>
+    <span class="heatmap-date">{{ h.label }}</span>
+  </button>
+  {% endfor %}
+  {% for h in heatmap_slot_headers %}
+  <button type="button" class="heatmap-slot-header" data-slot="{{ h.slot }}"
+          title="Toggle {{ h.time_label }} across all days"
+          style="grid-column: 1; grid-row: {{ h.slot + 2 }};">
+    {{ h.label }}
+  </button>
+  {% endfor %}
+  {% for c in heatmap_cells %}
+  {%- set passes_text = (c.count|string) ~ (' pass' if c.count == 1 else ' passes') -%}
+  {%- if c.count > 0 and c.avg_mph is not none -%}
+    {%- set tip = c.day_label ~ ' ' ~ c.time_range ~ ' · ' ~ passes_text ~ ' · avg ' ~ ('%d' % c.avg_mph) ~ ' mph · top ' ~ ('%d' % c.top_mph) ~ ' mph' -%}
+  {%- elif c.count > 0 -%}
+    {%- set tip = c.day_label ~ ' ' ~ c.time_range ~ ' · ' ~ passes_text ~ ' · avg — · top —' -%}
+  {%- else -%}
+    {%- set tip = c.day_label ~ ' ' ~ c.time_range ~ ' · ' ~ passes_text -%}
+  {%- endif -%}
+  <button type="button"
+          class="heatmap-cell heat-{{ c.heat_count }}{% if c.selected %} selected{% endif %}"
+          data-day="{{ c.day }}" data-slot="{{ c.slot }}" data-index="{{ c.index }}"
+          data-count="{{ c.count }}"
+          data-heat-count="{{ c.heat_count }}"
+          data-heat-speed="{{ c.heat_speed }}"
+          title="{{ tip }}"
+          style="grid-column: {{ c.day + 2 }}; grid-row: {{ c.slot + 2 }};"></button>
+  {% endfor %}
+</div>

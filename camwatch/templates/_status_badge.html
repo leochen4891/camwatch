@@ -1,0 +1,20 @@
+{# Live status pill in the top-left of the page. Polled every few seconds
+   so the user sees the worker switch to "Paused (night)" without a refresh
+   when the camera goes into IR mode and detection is gated off. #}
+{% if not running %}
+<span class="status-badge idle"
+      hx-get="/status-badge" hx-trigger="every 5s" hx-swap="outerHTML">
+  ○ idle
+</span>
+{% elif paused_night %}
+<span class="status-badge paused"
+      hx-get="/status-badge" hx-trigger="every 5s" hx-swap="outerHTML"
+      title="Detection paused — camera is in IR/night mode">
+  ⏸ paused (night)
+</span>
+{% else %}
+<span class="status-badge live"
+      hx-get="/status-badge" hx-trigger="every 5s" hx-swap="outerHTML">
+  ● live
+</span>
+{% endif %}

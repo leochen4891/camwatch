@@ -3,8 +3,19 @@
          hx-get="/passes"
          hx-trigger="change"
          hx-target="#pass-list"
-         hx-include="#filter-form, #histogram">
+         hx-include="#filter-form, #histogram, #heatmap">
   {% include "_histogram.html" %}
+</section>
+{% endif %}
+{% if include_oob_heatmap %}
+<section id="heatmap" class="heatmap-section" hx-swap-oob="true"
+         hx-get="/passes"
+         hx-trigger="change"
+         hx-target="#pass-list"
+         hx-include="#filter-form, #histogram, #heatmap">
+  {% include "_heatmap.html" %}
+  <input type="hidden" name="time_mask" id="time-mask" value="{{ time_mask }}" form="filter-form">
+  <input type="hidden" name="time_ref_date" id="time-ref-date" value="{{ time_ref_date }}" form="filter-form">
 </section>
 {% endif %}
 {% if not rows %}

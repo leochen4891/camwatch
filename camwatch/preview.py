@@ -30,22 +30,66 @@ class PreviewBuffer:
         self._quality = jpeg_quality
         # Scene config (set once via configure())
         self._roi: tuple[int, int, int, int] | None = None
-        self._line_a_x: int = 0
-        self._line_b_x: int = 0
-        self._show_lines: bool = False
-
-    def set_show_lines(self, show: bool) -> None:
-        self._show_lines = bool(show)
+        # Grid overlay (settable independently of configure())
+        self._show_grid: bool = False
+        # Pre-computed grid polylines in pre-resize pixel coords; recomputed
+        # whenever the homography or grid bounds change. None disables drawing.
+        self._grid_polylines: list[np.ndarray] | None = None
 
     def configure(
         self,
         roi: tuple[int, int, int, int] | None,
-        line_a_x: int,
-        line_b_x: int,
+        line_a_x: int = 0,  # noqa: ARG002 (kept for caller compat; unused)
+        line_b_x: int = 0,  # noqa: ARG002
     ) -> None:
         self._roi = roi
-        self._line_a_x = int(line_a_x)
-        self._line_b_x = int(line_b_x)
+
+    def set_grid(
+        self,
+        homography: Any | None,
+        grid_x_min: float, grid_x_max: float,
+        grid_y_min: float, grid_y_max: float,
+    ) -> None:
+        """Pre-project the grid corners + inner lines into pixel space so the
+        per-frame _render path can draw them with cheap polylines instead of
+        re-projecting every frame. Pass homography=None to disable the overlay
+        entirely (e.g., if calibration is missing)."""
+        if homography is None:
+            self._grid_polylines = None
+            return
+        inv = homography.inv_H
+
+        def to_px(X: float, Y: float) -> tuple[int, int]:
+            p = inv @ np.array([X, Y, 1.0])
+            return int(round(p[0] / p[2])), int(round(p[1] / p[2]))
+
+        polylines: list[np.ndarray] = []
+        # Outer rectangle
+        outer = [
+            to_px(grid_x_min, grid_y_min),
+            to_px(grid_x_max, grid_y_min),
+            to_px(grid_x_max, grid_y_max),
+            to_px(grid_x_min, grid_y_max),
+            to_px(grid_x_min, grid_y_min),
+        ]
+        polylines.append(np.array(outer, dtype=np.int32))
+        # Inner lines every 5 ft (1.524 m) — ladder of road-perpendicular lines
+        # along Y from grid_y_min..grid_y_max, plus road-parallel lines along
+        # X. Lets the user eyeball perspective and see when a vehicle's red
+        # ground-point lands in which cell.
+        step = 5.0 * 0.3048
+        y = grid_y_min + step
+        while y < grid_y_max - 1e-6:
+            polylines.append(np.array([to_px(grid_x_min, y), to_px(grid_x_max, y)], dtype=np.int32))
+            y += step
+        x = grid_x_min + step
+        while x < grid_x_max - 1e-6:
+            polylines.append(np.array([to_px(x, grid_y_min), to_px(x, grid_y_max)], dtype=np.int32))
+            x += step
+        self._grid_polylines = polylines
+
+    def set_show_grid(self, show: bool) -> None:
+        self._show_grid = bool(show)
 
     def update(self, frame: np.ndarray, tracks: list[Any]) -> None:
         annotated, _ = self._render(frame, tracks)
@@ -86,15 +130,16 @@ class PreviewBuffer:
 
         ih, iw = img.shape[:2]
 
-        # Crossing lines: thin gray, just visible reference markers.
-        if self._show_lines:
-            line_color = (160, 160, 160)
-            if self._line_a_x > 0:
-                ax = int(round(self._line_a_x * scale))
-                cv2.line(img, (ax, 0), (ax, ih), line_color, 1)
-            if self._line_b_x > 0:
-                bx = int(round(self._line_b_x * scale))
-                cv2.line(img, (bx, 0), (bx, ih), line_color, 1)
+        # Calibrated measurement grid (yellow outer rectangle, dim inner
+        # 5-ft cells). Drawn first so detection bboxes render on top.
+        if self._show_grid and self._grid_polylines:
+            outer_color = (0, 255, 255)   # yellow
+            inner_color = (60, 140, 140)  # dim yellow
+            for i, pl in enumerate(self._grid_polylines):
+                pts = (pl.astype(np.float64) * scale).astype(np.int32)
+                color = outer_color if i == 0 else inner_color
+                thickness = 2 if i == 0 else 1
+                cv2.polylines(img, [pts], False, color, thickness, cv2.LINE_AA)
 
         # Bboxes + ground points
         for t in tracks:

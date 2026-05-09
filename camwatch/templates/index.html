@@ -11,7 +11,7 @@
   <header>
     <div class="title-row">
       <h1>camwatch</h1>
-      <span class="status-badge" id="status">{% if running %}● live{% else %}○ idle{% endif %}</span>
+      {% include "_status_badge.html" %}
       <button type="button" class="settings-btn" title="Settings"
               onclick="document.getElementById('settings-dialog').showModal()">⚙</button>
     </div>
@@ -41,14 +41,6 @@
       </section>
 
       <section class="settings-section">
-        <h3>Live preview</h3>
-        <label class="setting-row">
-          <input type="checkbox" name="show_lines" value="true">
-          <span>Show crossing lines on the live preview</span>
-        </label>
-      </section>
-
-      <section class="settings-section">
         <h3>Clip margin</h3>
         <p class="muted-text">Seconds of pre-roll before the first crossing and post-roll after the last. Larger values mean longer clips and more disk use.</p>
         <div class="setting-row">
@@ -66,6 +58,30 @@
           <span>to</span>
           <input type="number" name="clip_capture_max_mph" value="{{ '%g' % clip_capture_max_mph }}" step="1" min="0" max="999">
           <span>mph</span>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Live preview</h3>
+        <p class="muted-text">Draw the calibrated measurement grid on the live preview to verify alignment.</p>
+        <div class="setting-row">
+          <label class="checkbox">
+            <input type="checkbox" name="preview_show_grid" value="true"
+                   {% if preview_show_grid %}checked{% endif %}>
+            Show measurement grid on the preview
+          </label>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Night mode</h3>
+        <p class="muted-text">When the camera switches to monochrome IR illumination in low light, only headlights/taillights are bright enough to detect — speed measurements from those frames are unreliable. Pause detection while in night mode.</p>
+        <div class="setting-row">
+          <label class="checkbox">
+            <input type="checkbox" name="pause_at_night" value="true"
+                   {% if pause_at_night %}checked{% endif %}>
+            Pause detection during night mode
+          </label>
         </div>
       </section>
 
@@ -107,7 +123,7 @@
               <option value="S">S</option>
             </select>
           </label>
-          <label class="checkbox"><input type="checkbox" name="alerts_only" value="true"> alerts only</label>
+          <label class="checkbox"><input type="checkbox" name="alerts_only" value="true" checked> alerts only</label>
           <input type="hidden" name="page" value="{{ page }}" id="page-input">
         </form>
       </section>
@@ -161,13 +177,85 @@
           const input = document.getElementById("page-input");
           if (input) input.value = "1";
         }
+        saveFilterState();
         return;
       }
       if (t.closest("#histogram") || t.id === "heatmap" || t.closest("#heatmap")) {
         const input = document.getElementById("page-input");
         if (input) input.value = "1";
+        saveFilterState();
       }
     });
+
+    // ---------- persisted filter state (localStorage) ----------
+    // Restored on page load; saved on every change. Time mask is anchored to
+    // the ref_date it was created with — if that date is stale (different
+    // calendar day from "now"), the mask is dropped and the server's default
+    // ("today-only") wins. All other filters carry over verbatim.
+    const FILTER_STORAGE_KEY = "camwatch.filters.v1";
+
+    function saveFilterState() {
+      try {
+        const f = document.getElementById("filter-form");
+        if (!f) return;
+        const direction = f.querySelector('[name="direction"]')?.value ?? "";
+        const alerts_only = !!f.querySelector('[name="alerts_only"]')?.checked;
+        const time_mask = document.getElementById("time-mask")?.value || "";
+        const time_ref_date = document.getElementById("time-ref-date")?.value || "";
+        const buckets = Array.from(
+          document.querySelectorAll('#histogram input[name="buckets"]:checked')
+        ).map(c => c.value);
+        localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
+          direction, alerts_only, time_mask, time_ref_date, buckets,
+          heatmap_mode: heatmapMode,
+        }));
+      } catch (e) { /* localStorage may be disabled / full; non-fatal */ }
+    }
+
+    function restoreFilterState() {
+      let s;
+      try {
+        s = JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) || "null");
+      } catch (e) { return false; }
+      if (!s || typeof s !== "object") return false;
+
+      const f = document.getElementById("filter-form");
+      const dirSel = f?.querySelector('[name="direction"]');
+      const alertsBox = f?.querySelector('[name="alerts_only"]');
+      if (dirSel && typeof s.direction === "string") dirSel.value = s.direction;
+      if (alertsBox && typeof s.alerts_only === "boolean") alertsBox.checked = s.alerts_only;
+
+      if (s.heatmap_mode === "speed" || s.heatmap_mode === "count") {
+        heatmapMode = s.heatmap_mode;
+      }
+
+      // Time mask is only meaningful within its anchor week. The server emits
+      // a fresh ref_date on every initial render; if our saved one matches,
+      // the saved selection lines up with the same 7-day window.
+      const currentRef = document.getElementById("time-ref-date")?.value || "";
+      if (
+        typeof s.time_mask === "string" &&
+        s.time_mask.length === HEATMAP_TOTAL_SLOTS &&
+        s.time_ref_date === currentRef
+      ) {
+        const maskInput = document.getElementById("time-mask");
+        if (maskInput) maskInput.value = s.time_mask;
+        heatmapMask = Array.from(s.time_mask, c => c === "1");
+        document.querySelectorAll("#heatmap .heatmap-cell").forEach(cell => {
+          const i = parseInt(cell.dataset.index, 10);
+          cell.classList.toggle("selected", !!heatmapMask[i]);
+        });
+      }
+
+      if (Array.isArray(s.buckets)) {
+        const wanted = new Set(s.buckets.map(String));
+        document.querySelectorAll('#histogram input[name="buckets"]').forEach(c => {
+          c.checked = wanted.has(c.value);
+        });
+      }
+
+      return true;
+    }
 
     // ---------- heatmap (week-view time filter) ----------
     const HEATMAP_SLOTS_PER_DAY = 32;       // 06:00-22:00 in 30-min steps
@@ -300,16 +388,56 @@
       }
     });
 
-    // After a #heatmap OOB swap, re-sync the JS mask from the freshly-rendered
-    // hidden input so JS state matches whatever the server actually used.
-    document.body.addEventListener("htmx:afterSwap", (e) => {
-      if (e.target && e.target.id === "heatmap") {
-        heatmapMask = readHeatmapMaskFromInput();
-      }
+    // ---------- heatmap color mode (count vs avg-speed) ----------
+    // Purely client-side. Server always renders cells with heat-{count}; this
+    // swaps to heat-{speed} when the user picks Speed mode. Re-applied after
+    // every OOB swap so the choice survives filter changes.
+    let heatmapMode = "count";
+    const HEATMAP_HEAT_CLASSES = ["heat-0", "heat-1", "heat-2", "heat-3", "heat-4", "heat-5"];
+
+    function applyHeatmapMode() {
+      const attr = heatmapMode === "speed" ? "heatSpeed" : "heatCount";
+      const heatmap = document.getElementById("heatmap");
+      if (heatmap) heatmap.classList.toggle("mode-speed", heatmapMode === "speed");
+      document.querySelectorAll("#heatmap .heatmap-cell").forEach(cell => {
+        const heat = cell.dataset[attr];
+        if (heat === undefined) return;
+        cell.classList.remove(...HEATMAP_HEAT_CLASSES);
+        cell.classList.add("heat-" + heat);
+      });
+      document.querySelectorAll("#heatmap .heatmap-mode-btn").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.mode === heatmapMode);
+      });
+    }
+
+    document.body.addEventListener("click", (e) => {
+      const btn = e.target.closest(".heatmap-mode-btn");
+      if (!btn) return;
+      heatmapMode = btn.dataset.mode === "speed" ? "speed" : "count";
+      applyHeatmapMode();
+      saveFilterState();
+    });
+
+    // After any HTMX settle (main target or OOB swap), re-sync the JS mask
+    // from the freshly-rendered hidden input AND re-apply the chosen color
+    // mode. Polling-driven OOB swaps replace #heatmap wholesale, so without
+    // this the user's Speed-mode choice would revert to the server default
+    // (Count) on every refresh.
+    document.body.addEventListener("htmx:afterSettle", () => {
+      if (!document.getElementById("heatmap")) return;
+      heatmapMask = readHeatmapMaskFromInput();
+      applyHeatmapMode();
     });
 
     document.addEventListener("DOMContentLoaded", () => {
       heatmapMask = readHeatmapMaskFromInput();
+      const restored = restoreFilterState();
+      applyHeatmapMode();
+      if (restored) {
+        // Server rendered with defaults; fire one fetch to bring the list,
+        // histogram, and heatmap counts in line with the restored filters.
+        htmx.trigger("#filter-form", "change");
+      }
     });
 
     // Refresh button: re-trigger the filter-form to refetch /passes immediately.
@@ -391,8 +519,9 @@
           imageWrap.classList.remove("hidden");
         }
         if (videoWrap) {
-          videoWrap.innerHTML = `<video controls autoplay playsinline src="/passes/${passId}/clip"></video>`;
+          videoWrap.innerHTML = playerPackageHTML(passId);
           videoWrap.classList.remove("hidden");
+          setupPlayerPackage(videoWrap, passId);
         }
       }
     }
@@ -413,14 +542,491 @@
       togglePlay(passId);
     }
 
-    // Click anywhere on the row (except interactive areas) toggles the player.
+    // ============================================================
+    // Player package: <video> + grid canvas overlay + custom bottom
+    // controls + speed-vs-position chart with video-synced marker.
+    // ============================================================
+
+    // Cached homography (loaded once on demand). Cleared on calibration change.
+    let _homogCache = null;
+    async function fetchHomography() {
+      if (_homogCache) return _homogCache;
+      const r = await fetch("/api/homography");
+      if (!r.ok) return null;
+      _homogCache = await r.json();
+      return _homogCache;
+    }
+
+    function playerPackageHTML(passId) {
+      return `
+        <div class="player-pkg" data-pass-id="${passId}">
+          <div class="video-frame">
+            <video class="player-video" src="/passes/${passId}/clip" playsinline autoplay></video>
+            <canvas class="grid-overlay"></canvas>
+          </div>
+          <div class="player-controls" onclick="event.stopPropagation()">
+            <button type="button" class="player-pp" aria-label="play / pause">▶</button>
+            <input type="range" class="player-scrub" min="0" max="1000" value="0" step="1">
+            <span class="player-time">0:00 / 0:00</span>
+          </div>
+          <div class="speed-chart-wrap">
+            <canvas class="speed-chart"></canvas>
+            <div class="speed-chart-legend"></div>
+          </div>
+        </div>
+      `;
+    }
+
+    async function setupPlayerPackage(rootEl, passId) {
+      const video = rootEl.querySelector(".player-video");
+      const overlay = rootEl.querySelector(".grid-overlay");
+      const ppBtn = rootEl.querySelector(".player-pp");
+      const scrub = rootEl.querySelector(".player-scrub");
+      const timeLbl = rootEl.querySelector(".player-time");
+      const chart = rootEl.querySelector(".speed-chart");
+      const legend = rootEl.querySelector(".speed-chart-legend");
+
+      // ---- minimal custom controls --------------------------------
+      function fmtTime(s) {
+        if (!isFinite(s)) return "0:00";
+        const m = Math.floor(s / 60), ss = Math.floor(s % 60);
+        return `${m}:${ss.toString().padStart(2, "0")}`;
+      }
+      function syncPP() {
+        ppBtn.textContent = video.paused ? "▶" : "⏸";
+      }
+      ppBtn.addEventListener("click", () => {
+        if (video.paused) video.play();
+        else video.pause();
+      });
+      video.addEventListener("play", syncPP);
+      video.addEventListener("pause", syncPP);
+      video.addEventListener("ended", syncPP);
+      let scrubbing = false;
+      scrub.addEventListener("input", () => {
+        if (!isFinite(video.duration)) return;
+        scrubbing = true;
+        video.currentTime = (scrub.value / 1000) * video.duration;
+      });
+      scrub.addEventListener("change", () => { scrubbing = false; });
+      video.addEventListener("timeupdate", () => {
+        if (!scrubbing && isFinite(video.duration) && video.duration > 0) {
+          scrub.value = String((video.currentTime / video.duration) * 1000);
+        }
+        timeLbl.textContent = `${fmtTime(video.currentTime)} / ${fmtTime(video.duration)}`;
+        renderChartMarker();
+      });
+      video.addEventListener("loadedmetadata", () => {
+        timeLbl.textContent = `0:00 / ${fmtTime(video.duration)}`;
+      });
+
+      // ---- grid overlay --------------------------------------------
+      const homog = await fetchHomography();
+      function drawGrid() {
+        const ctx = overlay.getContext("2d");
+        // size canvas to displayed video dims
+        const r = video.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        overlay.width = Math.round(r.width * dpr);
+        overlay.height = Math.round(r.height * dpr);
+        overlay.style.width = r.width + "px";
+        overlay.style.height = r.height + "px";
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, r.width, r.height);
+        if (!homog) return;
+        const [Fw, Fh] = homog.frame_size_sub;  // 640, 480
+        const sx = r.width / Fw, sy = r.height / Fh;
+        const H = homog.H;
+        // Hinv via cofactors
+        function inv3(M) {
+          const [[a,b,c],[d,e,f],[g,h,i]] = M;
+          const det = a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+          if (Math.abs(det) < 1e-12) return null;
+          const inv = [
+            [(e*i-f*h)/det,  -(b*i-c*h)/det,  (b*f-c*e)/det],
+            [-(d*i-f*g)/det,  (a*i-c*g)/det,  -(a*f-c*d)/det],
+            [(d*h-e*g)/det,  -(a*h-b*g)/det,  (a*e-b*d)/det],
+          ];
+          return inv;
+        }
+        const Hinv = inv3(H);
+        if (!Hinv) return;
+        function m2disp(X, Y) {
+          const w = Hinv[2][0]*X + Hinv[2][1]*Y + Hinv[2][2];
+          if (Math.abs(w) < 1e-9) return null;
+          const u = (Hinv[0][0]*X + Hinv[0][1]*Y + Hinv[0][2]) / w;
+          const v = (Hinv[1][0]*X + Hinv[1][1]*Y + Hinv[1][2]) / w;
+          return [u * sx, v * sy];
+        }
+        const FT_TO_M = 0.3048;
+        const RW = (homog.road_width_ft || 30) * FT_TO_M;
+        const xMin = -RW - 1, xMax = 1;
+        const yMin = -25 * FT_TO_M - 1, yMax = 25 * FT_TO_M + 1;
+        // 5ft cyan major lines (horizontal cross-sections)
+        ctx.strokeStyle = "rgba(0, 220, 255, 0.65)";
+        ctx.lineWidth = 1;
+        for (let n = -5; n <= 5; n++) {
+          const Y = n * 5 * FT_TO_M;
+          const a = m2disp(xMin, Y), b = m2disp(xMax, Y);
+          if (a && b) {
+            ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+          }
+        }
+        // 1ft sub-grid (lighter)
+        ctx.strokeStyle = "rgba(0, 220, 255, 0.25)";
+        for (let n = -25; n <= 25; n++) {
+          if (n % 5 === 0) continue;
+          const Y = n * FT_TO_M;
+          const a = m2disp(xMin, Y), b = m2disp(xMax, Y);
+          if (a && b) {
+            ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+          }
+        }
+        // Yellow rectangle (calibration boundary)
+        ctx.strokeStyle = "rgba(255, 220, 0, 0.85)";
+        ctx.lineWidth = 1.5;
+        const corners = [
+          [0, 25*FT_TO_M], [0, -25*FT_TO_M],
+          [-RW, -25*FT_TO_M], [-RW, 25*FT_TO_M],
+        ];
+        const cp = corners.map(([X,Y]) => m2disp(X, Y));
+        if (cp.every(p => p)) {
+          ctx.beginPath();
+          ctx.moveTo(cp[0][0], cp[0][1]);
+          for (let i = 1; i < cp.length; i++) ctx.lineTo(cp[i][0], cp[i][1]);
+          ctx.closePath();
+          ctx.stroke();
+        }
+      }
+      // Draw grid only on specific events — NOT a ResizeObserver, which
+      // can cause feedback loops since the canvas size changes per redraw.
+      video.addEventListener("loadedmetadata", drawGrid);
+      window.addEventListener("resize", drawGrid);
+
+      // ---- speed chart --------------------------------------------
+      let trajectory = null;  // { manifest, samples }
+      let chartGeo = null;    // axis-mapping cache for marker
+      try {
+        const r = await fetch(`/passes/${passId}/trajectory.jsonl`);
+        if (r.ok) {
+          const text = await r.text();
+          const lines = text.trim().split("\n").map(l => JSON.parse(l));
+          trajectory = { manifest: lines[0], samples: lines.slice(1) };
+        }
+      } catch (e) { /* no trajectory available */ }
+
+      let chartSized = false;
+      function sizeChart() {
+        const r = chart.parentElement.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        chart.width = Math.round(r.width * dpr);
+        chart.height = Math.round(160 * dpr);
+        chart.style.width = r.width + "px";
+        chart.style.height = "160px";
+        chartSized = true;
+      }
+      function drawChart() {
+        if (!trajectory) {
+          legend.textContent = "(no trajectory data)";
+          return;
+        }
+        if (!chartSized) sizeChart();
+        const ctx = chart.getContext("2d");
+        const dpr = window.devicePixelRatio || 1;
+        const r = { width: chart.width / dpr, height: chart.height / dpr };
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, r.width, 160);
+
+        // X axis = bbox center u (sub-stream pixel space). The chart and
+        // video are constrained to the same max-width (720px) so the data
+        // area maps approximately 1:1 to the video frame: as the car moves
+        // horizontally in the video, the chart's marker tracks horizontally.
+        // Padding is chosen so the data area edges line up reasonably with
+        // the video edges.
+        const padL = 36, padR = 8, padT = 12, padB = 28;
+        const chW = r.width - padL - padR;
+        const chH = 160 - padT - padB;
+
+        const m = trajectory.manifest;
+        const fallbackPre = m.clip_pre_roll_s ?? 0.5;
+        const fallbackPost = m.clip_post_roll_s ?? 0.5;
+        const clipStart = (m.clip_start_ts != null)
+          ? m.clip_start_ts
+          : Math.min(m.t_a_pts, m.t_b_pts) - fallbackPre;
+        const clipEnd = (m.clip_end_ts != null)
+          ? m.clip_end_ts
+          : Math.max(m.t_a_pts, m.t_b_pts) + fallbackPost;
+        const clipDur = clipEnd - clipStart;
+        // ±half_window for the centered-regression speed. Read from the
+        // manifest if present (new JSONLs); fall back to ±15 ft for older
+        // JSONLs that pre-date the field. We then derive `in_speed_window`
+        // per row from each sample's Y (always present), so old captures
+        // get the highlighting / fitted line too.
+        const halfWindowM = (m.speed_window_half_m != null && isFinite(m.speed_window_half_m))
+          ? m.speed_window_half_m : (15.0 * 0.3048);
+        const samples = trajectory.samples
+          .filter(s => s.v_inst_mph != null)
+          .map(s => ({
+            ...s,
+            ct: s.ts - clipStart,
+            in_speed_window: (s.in_speed_window === true)
+              || (s.Y != null && Math.abs(s.Y) <= halfWindowM),
+          }));
+        if (samples.length < 2) {
+          legend.textContent = "(not enough samples)";
+          return;
+        }
+        const Vvals = samples.map(s => s.v_inst_mph);
+        // Use the sub-stream frame width as the X axis range so the dot's
+        // horizontal position on the chart corresponds directly to the car's
+        // horizontal position in the video.
+        const uMin = 0;
+        const uMax = (m.frame_size_sub && m.frame_size_sub[0]) || 640;
+        const vMin = 0;
+        const vMax = Math.max(40, Math.ceil(Math.max(...Vvals) / 10) * 10 + 5);
+        chartGeo = { samples, padL, padR, padT, padB, chW, chH,
+                     uMin, uMax, vMin, vMax, clipStart, clipDur };
+
+        // Plot frame
+        ctx.strokeStyle = "#444"; ctx.fillStyle = "#888";
+        ctx.font = "10px system-ui";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + chH); ctx.lineTo(padL + chW, padT + chH);
+        ctx.stroke();
+
+        // Shade the U range where samples were inside the centered ±N ft
+        // window used for the regression-based reported speed. Falls back to
+        // no shading if the JSONL pre-dates the in_speed_window field.
+        const inWinSamples = samples.filter(s => s.in_speed_window === true);
+        if (inWinSamples.length >= 2) {
+          const inUmin = Math.min(...inWinSamples.map(s => s.u));
+          const inUmax = Math.max(...inWinSamples.map(s => s.u));
+          const xLo = padL + (inUmin - uMin) / (uMax - uMin) * chW;
+          const xHi = padL + (inUmax - uMin) / (uMax - uMin) * chW;
+          ctx.fillStyle = "rgba(74, 144, 226, 0.10)";
+          ctx.fillRect(xLo, padT, xHi - xLo, chH);
+          ctx.save();
+          ctx.setLineDash([3, 3]);
+          ctx.strokeStyle = "rgba(74, 144, 226, 0.55)";
+          ctx.beginPath();
+          ctx.moveTo(xLo, padT); ctx.lineTo(xLo, padT + chH);
+          ctx.moveTo(xHi, padT); ctx.lineTo(xHi, padT + chH);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Dotted horizontal gridlines every 10 mph
+        ctx.save();
+        ctx.setLineDash([2, 3]);
+        ctx.strokeStyle = "#3a4150";
+        for (let v = 10; v < vMax; v += 10) {
+          const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
+          ctx.beginPath();
+          ctx.moveTo(padL, y); ctx.lineTo(padL + chW, y);
+          ctx.stroke();
+        }
+        ctx.restore();
+
+        // Y-axis tick labels (mph)
+        ctx.fillStyle = "#888";
+        for (let v = 0; v <= vMax; v += 10) {
+          const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
+          ctx.beginPath(); ctx.moveTo(padL - 3, y); ctx.lineTo(padL, y); ctx.stroke();
+          ctx.fillText(v.toString(), 4, y + 3);
+        }
+
+        // X-axis: the chart's data area corresponds to the video's u range
+        // (0..640), so as the car moves horizontally in the video the chart
+        // marker tracks horizontally. The L/R direction labels match the
+        // image: "← S" on the left edge, "N →" on the right (since image
+        // right = north for this camera — confirmed when we calibrated).
+        ctx.fillStyle = "#888";
+        ctx.fillText("← S", padL + 4, padT + chH + 14);
+        ctx.fillText("N →", padL + chW - 28, padT + chH + 14);
+        ctx.fillText("car position in frame", padL + chW/2 - 60, padT + chH + 24);
+        ctx.fillText("mph", 2, 10);
+
+        // Line: connect consecutive in-grid samples directly. Earlier we
+        // broke the line at "large" time gaps to avoid drawing through
+        // missing data, but it broke on every minor detection hiccup
+        // (e.g., a single dropped frame at 15 fps creates a 130 ms gap
+        // that's invisible in the video). Now we keep the line continuous;
+        // brief detection gaps just produce a slightly steeper segment in
+        // that span, which honestly represents the data.
+        ctx.strokeStyle = "#4a90e2"; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        samples.forEach((s, i) => {
+          const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
+          const y = padT + chH - (s.v_inst_mph - vMin) / (vMax - vMin) * chH;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        // Dots at each detection. In-window samples (those that contributed
+        // to the regression-based reported speed) get a slightly larger,
+        // fully-opaque dot; out-of-window samples are dimmed so the user can
+        // see at a glance which points the headline number was derived from.
+        samples.forEach(s => {
+          const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
+          const y = padT + chH - (s.v_inst_mph - vMin) / (vMax - vMin) * chH;
+          const inWin = s.in_speed_window === true;
+          ctx.fillStyle = inWin ? "#4a90e2" : "rgba(74, 144, 226, 0.35)";
+          ctx.beginPath();
+          ctx.arc(x, y, inWin ? 3 : 2, 0, Math.PI*2);
+          ctx.fill();
+        });
+
+        // Linear least-squares regression on the highlighted (in-window)
+        // v_inst points. v_inst = slope · u + intercept. The line is drawn
+        // from the leftmost to rightmost in-window sample's u. For a steady-
+        // speed car the line will be roughly horizontal at the reported
+        // speed; if the car is accelerating/decelerating through the window,
+        // the line tilts and you can see it visually.
+        // Speed-fit visualization. Both 'regression' (primary ±15 ft) and
+        // 'regression_wide' (widened ±25 ft) use the same math — the
+        // shaded window already reflects which size was used, so the same
+        // best-fit-through-in-window-samples line renders for both. We
+        // change the line color to amber when widened so it visually
+        // matches the low-confidence "?" icon in the row.
+        // Legacy 'median_fallback' (older JSONLs) → dashed amber line at
+        // the reported speed across the chart.
+        const speedMethod = m.speed_method;
+        const reportedMphForLine = (m.speed_mph != null && isFinite(m.speed_mph))
+          ? m.speed_mph : null;
+        if (speedMethod === 'median_fallback' && reportedMphForLine != null) {
+          const yMed = padT + chH - (reportedMphForLine - vMin) / (vMax - vMin) * chH;
+          ctx.save();
+          ctx.strokeStyle = "#d8a52e";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padL, yMed); ctx.lineTo(padL + chW, yMed);
+          ctx.stroke();
+          ctx.restore();
+        } else if (inWinSamples.length >= 2) {
+          const n = inWinSamples.length;
+          let sumU = 0, sumV = 0, sumUV = 0, sumUU = 0;
+          inWinSamples.forEach(s => {
+            sumU  += s.u;
+            sumV  += s.v_inst_mph;
+            sumUV += s.u * s.v_inst_mph;
+            sumUU += s.u * s.u;
+          });
+          const denom = (n * sumUU) - (sumU * sumU);
+          if (Math.abs(denom) > 1e-9) {
+            const slope     = ((n * sumUV) - (sumU * sumV)) / denom;
+            const intercept = (sumV - slope * sumU) / n;
+            const uA = Math.min(...inWinSamples.map(s => s.u));
+            const uB = Math.max(...inWinSamples.map(s => s.u));
+            const vA = slope * uA + intercept;
+            const vB = slope * uB + intercept;
+            const xA = padL + (uA - uMin) / (uMax - uMin) * chW;
+            const xB = padL + (uB - uMin) / (uMax - uMin) * chW;
+            const yA = padT + chH - (vA - vMin) / (vMax - vMin) * chH;
+            const yB = padT + chH - (vB - vMin) / (vMax - vMin) * chH;
+            // Amber when widened, orange for the normal primary window.
+            ctx.strokeStyle = (speedMethod === 'regression_wide') ? "#d8a52e" : "#ff8a3d";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(xA, yA); ctx.lineTo(xB, yB);
+            ctx.stroke();
+          }
+        }
+
+        // Canonical speed: prefer manifest's `speed_mph` (new schema), fall
+        // back to `v_homog_mph` (older JSONLs). Either way it's the same
+        // homography-derived value.
+        const canonicalSpeed = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
+        const speedStr = (canonicalSpeed != null && isFinite(canonicalSpeed))
+          ? `${canonicalSpeed.toFixed(2)} mph` : "—";
+        const halfWindowFt = (m.speed_window_half_m != null)
+          ? (m.speed_window_half_m / 0.3048).toFixed(0) : null;
+        let methodStr;
+        if (speedMethod === 'median_fallback') {
+          methodStr = ` · <span style="color:#d8a52e">median fallback over ${samples.length} samples (low confidence)</span>`;
+        } else if (speedMethod === 'regression_wide' && halfWindowFt) {
+          methodStr = ` · <span style="color:#d8a52e">regression on <b>${inWinSamples.length}</b> samples (widened to ±${halfWindowFt} ft)</span>`;
+        } else if (halfWindowFt && inWinSamples.length >= 2) {
+          methodStr = ` · regression on <b>${inWinSamples.length}</b> samples (±${halfWindowFt} ft)`;
+        } else {
+          methodStr = "";
+        }
+        legend.innerHTML = `pass <b>${m.pass_id}</b> ${m.direction}-bound · `
+          + `speed=<b>${speedStr}</b>${methodStr} · `
+          + `${m.n_frames} frames`;
+      }
+      function renderChartMarker() {
+        if (!chartGeo) return;
+        // Re-draw whole chart then overlay marker (simpler than diff buffer)
+        drawChart();
+        if (!isFinite(video.duration) || video.duration <= 0) return;
+        const ctx = chart.getContext("2d");
+        const { samples, padL, padT, chW, chH, uMin, uMax, vMin, vMax,
+                clipDur } = chartGeo;
+        // Find the trajectory entry CLOSEST to the current video time, then
+        // SNAP the marker exactly to that sample's (u, v_inst). No
+        // interpolation between samples — the chart is a diagnostic showing
+        // exactly what was measured per frame, so the marker should land on
+        // a real data point and step from one to the next as the video
+        // plays. As the car moves horizontally in the video, the dot jumps
+        // from one detection's position to the next.
+        //
+        // IMPORTANT: video.currentTime is in encoded-video seconds (clip is
+        // recorded at a fixed fps, e.g. 10), but trajectory ts/ct is in real
+        // seconds (camera ran at ~14 fps). They don't match 1:1, so we scale
+        // video time by (clipDur / video.duration) to recover real time.
+        const vDur = video.duration;
+        const scaleVT = (isFinite(vDur) && vDur > 0) ? (clipDur / vDur) : 1;
+        const t = video.currentTime * scaleVT;
+        let bestI = 0, bestD = Math.abs(samples[0].ct - t);
+        for (let i = 1; i < samples.length; i++) {
+          const d = Math.abs(samples[i].ct - t);
+          if (d < bestD) { bestD = d; bestI = i; }
+        }
+        const s = samples[bestI];
+        const u_at_t = s.u;
+        const v_at_t = s.v_inst_mph;
+        const x = padL + (u_at_t - uMin) / (uMax - uMin) * chW;
+        const y = padT + chH - (v_at_t - vMin) / (vMax - vMin) * chH;
+        ctx.fillStyle = "#ffeb3b";
+        ctx.strokeStyle = "#000";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+        // Speed value next to the dot (uses the interpolated v_at_t so the
+        // label matches the dot position exactly)
+        const lbl = `${v_at_t.toFixed(1)} mph`;
+        ctx.font = "bold 12px system-ui";
+        const tw = ctx.measureText(lbl).width;
+        // Position label to the right of the dot, but flip to the left if
+        // it would overflow the chart area
+        let lx = x + 9;
+        if (lx + tw + 4 > padL + chW) lx = x - 9 - tw;
+        const ly = y - 8;
+        // background pill for legibility
+        ctx.fillStyle = "rgba(20, 24, 32, 0.85)";
+        ctx.fillRect(lx - 3, ly - 11, tw + 6, 15);
+        ctx.fillStyle = "#ffeb3b";
+        ctx.fillText(lbl, lx, ly);
+      }
+      // Draw chart on metadata load (when we know video duration) + on
+      // explicit window resize. NO ResizeObserver — canvas resizing inside
+      // observed element can loop.
+      window.addEventListener("resize", () => { sizeChart(); drawChart(); });
+      sizeChart();
+      drawChart();
+    }
+
+    // Click anywhere on the row toggles the player. Clicks on the video,
+    // grid overlay, speed chart, or thumbnail image bubble up here and also
+    // fold the entry. Interactive controls inside the player (play/pause
+    // button, scrubber) explicitly stopPropagation to avoid folding.
     function rowClick(event, passId) {
       if (
         event.target.closest(".row-actions") ||
         event.target.closest(".kebab-menu") ||
-        event.target.closest(".known-input-wrap") ||
-        event.target.closest(".video-wrap") ||
-        event.target.closest(".big-image-wrap")
+        event.target.closest(".known-input-wrap")
       ) {
         return;
       }

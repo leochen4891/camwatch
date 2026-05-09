@@ -46,6 +46,28 @@ header {
   font-size: 13px;
   color: var(--green);
 }
+.status-badge.live   { color: var(--green); }
+.status-badge.paused { color: #d8a52e; }  /* amber: detection gated off */
+.status-badge.idle   { color: var(--muted); }
+
+/* Low-confidence speed indicator: appears next to the speed when the
+   trajectory regression couldn't run and we fell back to median of
+   in-grid v_inst. Hover to see the explanatory tooltip. */
+.low-confidence {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 50%;
+  background: #4a4030;
+  color: #d8a52e;
+  font-size: 11px;
+  font-weight: 700;
+  margin-left: 4px;
+  cursor: help;
+  vertical-align: middle;
+}
 .settings-btn {
   background: transparent;
   color: var(--muted);
@@ -311,6 +333,22 @@ header {
   background: var(--accent);
 }
 .bar-wrap input:checked ~ .bar-track .bar { background: var(--accent); }
+/* Selected bars also brighten the count + label so a bar with a tiny
+   height (e.g. 1 pass) is still visibly selected. */
+.bar-wrap input:checked + .bar-count,
+.bar-wrap input:checked ~ .bar-label {
+  color: var(--text);
+  font-weight: 600;
+}
+/* "All default" state: no buckets explicitly picked → server treats as
+   "no filter / show all". Render every bar as visually selected so the
+   default doesn't look like everything was filtered out. */
+.bars.all-default .bar { background: var(--accent); }
+.bars.all-default .bar-count,
+.bars.all-default .bar-label {
+  color: var(--text);
+  font-weight: 600;
+}
 .bar-label {
   font-size: 11px;
   color: var(--muted);
@@ -620,6 +658,82 @@ main { padding: 16px 20px 80px; }
   border-radius: 4px;
   background: black;
 }
+
+/* Player package: video + grid overlay + custom controls + speed chart. */
+.player-pkg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  max-width: 720px;
+}
+.player-pkg .video-frame {
+  position: relative;
+  width: 100%;
+  max-width: 720px;
+  aspect-ratio: 4 / 3;
+  background: black;
+  border-radius: 4px;
+  overflow: hidden;
+  line-height: 0;
+}
+.player-pkg .player-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: black;
+  object-fit: contain;
+}
+.player-pkg .grid-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.player-pkg .player-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+  background: var(--surface-2);
+  border-radius: 4px;
+}
+.player-pkg .player-pp {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 14px;
+  width: 32px;
+  height: 28px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.player-pkg .player-pp:hover { background: var(--surface); }
+.player-pkg .player-scrub {
+  flex: 1;
+  height: 4px;
+  accent-color: var(--accent);
+}
+.player-pkg .player-time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  min-width: 88px;
+  text-align: right;
+}
+.player-pkg .speed-chart-wrap {
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 4px;
+}
+.player-pkg .speed-chart {
+  display: block;
+  width: 100%;
+}
+.player-pkg .speed-chart-legend {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 4px 0;
+}
 .big-image-wrap { grid-area: bigimg; }
 .big-image-wrap img {
   display: block;
@@ -630,16 +744,21 @@ main { padding: 16px 20px 80px; }
   background: var(--surface-2);
 }
 
-/* Expanded view, with a clip: 50:50 between the high-res image and the video. */
+/* Expanded view, with a clip: video on top (full width), high-res image below. */
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) {
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr auto;
   grid-template-areas:
     "meta    actions"
-    "bigimg  video"
+    "video   video"
+    "bigimg  bigimg"
     "known   known";
 }
+.pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .big-image-wrap img {
+  max-width: 720px;
+  margin: 0 auto;
+}
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .thumb { display: none; }
-.pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .video-wrap video { max-width: none; }
+.pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .video-wrap > video { max-width: none; }
 
 /* Expanded view, image only (no clip): big image takes the full row. */
 .pass-row:not(.deleted):has(.big-image-wrap:not(.hidden)):not(:has(.video-wrap:not(.hidden))) {
@@ -679,12 +798,42 @@ main { padding: 16px 20px 80px; }
   letter-spacing: 0.06em;
   color: var(--muted);
   margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 .heatmap-title .muted {
   text-transform: none;
   letter-spacing: 0;
-  margin-left: 6px;
   font-size: 11px;
+}
+.heatmap-mode {
+  display: inline-flex;
+  margin-left: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.heatmap-mode-btn {
+  background: var(--surface);
+  color: var(--muted);
+  border: 0;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.heatmap-mode-btn + .heatmap-mode-btn { border-left: 1px solid var(--border); }
+.heatmap-mode-btn:hover { color: var(--text); }
+.heatmap-mode-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+#heatmap.mode-speed .heatmap-mode-btn[data-mode="speed"].active {
+  background: #e24a4a;
 }
 .heatmap-grid {
   display: grid;
@@ -749,12 +898,18 @@ main { padding: 16px 20px 80px; }
   border: 0;
   background: #000; /* deselected = pure black */
 }
-/* Selected scale: clearly-visible gray (no data) → blue gradient (heat). */
+/* Selected scale: clearly-visible gray (no data) → blue gradient (count mode). */
 .heatmap-cell.selected.heat-0 { background: #3a3f4a; }
 .heatmap-cell.selected.heat-1 { background: #1f3a5e; }
 .heatmap-cell.selected.heat-2 { background: #295488; }
 .heatmap-cell.selected.heat-3 { background: #356eaf; }
 .heatmap-cell.selected.heat-4 { background: #4185d2; }
 .heatmap-cell.selected.heat-5 { background: var(--accent); }
+/* Speed mode: red gradient (faster = redder). */
+#heatmap.mode-speed .heatmap-cell.selected.heat-1 { background: #5e1f1f; }
+#heatmap.mode-speed .heatmap-cell.selected.heat-2 { background: #882929; }
+#heatmap.mode-speed .heatmap-cell.selected.heat-3 { background: #af3535; }
+#heatmap.mode-speed .heatmap-cell.selected.heat-4 { background: #d24141; }
+#heatmap.mode-speed .heatmap-cell.selected.heat-5 { background: #e24a4a; }
 .heatmap-cell:hover { outline: 1px solid var(--text); z-index: 2; }
 

@@ -80,6 +80,8 @@ class Config:
     clip_margin_s: float = 0.5  # pre/post-roll padding around the crossing window
     clip_capture_min_mph: float = 0.0  # passes below this speed are logged but skip clip
     clip_capture_max_mph: float = 999.0  # passes above this speed are logged but skip clip
+    preview_show_grid: bool = True  # draw the calibrated measurement grid on the live preview
+    pause_at_night: bool = True  # skip YOLO/triggering when the camera is in IR/night mode
 
     def load_calibration(self) -> CalibrationConfig | None:
         if not self.calibration_path.exists():
@@ -146,4 +148,6 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         clip_margin_s=float((raw.get("clip") or {}).get("margin_s", 0.5) or 0.5),
         clip_capture_min_mph=float((raw.get("clip") or {}).get("capture_min_mph", 0.0) or 0.0),
         clip_capture_max_mph=float((raw.get("clip") or {}).get("capture_max_mph", 999.0) or 999.0),
+        preview_show_grid=bool((raw.get("preview") or {}).get("show_grid", True)),
+        pause_at_night=bool((raw.get("capture") or {}).get("pause_at_night", True)),
     )
