@@ -27,8 +27,6 @@
         <img src="/passes/{{ p.id }}/thumb" alt="" loading="lazy">
         {% if p.thumb_upgrade_status == 'ok' %}
           <span class="thumb-badge ok" title="High-res thumbnail (main stream)">HD</span>
-        {% elif p.thumb_upgrade_status == 'failed' %}
-          <span class="thumb-badge fail" title="Upgrade failed; this is the sub-stream thumbnail">!</span>
         {% endif %}
       {% else %}
         <div class="thumb-placeholder">no thumb</div>
