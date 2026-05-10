@@ -38,6 +38,23 @@ STATIC_DIR = HERE / "static"
 
 # ---------- helpers ----------
 
+def _rotate_if_oversized(path: Path, max_bytes: int = 10 * 1024 * 1024, backups: int = 5) -> None:
+    """Size-based rotation: path -> path.1 -> path.2 -> ... -> path.{backups} when path exceeds max_bytes.
+    Best-effort; never raises so writes are not blocked."""
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+        for i in range(backups, 0, -1):
+            src = path if i == 1 else path.parent / f"{path.name}.{i-1}"
+            dst = path.parent / f"{path.name}.{i}"
+            if src.exists():
+                if dst.exists():
+                    dst.unlink()
+                src.rename(dst)
+    except Exception:
+        log.exception("log rotation failed for %s", path)
+
+
 def computed_mph(p: Pass, dist_n: float, dist_s: float) -> float | None:  # noqa: ARG001
     """Read the canonical speed from the DB. Returns None when the
     homography pipeline couldn't compute a reliable speed (e.g., the
@@ -225,6 +242,7 @@ def make_app(
         }
         try:
             access_log_path.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_if_oversized(access_log_path)
             with access_log_path.open("a") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception:
