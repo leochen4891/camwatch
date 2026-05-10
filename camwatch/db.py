@@ -222,9 +222,10 @@ class Database:
             )
             return cur.rowcount
 
-    def purge_older_than(self, days: int) -> tuple[int, list[str]]:
-        """Hard-delete passes older than `days` and return (count, removed_clip_paths)
-        so the caller can also clean up the clip + thumb files on disk."""
+    def purge_older_than(self, days: int) -> tuple[int, list[tuple[int, str | None]]]:
+        """Hard-delete passes older than `days` and return (count, [(id, clip_path), ...])
+        so the caller can also clean up the clip + thumb + per-pass log files on disk.
+        clip_path may be None for rows without a recorded clip."""
         if days <= 0:
             return 0, []
         from datetime import datetime, timedelta, timezone
@@ -237,14 +238,14 @@ class Database:
                 (cutoff,),
             ))
             ids = [r["id"] for r in rows]
-            clip_paths = [r["clip_path"] for r in rows if r["clip_path"]]
+            items: list[tuple[int, str | None]] = [(r["id"], r["clip_path"]) for r in rows]
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
                     f"DELETE FROM passes WHERE id IN ({placeholders})",
                     ids,
                 )
-            return len(ids), clip_paths
+            return len(ids), items
 
     # ---------- reads ----------
 

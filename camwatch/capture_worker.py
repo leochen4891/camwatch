@@ -581,13 +581,20 @@ class CaptureWorker(threading.Thread):
                     last_purge = time.monotonic()
                     days = int(self._cfg.retention_days or 0)
                     if days > 0:
-                        n, clips = self._db.purge_older_than(days)
-                        for cp in clips:
-                            try:
-                                Path(cp).unlink(missing_ok=True)
-                                Path(cp[:-4] + ".jpg").unlink(missing_ok=True)
-                            except Exception as e:  # noqa: BLE001
-                                log.debug("retention: %s: %s", cp, e)
+                        n, items = self._db.purge_older_than(days)
+                        events_dir = self._cfg.events_dir
+                        for pid, cp in items:
+                            paths_to_unlink: list[str] = []
+                            if cp:
+                                paths_to_unlink.append(cp)
+                                paths_to_unlink.append(cp[:-4] + ".jpg")
+                                paths_to_unlink.append(cp[:-4] + "_big.jpg")
+                            paths_to_unlink.append(str(events_dir / f"pass_{pid}.jsonl"))
+                            for path in paths_to_unlink:
+                                try:
+                                    Path(path).unlink(missing_ok=True)
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("retention: %s: %s", path, e)
                         if n:
                             log.info("retention: purged %d passes older than %d days", n, days)
 

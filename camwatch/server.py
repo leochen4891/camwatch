@@ -447,13 +447,19 @@ def make_app(
             preview.set_show_grid(bool(preview_show_grid))
         # Trigger an immediate retention sweep if enabled
         if cfg.retention_days > 0:
-            n, clips = db.purge_older_than(cfg.retention_days)
-            for cp in clips:
-                try:
-                    Path(cp).unlink(missing_ok=True)
-                    Path(cp[:-4] + ".jpg").unlink(missing_ok=True)
-                except Exception:
-                    pass
+            n, items = db.purge_older_than(cfg.retention_days)
+            for pid, cp in items:
+                paths_to_unlink: list[str] = []
+                if cp:
+                    paths_to_unlink.append(cp)
+                    paths_to_unlink.append(cp[:-4] + ".jpg")
+                    paths_to_unlink.append(cp[:-4] + "_big.jpg")
+                paths_to_unlink.append(str(cfg.events_dir / f"pass_{pid}.jsonl"))
+                for path in paths_to_unlink:
+                    try:
+                        Path(path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
             if n:
                 log.info("retention: purged %d passes on settings save", n)
         return _render_status_panel(request, cfg, db)
