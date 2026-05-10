@@ -33,6 +33,21 @@ from .homography import Homography
 log = logging.getLogger(__name__)
 
 
+def _bbox_iou(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = a_area + b_area - inter
+    return inter / union if union > 0 else 0.0
+
+
 @dataclass
 class _GridState:
     cls_name: str = ""
@@ -78,6 +93,8 @@ class GridCrossingDetector:
         min_dy_m: float = 3.0,
         min_elapsed_s: float = 0.2,
         dedupe_window_s: float = 0.5,
+        iou_dedupe_window_s: float = 2.0,
+        iou_dedupe_threshold: float = 0.3,
     ) -> None:
         self._homog = homography
         self._x_min = grid_x_min - tolerance_m
@@ -88,8 +105,13 @@ class GridCrossingDetector:
         self._min_dy = float(min_dy_m)
         self._min_elapsed = float(min_elapsed_s)
         self._dedupe_window = float(dedupe_window_s)
+        self._iou_window = float(iou_dedupe_window_s)
+        self._iou_threshold = float(iou_dedupe_threshold)
         self._state: dict[int, _GridState] = {}
         self._last_event_t: dict[str, float] = {"N": -1e9, "S": -1e9}
+        self._last_event_bbox: dict[str, tuple[float, float, float, float] | None] = {
+            "N": None, "S": None,
+        }
 
     def _in_grid(self, X: float, Y: float) -> bool:
         return self._x_min <= X <= self._x_max and self._y_min <= Y <= self._y_max
@@ -219,15 +241,42 @@ class GridCrossingDetector:
         )
 
     def _accept(self, ev: CrossingEvent) -> bool:
-        """Apply per-direction dedup window to drop split-bbox duplicates
-        that BotSORT occasionally generates for the same vehicle."""
+        """Drop duplicate events for the same physical vehicle.
+
+        Two layers, both per-direction:
+          1. Short time-only window catches BotSORT split-bbox flicker
+             (sub-second gap, any spatial relationship).
+          2. Wider IoU window catches the case where one physical vehicle
+             carries two simultaneous track IDs (e.g., a parked van that
+             flips between YOLO classes "car" / "truck" — observed gap
+             ~0.7-1.5 s between the two age-outs because each track loses
+             its last detection at slightly different frames). The
+             previously fired event's last bbox should overlap with the
+             new event's last bbox if they are the same object.
+        """
         event_t = max(ev.t_a, ev.t_b)
-        gap = event_t - self._last_event_t[ev.direction]
+        last_t = self._last_event_t[ev.direction]
+        gap = event_t - last_t
         if gap < self._dedupe_window:
             log.info(
                 "track %d %s grid-pass dropped (%.3fs after previous %s pass)",
                 ev.track_id, ev.direction, gap, ev.direction,
             )
             return False
+        last_bbox = self._last_event_bbox[ev.direction]
+        if (
+            gap < self._iou_window
+            and ev.bbox is not None
+            and last_bbox is not None
+        ):
+            iou = _bbox_iou(ev.bbox, last_bbox)
+            if iou > self._iou_threshold:
+                log.info(
+                    "track %d %s grid-pass dropped (IoU=%.2f vs previous %s "
+                    "pass %.3fs ago — same physical vehicle, dual-tracked)",
+                    ev.track_id, ev.direction, iou, ev.direction, gap,
+                )
+                return False
         self._last_event_t[ev.direction] = event_t
+        self._last_event_bbox[ev.direction] = ev.bbox
         return True

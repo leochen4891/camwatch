@@ -148,7 +148,20 @@ class RtspStream:
     def frames(self) -> Iterator[Frame]:
         seq = 0
         while not self._stop:
-            self._open()
+            try:
+                self._open()
+            except av.error.FFmpegError as e:
+                # Most commonly ConnectionRefusedError when the camera is
+                # rebooting (Reolink runs a nightly maintenance reboot
+                # ~02:00). Without this, the exception propagates up
+                # through capture_worker.run() and kills the worker for
+                # the rest of the day. Sleep and retry the open instead.
+                log.warning(
+                    "stream %s: open failed, retrying in %.1fs (%s)",
+                    self._log_label, self._reconnect_delay_s, e,
+                )
+                time.sleep(self._reconnect_delay_s)
+                continue
             container = self._container
             assert container is not None
             vstream = container.streams.video[0]

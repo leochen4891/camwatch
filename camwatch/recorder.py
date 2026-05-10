@@ -71,7 +71,7 @@ class ClipRecorder:
         pre_seconds_before_a: float = 1.0,
         post_seconds_after_b: float = 1.0,
         max_clip_seconds: float = 5.0,
-        ring_seconds: float = 7.0,
+        ring_seconds: float = 12.0,
         max_width: int = 2560,
     ) -> None:
         self._dir = Path(recordings_dir)
@@ -83,18 +83,30 @@ class ClipRecorder:
         self._max_width = max_width
         self._size: tuple[int, int] | None = None
         self._scale: float = 1.0
-        # Ring buffer must hold enough frames that, at trigger time, we can
-        # still find a frame at (t_a - pre_seconds_before_a). Worst case is a
-        # slow car (long elapsed) plus the pre-roll window. Default 7s gives
-        # comfortable headroom over a 5s clip cap with 5s max track age.
-        self._pre_n = max(1, int(ring_seconds * fps))
-        self._ring: collections.deque[_FrameRec] = collections.deque(maxlen=self._pre_n)
+        # Ring buffer is sized in REAL TIME (PTS seconds), not in frame count.
+        # The previous frame-count sizing (int(ring_seconds * fps)) used the
+        # playback fps, not the actual capture fps, so a 7 s × 10 fps = 70-frame
+        # ring only held ~4.7 s at the actual 15 fps capture rate. That was
+        # smaller than the worst-case trigger latency: when GridCrossingDetector
+        # ages a track out, the trigger fires up to max_track_age_s after the
+        # car left the grid, so by then the in-grid frames had been evicted
+        # and the resulting clip was a fraction of a second of stale frames.
+        # ring_seconds default 12 s comfortably covers max_clip cap (5 s) +
+        # max_track_age_s (5 s) + pre_a (~0.5 s) + slack.
+        self._ring_seconds = float(ring_seconds)
+        self._ring: collections.deque[_FrameRec] = collections.deque()
         self._active: list[_ActiveClip] = []
 
     def push(self, frame: np.ndarray, ts: float, detections: list[Any]) -> None:
         small = self._scale_frame(frame)
         rec = _FrameRec(image=small, ts=ts, detections=list(detections))
         self._ring.append(rec)
+        # Time-based eviction: drop frames older than ring_seconds before the
+        # newest pushed frame. This is robust to varying capture fps (a frame-
+        # count-based deque was the bug behind the truncated-clip regression).
+        cutoff = ts - self._ring_seconds
+        while self._ring and self._ring[0].ts < cutoff:
+            self._ring.popleft()
 
         completed: list[_ActiveClip] = []
         for clip in self._active:
