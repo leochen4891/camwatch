@@ -759,14 +759,15 @@ def _heat_class(count: int, max_count: int) -> int:
     return min(5, max(1, int(ratio * 5 + 0.999)))
 
 
-def _heat_class_speed(avg: float | None, min_avg: float, max_avg: float) -> int:
-    """Linear bucketing for avg-speed mode. Spreads observed range over 5 buckets
-    so the slowest non-empty cell is heat-1 and the fastest is heat-5."""
-    if avg is None or avg <= 0 or max_avg <= 0:
+def _heat_class_speed(value: float | None, min_v: float, max_v: float) -> int:
+    """Linear bucketing for speed mode (top mph per slot). Spreads observed
+    range over 5 buckets so the slowest non-empty cell is heat-1 and the
+    fastest is heat-5."""
+    if value is None or value <= 0 or max_v <= 0:
         return 0
-    if max_avg <= min_avg:
+    if max_v <= min_v:
         return 3
-    ratio = (avg - min_avg) / (max_avg - min_avg)
+    ratio = (value - min_v) / (max_v - min_v)
     return min(5, max(1, int(ratio * 5 + 0.999)))
 
 
@@ -801,7 +802,9 @@ def _build_heatmap(
     valid_avgs = [a for a in avg_mph if a is not None]
     min_avg = min(valid_avgs) if valid_avgs else 0.0
     max_avg = max(valid_avgs) if valid_avgs else 0.0
-    max_top = max((t for t in top_mph if t is not None), default=0.0)
+    valid_tops = [t for t in top_mph if t is not None]
+    min_top = min(valid_tops) if valid_tops else 0.0
+    max_top = max(valid_tops) if valid_tops else 0.0
 
     is_selected = (lambda i: True) if selected is None else (lambda i: i in selected)
 
@@ -842,7 +845,7 @@ def _build_heatmap(
                 "avg_mph": avg_mph[i],
                 "top_mph": top_mph[i],
                 "heat_count": _heat_class(counts[i], max_count),
-                "heat_speed": _heat_class_speed(avg_mph[i], min_avg, max_avg),
+                "heat_speed": _heat_class_speed(top_mph[i], min_top, max_top),
                 "selected": is_selected(i),
                 "time_label": slot_time_label(slot),
                 "time_range": slot_time_range(slot),
