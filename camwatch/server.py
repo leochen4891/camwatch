@@ -482,14 +482,18 @@ def make_app(
                 base = cp[:-4]
                 thumb_small = base + ".jpg"
                 thumb_big = base + "_big.jpg"
-                jsonl_src = str(cfg.events_dir / f"pass_{pid}.jsonl")
                 if speed is not None and speed >= threshold_mph:
-                    for src in (cp, thumb_small, thumb_big, jsonl_src):
+                    # Alarm: archive thumbnails only; delete the .mp4.
+                    for src in (thumb_small, thumb_big):
                         if Path(src).exists():
                             try:
                                 shutil.move(src, archive_dir / Path(src).name)
                             except Exception:
                                 pass
+                    try:
+                        Path(cp).unlink(missing_ok=True)
+                    except Exception:
+                        pass
                     archived += 1
                 else:
                     for path in (cp, thumb_small, thumb_big):

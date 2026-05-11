@@ -597,15 +597,19 @@ class CaptureWorker(threading.Thread):
                             base = cp[:-4]
                             thumb_small = base + ".jpg"
                             thumb_big = base + "_big.jpg"
-                            jsonl_src = str(events_dir / f"pass_{pid}.jsonl")
                             if speed is not None and speed >= threshold_mph:
-                                # Alarm pass: rescue everything to archive
-                                for src in (cp, thumb_small, thumb_big, jsonl_src):
+                                # Alarm pass: rescue thumbnails only; delete the .mp4.
+                                # Per-pass jsonl follows the standard passes-sweep flow.
+                                for src in (thumb_small, thumb_big):
                                     if Path(src).exists():
                                         try:
                                             shutil.move(src, archive_dir / Path(src).name)
                                         except Exception as e:  # noqa: BLE001
                                             log.debug("archive move %s: %s", src, e)
+                                try:
+                                    Path(cp).unlink(missing_ok=True)
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("recordings cleanup (alarm clip): %s: %s", cp, e)
                                 archived += 1
                             else:
                                 # Non-alarm: delete clip + thumbs (jsonl stays for passes-sweep)
