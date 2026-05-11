@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import threading
 import time
 from collections import deque
@@ -586,17 +587,39 @@ class CaptureWorker(threading.Thread):
                     days_recordings = int(self._cfg.recordings_days or 0)
                     if days_recordings > 0:
                         rec_items = self._db.purge_recordings_older_than(days_recordings)
-                        for _, cp in rec_items:
-                            base = cp[:-4]
-                            for path in (cp, base + ".jpg", base + "_big.jpg"):
-                                try:
-                                    Path(path).unlink(missing_ok=True)
-                                except Exception as e:  # noqa: BLE001
-                                    log.debug("recordings cleanup: %s: %s", path, e)
+                        threshold_mph = float(self._cfg.alert_threshold_mph)
+                        archive_dir = Path("recordings_archive")
                         if rec_items:
+                            archive_dir.mkdir(parents=True, exist_ok=True)
+                        archived = 0
+                        deleted = 0
+                        for pid, cp, speed in rec_items:
+                            base = cp[:-4]
+                            thumb_small = base + ".jpg"
+                            thumb_big = base + "_big.jpg"
+                            jsonl_src = str(events_dir / f"pass_{pid}.jsonl")
+                            if speed is not None and speed >= threshold_mph:
+                                # Alarm pass: rescue everything to archive
+                                for src in (cp, thumb_small, thumb_big, jsonl_src):
+                                    if Path(src).exists():
+                                        try:
+                                            shutil.move(src, archive_dir / Path(src).name)
+                                        except Exception as e:  # noqa: BLE001
+                                            log.debug("archive move %s: %s", src, e)
+                                archived += 1
+                            else:
+                                # Non-alarm: delete clip + thumbs (jsonl stays for passes-sweep)
+                                for path in (cp, thumb_small, thumb_big):
+                                    try:
+                                        Path(path).unlink(missing_ok=True)
+                                    except Exception as e:  # noqa: BLE001
+                                        log.debug("recordings cleanup: %s: %s", path, e)
+                                deleted += 1
+                        if archived or deleted:
                             log.info(
-                                "retention: deleted recordings for %d passes older than %d days",
-                                len(rec_items), days_recordings,
+                                "retention: %d alarm passes archived, %d non-alarm cleaned "
+                                "(recordings_days=%d, threshold=%.1f mph)",
+                                archived, deleted, days_recordings, threshold_mph,
                             )
 
                     days_passes = int(self._cfg.passes_days or 0)

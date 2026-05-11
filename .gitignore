@@ -23,6 +23,7 @@ config/visual_grid_verify.jpg
 
 events/
 recordings/
+recordings_archive/
 models/
 *.pt
 

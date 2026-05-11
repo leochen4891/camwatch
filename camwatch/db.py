@@ -222,11 +222,13 @@ class Database:
             )
             return cur.rowcount
 
-    def purge_recordings_older_than(self, days: int) -> list[tuple[int, str]]:
+    def purge_recordings_older_than(
+        self, days: int
+    ) -> list[tuple[int, str, float | None]]:
         """Drop only the clip + thumbnail files for passes older than `days`.
         NULLs `clip_path` in the row so the pass survives as a stats record;
-        returns [(id, original_clip_path), ...] for the caller to unlink the
-        .mp4 / .jpg / _big.jpg from disk."""
+        returns [(id, original_clip_path, speed_mph), ...]. The caller uses
+        speed_mph to decide whether to archive (alarm passes) or hard-delete."""
         if days <= 0:
             return []
         from datetime import datetime, timedelta, timezone
@@ -235,15 +237,17 @@ class Database:
         ).isoformat(timespec="seconds")
         with self.connect() as conn:
             rows = list(conn.execute(
-                "SELECT id, clip_path FROM passes WHERE captured_at < ? AND clip_path IS NOT NULL",
+                "SELECT id, clip_path, speed_mph FROM passes WHERE captured_at < ? AND clip_path IS NOT NULL",
                 (cutoff,),
             ))
-            items: list[tuple[int, str]] = [(r["id"], r["clip_path"]) for r in rows]
+            items: list[tuple[int, str, float | None]] = [
+                (r["id"], r["clip_path"], r["speed_mph"]) for r in rows
+            ]
             if items:
                 placeholders = ",".join("?" * len(items))
                 conn.execute(
                     f"UPDATE passes SET clip_path = NULL WHERE id IN ({placeholders})",
-                    [i for i, _ in items],
+                    [i for i, _, _ in items],
                 )
             return items
 

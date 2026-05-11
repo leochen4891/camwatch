@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -471,17 +472,36 @@ def make_app(
         # Trigger immediate sweeps for both retention phases
         if cfg.recordings_days > 0:
             rec_items = db.purge_recordings_older_than(cfg.recordings_days)
-            for _, cp in rec_items:
-                base = cp[:-4]
-                for path in (cp, base + ".jpg", base + "_big.jpg"):
-                    try:
-                        Path(path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            threshold_mph = float(cfg.alert_threshold_mph)
+            archive_dir = Path("recordings_archive")
             if rec_items:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+            archived = 0
+            deleted = 0
+            for pid, cp, speed in rec_items:
+                base = cp[:-4]
+                thumb_small = base + ".jpg"
+                thumb_big = base + "_big.jpg"
+                jsonl_src = str(cfg.events_dir / f"pass_{pid}.jsonl")
+                if speed is not None and speed >= threshold_mph:
+                    for src in (cp, thumb_small, thumb_big, jsonl_src):
+                        if Path(src).exists():
+                            try:
+                                shutil.move(src, archive_dir / Path(src).name)
+                            except Exception:
+                                pass
+                    archived += 1
+                else:
+                    for path in (cp, thumb_small, thumb_big):
+                        try:
+                            Path(path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    deleted += 1
+            if archived or deleted:
                 log.info(
-                    "retention: deleted recordings for %d passes on settings save",
-                    len(rec_items),
+                    "retention: %d alarm passes archived, %d non-alarm cleaned on settings save",
+                    archived, deleted,
                 )
         if cfg.passes_days > 0:
             n, items = db.purge_older_than(cfg.passes_days)
