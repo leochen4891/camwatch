@@ -87,11 +87,19 @@
 
       <section class="settings-section">
         <h3>Storage retention</h3>
-        <p class="muted-text">Auto-delete passes (and their clips) older than this many days. <code>0</code> disables auto-deletion.</p>
+        <p class="muted-text">Two phases. <code>0</code> on either knob disables that phase.</p>
         <div class="setting-row">
-          <input type="number" name="retention_days" value="{{ retention_days }}" step="1" min="0" max="365">
+          <label>Recordings (clips + thumbnails)</label>
+          <input type="number" name="recordings_days" value="{{ recordings_days }}" step="1" min="0" max="3650">
           <span>days</span>
         </div>
+        <p class="muted-text">After this many days, <code>.mp4</code> and thumbnails are deleted from disk. The pass row stays (without playback) so stats remain intact.</p>
+        <div class="setting-row">
+          <label>Pass records (DB row + detection logs)</label>
+          <input type="number" name="passes_days" value="{{ passes_days }}" step="1" min="0" max="3650">
+          <span>days</span>
+        </div>
+        <p class="muted-text">After this many days, the pass row and its <code>events/pass_*.jsonl</code> are hard-deleted. Set higher than recordings if you want long-term stats.</p>
       </section>
 
       <div class="settings-footer">

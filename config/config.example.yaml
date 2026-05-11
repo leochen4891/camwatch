@@ -27,7 +27,11 @@ speed:
   max_track_age_s: 5.0     # drop tracks idle this long without crossing both lines
 
 retention:
-  days: 7                  # auto-delete passes (and clips/thumbs) older than this. 0 disables.
+  recordings_days: 7       # delete clips + thumbnails (.mp4, .jpg, _big.jpg) older than this. 0 disables.
+                           # Pass row survives (clip_path = NULL), so DB stats remain intact.
+  passes_days: 365         # hard-delete DB row + events/pass_*.jsonl older than this. 0 disables.
+                           # Set higher than recordings_days for long-term statistical retention.
+                           # (Backward compat: a legacy `days:` key is read as `recordings_days`.)
 
 clip:
   margin_s: 0.5            # seconds of pre-roll before the first crossing and post-roll after the last

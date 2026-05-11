@@ -424,7 +424,8 @@ def make_app(
     async def save_settings(
         request: Request,
         threshold_mph: float = Form(...),
-        retention_days: int = Form(default=0),
+        recordings_days: int = Form(default=0),
+        passes_days: int = Form(default=0),
         clip_margin_s: float = Form(default=0.5),
         clip_capture_min_mph: float = Form(default=0.0),
         clip_capture_max_mph: float = Form(default=999.0),
@@ -439,7 +440,10 @@ def make_app(
         with cfg_path.open() as f:
             data = yaml.safe_load(f) or {}
         data.setdefault("alert", {})["threshold_mph"] = float(threshold_mph)
-        data.setdefault("retention", {})["days"] = max(0, int(retention_days))
+        retention_section = data.setdefault("retention", {})
+        retention_section["recordings_days"] = max(0, int(recordings_days))
+        retention_section["passes_days"] = max(0, int(passes_days))
+        retention_section.pop("days", None)  # drop legacy single-knob key
         clip_section = data.setdefault("clip", {})
         clip_section["margin_s"] = margin
         clip_section["capture_min_mph"] = cap_min
@@ -449,7 +453,8 @@ def make_app(
         with cfg_path.open("w") as f:
             yaml.safe_dump(data, f, sort_keys=False)
         cfg.alert_threshold_mph = float(threshold_mph)
-        cfg.retention_days = max(0, int(retention_days))
+        cfg.recordings_days = max(0, int(recordings_days))
+        cfg.passes_days = max(0, int(passes_days))
         cfg.clip_margin_s = margin
         cfg.clip_capture_min_mph = cap_min
         cfg.clip_capture_max_mph = cap_max
@@ -463,9 +468,23 @@ def make_app(
         preview = getattr(request.app.state, "preview", None)
         if preview is not None:
             preview.set_show_grid(bool(preview_show_grid))
-        # Trigger an immediate retention sweep if enabled
-        if cfg.retention_days > 0:
-            n, items = db.purge_older_than(cfg.retention_days)
+        # Trigger immediate sweeps for both retention phases
+        if cfg.recordings_days > 0:
+            rec_items = db.purge_recordings_older_than(cfg.recordings_days)
+            for _, cp in rec_items:
+                base = cp[:-4]
+                for path in (cp, base + ".jpg", base + "_big.jpg"):
+                    try:
+                        Path(path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            if rec_items:
+                log.info(
+                    "retention: deleted recordings for %d passes on settings save",
+                    len(rec_items),
+                )
+        if cfg.passes_days > 0:
+            n, items = db.purge_older_than(cfg.passes_days)
             for pid, cp in items:
                 paths_to_unlink: list[str] = []
                 if cp:
@@ -913,7 +932,8 @@ def _render_index(request: Request, cfg: Config, db: Database):
             "static_v": _static_version(),
             "rows": rows,
             "threshold": threshold,
-            "retention_days": cfg.retention_days,
+            "recordings_days": cfg.recordings_days,
+            "passes_days": cfg.passes_days,
             "clip_margin_s": cfg.clip_margin_s,
             "clip_capture_min_mph": cfg.clip_capture_min_mph,
             "clip_capture_max_mph": cfg.clip_capture_max_mph,

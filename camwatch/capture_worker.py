@@ -576,13 +576,32 @@ class CaptureWorker(threading.Thread):
                 if self._stop_evt.is_set():
                     break
 
-                # Periodic retention sweep.
+                # Periodic retention sweep — two phases:
+                #   1. Recordings older than recordings_days: delete clip + thumbs, NULL clip_path
+                #   2. Pass rows older than passes_days: hard-delete row + per-pass jsonl
                 if time.monotonic() - last_purge > purge_interval_s:
                     last_purge = time.monotonic()
-                    days = int(self._cfg.retention_days or 0)
-                    if days > 0:
-                        n, items = self._db.purge_older_than(days)
-                        events_dir = self._cfg.events_dir
+                    events_dir = self._cfg.events_dir
+
+                    days_recordings = int(self._cfg.recordings_days or 0)
+                    if days_recordings > 0:
+                        rec_items = self._db.purge_recordings_older_than(days_recordings)
+                        for _, cp in rec_items:
+                            base = cp[:-4]
+                            for path in (cp, base + ".jpg", base + "_big.jpg"):
+                                try:
+                                    Path(path).unlink(missing_ok=True)
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("recordings cleanup: %s: %s", path, e)
+                        if rec_items:
+                            log.info(
+                                "retention: deleted recordings for %d passes older than %d days",
+                                len(rec_items), days_recordings,
+                            )
+
+                    days_passes = int(self._cfg.passes_days or 0)
+                    if days_passes > 0:
+                        n, items = self._db.purge_older_than(days_passes)
                         for pid, cp in items:
                             paths_to_unlink: list[str] = []
                             if cp:
@@ -596,7 +615,7 @@ class CaptureWorker(threading.Thread):
                                 except Exception as e:  # noqa: BLE001
                                     log.debug("retention: %s: %s", path, e)
                         if n:
-                            log.info("retention: purged %d passes older than %d days", n, days)
+                            log.info("retention: purged %d passes older than %d days", n, days_passes)
 
                 loop_t = time.perf_counter() if prof else 0.0
                 if prof and last_loop_t is not None:

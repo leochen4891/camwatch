@@ -76,7 +76,8 @@ class Config:
     events_dir: Path
     calibration_path: Path
     max_track_age_s: float
-    retention_days: int = 0  # 0 = no auto-delete
+    recordings_days: int = 0  # 0 = no auto-delete; controls clip/thumb deletion (sets clip_path=NULL)
+    passes_days: int = 0  # 0 = no auto-delete; controls DB row + per-pass jsonl hard-deletion
     clip_margin_s: float = 0.5  # pre/post-roll padding around the crossing window
     clip_capture_min_mph: float = 0.0  # passes below this speed are logged but skip clip
     clip_capture_max_mph: float = 999.0  # passes above this speed are logged but skip clip
@@ -144,7 +145,14 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         events_dir=Path(raw["paths"]["events_dir"]),
         calibration_path=Path(raw["paths"]["calibration"]),
         max_track_age_s=float(raw["speed"]["max_track_age_s"]),
-        retention_days=int((raw.get("retention") or {}).get("days", 0) or 0),
+        recordings_days=int(
+            (raw.get("retention") or {}).get(
+                "recordings_days",
+                (raw.get("retention") or {}).get("days", 0),
+            )
+            or 0
+        ),
+        passes_days=int((raw.get("retention") or {}).get("passes_days", 0) or 0),
         clip_margin_s=float((raw.get("clip") or {}).get("margin_s", 0.5) or 0.5),
         clip_capture_min_mph=float((raw.get("clip") or {}).get("capture_min_mph", 0.0) or 0.0),
         clip_capture_max_mph=float((raw.get("clip") or {}).get("capture_max_mph", 999.0) or 999.0),

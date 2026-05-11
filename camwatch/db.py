@@ -222,6 +222,31 @@ class Database:
             )
             return cur.rowcount
 
+    def purge_recordings_older_than(self, days: int) -> list[tuple[int, str]]:
+        """Drop only the clip + thumbnail files for passes older than `days`.
+        NULLs `clip_path` in the row so the pass survives as a stats record;
+        returns [(id, original_clip_path), ...] for the caller to unlink the
+        .mp4 / .jpg / _big.jpg from disk."""
+        if days <= 0:
+            return []
+        from datetime import datetime, timedelta, timezone
+        cutoff = (
+            datetime.now(timezone.utc).astimezone() - timedelta(days=days)
+        ).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            rows = list(conn.execute(
+                "SELECT id, clip_path FROM passes WHERE captured_at < ? AND clip_path IS NOT NULL",
+                (cutoff,),
+            ))
+            items: list[tuple[int, str]] = [(r["id"], r["clip_path"]) for r in rows]
+            if items:
+                placeholders = ",".join("?" * len(items))
+                conn.execute(
+                    f"UPDATE passes SET clip_path = NULL WHERE id IN ({placeholders})",
+                    [i for i, _ in items],
+                )
+            return items
+
     def purge_older_than(self, days: int) -> tuple[int, list[tuple[int, str | None]]]:
         """Hard-delete passes older than `days` and return (count, [(id, clip_path), ...])
         so the caller can also clean up the clip + thumb + per-pass log files on disk.
