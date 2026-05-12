@@ -12,7 +12,9 @@ camera:
   # User and pass come from .env (REOLINK_USER, REOLINK_PASS)
 
 model:
-  weights: yolo11n.pt
+  weights: yolo11l.pt        # 2048x1536 main-stream + 3060 Ti: track p50 ≈ 29ms,
+                             # ~1.7x headroom over the 20fps camera rate. Smaller
+                             # variants (n/s/m) work too; x is feasible but tight.
   device: auto             # auto → cuda > mps > cpu. Set explicitly
                            # ("cuda", "mps", "cpu", "cuda:0") to override.
   conf: 0.35             # daytime default; lower to ~0.20 if you ever run at night
