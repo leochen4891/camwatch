@@ -6,12 +6,17 @@ windows and a background thread flushes one row per (bucket, metric)
 to the `metrics` table every BUCKET_S seconds.
 
 What's recorded:
-  * fps_sub, fps_main      — frames/sec decoded by each RtspStream
+  * fps_main               — frames/sec decoded by the main-stream RtspStream
   * fps_yolo               — frames/sec consumed by the YOLO loop
+                             (≈ fps_main under healthy load; gap signals
+                             frames dropped at the reader→consumer queue)
   * yolo_ms_p50/p95        — per-frame inference latency
   * lag_ms_p50/p95         — wallclock - frame.ts for frames reaching
                              the consumer (how far behind realtime)
-  * queue_depth            — mean depth of the reader→consumer queue
+  * queue_depth_main       — mean depth of the reader→consumer FIFO
+                             (0–3 healthy; sustained higher = backlog)
+  * frame_gap_ms_max_main  — longest inter-arrival gap between decoded
+                             frames in the bucket (Reolink burst signal)
 
 All `record_*` calls are O(1) and lock only briefly. The flush thread
 runs once per bucket — ~8 inserts every 5s, totally negligible load.

@@ -358,11 +358,11 @@ def make_app(
 
     @app.get("/api/homography")
     async def get_homography():
-        """Current homography matrix + frame size + scale. Used by the
-        client to project meter grid → sub-stream pixel for the video
-        canvas overlay. Also returns the raw clicked anchor positions so
-        the client can draw the calibration grid through the actual
-        white marks rather than through the H matrix's least-squares fit
+        """Current homography matrix + frame size. Used by the client to
+        project meter grid → main-stream pixel for the video canvas
+        overlay. Also returns the raw clicked anchor positions so the
+        client can draw the calibration grid through the actual white
+        marks rather than through the H matrix's least-squares fit
         (which has small per-point residuals)."""
         path = Path("config/homography.yaml")
         if not path.exists():

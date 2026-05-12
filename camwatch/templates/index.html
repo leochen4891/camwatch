@@ -803,7 +803,7 @@
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, r.width, 160);
 
-        // X axis = bbox center u (sub-stream pixel space). The chart and
+        // X axis = bbox center u (main-stream pixel space, 2048 wide). The chart and
         // video are constrained to the same max-width (720px) so the data
         // area maps approximately 1:1 to the video frame: as the car moves
         // horizontally in the video, the chart's marker tracks horizontally.
@@ -1155,19 +1155,18 @@
     // popup doesn't dominate the panel; lead with what is measured, follow
     // with what good/bad looks like.
     const METRIC_TOOLTIPS = {
-      fps_sub: "Sub-stream (640×480) frames decoded per second from the camera. "
-             + "Reolink E1's nominal sub rate is ~12 fps. Drops here mean the "
-             + "loss is upstream of camwatch — RTSP, network, or the decoder.",
-      fps_main: "Main-stream (high-res) frames reaching the thumb-upgrader buffer. "
-              + "The buffer sub-samples at 10 Hz so this caps near 10. Sustained "
-              + "values well below that mean the main stream is choking — which "
-              + "is what causes HD thumbnail upgrades to fail.",
-      fps_yolo: "Frames the YOLO detection loop actually consumed. If this lags "
-              + "behind sub fps the consumer is dropping frames to keep up. "
-              + "Healthy on this rig is ~5–10 fps depending on traffic.",
-      yolo_ms_p50: "Median per-frame YOLO inference time. Steady-state on Apple "
-                 + "Silicon (MPS) is typically 30–50 ms. Sustained higher values "
-                 + "mean the model+resolution combo is too heavy for realtime.",
+      fps_main: "Main-stream frames decoded per second from the camera. "
+              + "Should match the camera's configured frame rate (typically "
+              + "15 fps). Drops mean the loss is upstream of camwatch — "
+              + "RTSP, network, or the decoder.",
+      fps_yolo: "Frames the YOLO detection loop actually consumed. Should "
+              + "match fps_main under healthy load; a sustained gap means "
+              + "the consumer is falling behind the camera and the bounded "
+              + "queue is dropping the overflow.",
+      yolo_ms_p50: "Median per-frame YOLO inference time. With yolo11l on "
+                 + "the 3060 Ti (CUDA) the steady-state target is ~30–40 ms; "
+                 + "on Apple Silicon (MPS) ~30–50 ms. Sustained higher means "
+                 + "the model+resolution combo is too heavy for realtime.",
       yolo_ms_p95: "95th-percentile inference time. Occasional spikes (warmup, "
                  + "thermal, GPU contention) are normal. Sustained high p95 with "
                  + "low p50 indicates jitter — the loop runs fast on average but "
@@ -1179,39 +1178,18 @@
       lag_ms_p95: "95th-percentile lag. Sustained growth across buckets is the "
                 + "clearest signal that YOLO can't keep up with the camera; "
                 + "the queue fills, frames age, lag climbs.",
-      queue_depth_sub: "Frames waiting in the sub-stream reader buffer at drain "
-                     + "time. With queue_size=1 this is always 0 or 1; values "
-                     + "near 1 mean the consumer is right at the camera's frame "
-                     + "interval with no slack.",
-      queue_depth_main: "Frames waiting in the main-stream reader buffer "
-                      + "(size 200). ffmpeg delivers main-stream frames in "
-                      + "post-keyframe bursts so brief spikes are normal. "
-                      + "Sustained high depth = the upgrader can't drain fast "
-                      + "enough — the failure mode behind HD upgrade misses. "
-                      + "(Caveat: this only sees frames in our deque; ffmpeg's "
-                      + "internal buffer is invisible — watch buffer lag below "
-                      + "for the more honest signal.)",
-      buffer_lag_ms_p50: "Median wallclock-vs-PTS lag of the most recently "
-                       + "indexed frame in the high-res TimestampedFrameBuffer. "
-                       + "When main is bursty this oscillates as a sawtooth: "
-                       + "lag accumulates between bursts and drops on each "
-                       + "burst's arrival. Sustained climb without drops = main "
-                       + "stream has stalled; HD thumbnail upgrades will start "
-                       + "failing because the upgrader can't OCR enough frames "
-                       + "to recalibrate the cross-stream offset.",
-      buffer_lag_ms_p95: "95th-percentile of buffer lag samples in the bucket. "
-                       + "Captures the worst case during bursts; useful for "
-                       + "spotting stalls that don't quite move the median.",
-      frame_gap_ms_max_sub: "Longest wallclock interval between two consecutive "
-                          + "sub-stream frames in the bucket. Healthy sub at "
-                          + "~12 fps shows ~80–150 ms; sustained spikes mean the "
-                          + "RTSP/decoder pipeline is stalling.",
+      queue_depth_main: "Frames waiting in the reader→consumer FIFO at drain "
+                      + "time. The queue is sized at 150 frames (~10s @ 15fps) "
+                      + "to absorb Reolink's burst-then-gap delivery without "
+                      + "dropping. Healthy steady state is 0–4. Sustained values "
+                      + "near 75 trigger a backlog warning — that's the consumer "
+                      + "falling behind real-time and worth investigating.",
       frame_gap_ms_max_main: "Longest wallclock interval between two consecutive "
-                           + "main-stream frames in the bucket. This is the "
-                           + "burstiness signal: a healthy main shows ~150–300 "
-                           + "ms; when ffmpeg's buffer fills and dumps in bursts "
-                           + "you'll see multi-second spikes (5–30 s gaps are "
-                           + "the smoking gun for HD upgrade failures).",
+                           + "decoded frames in the bucket. Reolink delivers "
+                           + "main-stream frames in post-keyframe bursts so "
+                           + "occasional 500–1500 ms gaps between bursts are "
+                           + "normal; multi-second spikes mean the camera or "
+                           + "network is stalling.",
     };
     // Series → (label, color, axis, dasharray). Axis 'left' is the
     // primary y; 'right' is the secondary y, used for latency on the

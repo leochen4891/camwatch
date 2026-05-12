@@ -99,12 +99,19 @@ def overlay_grid_from_homography(img: np.ndarray) -> np.ndarray:
 
 def grab_mainstream_frame(url: str) -> np.ndarray:
     """Open RTSP main stream, decode the first keyframe, return BGR."""
+    import sys
     import av
     import av.codec.hwaccel as hw
 
     print("Opening main stream … (waiting for keyframe — Reolink main GOPs "
           "can be 5–10 s, so this may take a moment)")
-    hwa = hw.HWAccel(device_type="videotoolbox", allow_software_fallback=True)
+    # Platform-conditional hwaccel: matches camwatch/capture.py.
+    if sys.platform == "darwin":
+        hwa = hw.HWAccel(device_type="videotoolbox", allow_software_fallback=True)
+    elif sys.platform.startswith("linux"):
+        hwa = hw.HWAccel(device_type="cuda", allow_software_fallback=True)
+    else:
+        hwa = None
     opts = {"rtsp_transport": "tcp"}
     container = av.open(url, options=opts, hwaccel=hwa, timeout=(15.0, 15.0))
     try:

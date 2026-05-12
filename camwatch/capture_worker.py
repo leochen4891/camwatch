@@ -69,11 +69,11 @@ _GRID_TOLERANCE_M = 0.5
 # Stationary-track gate. A track whose projected ground point has stayed
 # inside a tight box for at least N consecutive samples is treated as
 # parked: any crossing event it produces is suppressed (no pass row, no
-# clip, no thumbnail). Even a 5 mph driver covers >2 m across 30 sub-stream
-# frames (~3 s), well beyond the 0.5 m spread, so legitimate passes never
-# trip this gate. Without it, bbox jitter on a parked curb car can
-# occasionally satisfy the 2-line crossing condition and produce a phantom
-# pass at unrealistically slow speeds.
+# clip, no thumbnail). Even a 5 mph driver covers >2 m across 30 frames
+# (~2 s at the current 15 fps capture rate), well beyond the 0.5 m spread,
+# so legitimate passes never trip this gate. Without it, bbox jitter on a
+# parked curb car can occasionally satisfy the 2-line crossing condition
+# and produce a phantom pass at unrealistically slow speeds.
 _STATIONARY_WINDOW_FRAMES = 30
 _STATIONARY_SPREAD_M = 0.5
 

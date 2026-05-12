@@ -43,11 +43,11 @@ cp config/config.example.yaml config/config.yaml
 uv run python scripts/test_stream.py      # smoke test: ~10-25 fps to /tmp/
 ```
 
-Prerequisites: macOS Apple Silicon (uses MPS for inference), Reolink camera with RTSP enabled, `brew install uv ffmpeg`.
+Prerequisites: Reolink camera with RTSP enabled, Python 3.12, and a GPU for inference — currently tested on Linux + NVIDIA (CUDA, 3060 Ti) and on macOS Apple Silicon (MPS). `device: auto` picks the right backend at startup.
 
 ## Calibration
 
-The runtime needs one artifact: `config/homography.yaml` — a 3×3 matrix mapping sub-stream pixels to road-plane meters. Producing it is a physical step plus a one-shot script run.
+The runtime needs one artifact: `config/homography.yaml` — a 3×3 matrix mapping main-stream pixel coordinates (2048×1536) to road-plane meters. Producing it is a physical step plus a one-shot script run.
 
 ![13 painted asphalt anchors (1-11 along the east curb at 5-foot spacings, 12-13 at the west curb corners) with the homography grid projected over them.](docs/images/camwatch-calibration-dots.png)
 
@@ -57,9 +57,11 @@ The runtime needs one artifact: `config/homography.yaml` — a 3×3 matrix mappi
 
 3. **Click each dot in order**:
    ```sh
-   uv run python scripts/mark_rectangle.py path/to/frame.jpg
+   uv run python scripts/mark_points.py --frame path/to/frame.jpg --with-grid
    ```
-   Writes `config/marked_points.yaml`.
+   Writes `config/marked_points.yaml`. The `--with-grid` flag overlays the
+   current homography's 5 ft lines so you can see drift before re-clicking;
+   omit it on a fresh setup.
 
 4. **Build the homography**:
    ```sh
@@ -125,7 +127,7 @@ Three things make the speed measurement work:
 
 ```yaml
 camera:        { host, port, path, static_frame_path? }   # path = main stream
-model:         { weights: yolo11n.pt, device: auto, conf: 0.35 }
+model:         { weights: yolo11l.pt, device: auto, conf: 0.35 }
 alert:         { threshold_mph: 40 }
 speed:         { max_track_age_s: 5.0 }
 retention:     { days: 7 }
@@ -147,9 +149,8 @@ camwatch/                 # runtime source (modules above)
 config/                   # config.yaml, calibration.yaml (gitignored);
                           # marked_points.yaml + homography.yaml (tracked)
 scripts/                  # mark_rectangle.py, build_homography_from_marks.py,
-                          # verify_homography.py, test_stream.py, OSD-template
-                          # collectors, timing diagnostics
-templates/                # OSD digit reference images for the thumb upgrader
+                          # render_homography_overlay.py, test_stream.py,
+                          # timing diagnostics
 docs/images/              # README screenshots
 ```
 
@@ -161,4 +162,4 @@ Gitignored at runtime: `camwatch.db`, `events/`, `recordings/`, `models/yolo11n.
 - **Camera must not move.** Calibration is tied to the painted-anchor pixel positions. If the camera is bumped, redo the click step.
 - **Auto-paused at night.** When the camera switches to IR illumination (frames go monochrome), detection pauses. Toggle off in settings if you want to capture night data, with the understanding that headlight-only readings have much higher error.
 - **Tracker splits lower confidence.** When BotSORT briefly loses a car (occlusion, YOLO confidence dip) the same physical vehicle gets two track IDs. The tiered regression handles this and flags the pass with a `?` chip; a larger YOLO model would reduce the rate.
-- **Best-effort high-res thumbnails.** The main-stream upgrade succeeds ~70-80% of the time. The fallback sub-stream thumbnail is always present.
+- **Single main stream.** Detection, tracking, clips, and thumbnails all come from the camera's main stream. The earlier dual-stream architecture (sub-stream for detection + main-stream thumbnail upgrades) was retired during the NVIDIA migration — the GPU has enough headroom to run YOLO directly on 2048×1536.
