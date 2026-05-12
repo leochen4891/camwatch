@@ -137,6 +137,8 @@ def _in_grid(X: float, Y: float) -> bool:
     return (_GRID_X_MIN - _GRID_TOLERANCE_M <= X <= _GRID_X_MAX + _GRID_TOLERANCE_M
             and _GRID_Y_MIN - _GRID_TOLERANCE_M <= Y <= _GRID_Y_MAX + _GRID_TOLERANCE_M)
 
+from typing import TYPE_CHECKING
+
 from .capture import RtspStream
 from .config import Config
 from .db import Database
@@ -147,6 +149,9 @@ from .homography import Homography
 from .preview import PreviewBuffer
 from .recorder import ClipRecorder
 from .thumb_upgrader import ThumbUpgrader
+
+if TYPE_CHECKING:
+    from .metrics import MetricsCollector
 
 # OSD pixel rectangle on the Reolink E1 sub stream (640x480) with the OSD
 # at the bottom of the frame. Used only for the one-time per-epoch sub-
@@ -226,6 +231,7 @@ class CaptureWorker(threading.Thread):
         recordings_dir: Path = Path("recordings"),
         preview: PreviewBuffer | None = None,
         profile: bool = False,
+        metrics: "MetricsCollector | None" = None,
     ) -> None:
         super().__init__(name="capture-worker", daemon=True)
         self._cfg = cfg
@@ -233,6 +239,7 @@ class CaptureWorker(threading.Thread):
         self._recordings_dir = Path(recordings_dir)
         self._preview = preview
         self._profile = bool(profile)
+        self._metrics = metrics
         self._stop_evt = threading.Event()
         self._stream: RtspStream | None = None
         self._error: BaseException | None = None
@@ -560,10 +567,13 @@ class CaptureWorker(threading.Thread):
                 rtsp_url=thumb_url,
                 model=self._cfg.model,
                 db=self._db,
+                metrics=self._metrics,
             )
             self._upgrader.start()
 
-        self._stream = RtspStream(self._cfg.camera.rtsp_url, log_label="sub")
+        self._stream = RtspStream(
+            self._cfg.camera.rtsp_url, log_label="sub", metrics=self._metrics,
+        )
         last_purge = time.monotonic()
         purge_interval_s = 3600.0  # check retention once an hour
         prof = _StageTimer() if self._profile else None
@@ -626,6 +636,12 @@ class CaptureWorker(threading.Thread):
                                 archived, deleted, days_recordings, threshold_mph,
                             )
 
+                    # Metrics retention: hardcoded 7-day cap. ~120k rows max,
+                    # cheap to keep; surfaced through the perf panel only.
+                    purged_m = self._db.purge_metrics_older_than(7)
+                    if purged_m:
+                        log.info("retention: purged %d metric rows older than 7 days", purged_m)
+
                     days_passes = int(self._cfg.passes_days or 0)
                     if days_passes > 0:
                         n, items = self._db.purge_older_than(days_passes)
@@ -652,6 +668,14 @@ class CaptureWorker(threading.Thread):
                     prof.record("interframe_gap", loop_t - last_loop_t)
                 last_loop_t = loop_t
 
+                if self._metrics is not None:
+                    # Pipeline lag = wallclock now − the frame's PTS-anchored
+                    # ts. Both are in the monotonic time domain (PTS is
+                    # re-anchored on session start), so the difference is
+                    # how far behind realtime this frame is at the consumer.
+                    self._metrics.record_lag(time.monotonic() - fr.ts)
+                    self._metrics.record_frame("yolo")
+
                 # Sub-stream drift calibration (runs only when drift_sub is
                 # missing for the current epoch; once we observe an OSD-tick
                 # we cache the result and stop OCR'ing). OCR cost: ~10-20ms
@@ -676,10 +700,16 @@ class CaptureWorker(threading.Thread):
                     last_loop_t = loop_t
                     continue
 
-                t0 = time.perf_counter() if prof else 0.0
+                # Time YOLO unconditionally so the perf panel always has data;
+                # `prof` separately records the same value into the 30s log
+                # summary when --profile is set.
+                yolo_t0 = time.perf_counter()
                 all_tracks = det.track(fr.image)
+                yolo_dt = time.perf_counter() - yolo_t0
                 if prof:
-                    prof.record("yolo_track", time.perf_counter() - t0)
+                    prof.record("yolo_track", yolo_dt)
+                if self._metrics is not None:
+                    self._metrics.record_stage("yolo", yolo_dt)
 
                 t0 = time.perf_counter() if prof else 0.0
                 tracks = [t for t in all_tracks if _track_on_road(t, self._homog)]

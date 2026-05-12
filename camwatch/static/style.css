@@ -200,6 +200,7 @@ header {
   min-width: 0;
 }
 .app-shell-left > .preview-section,
+.app-shell-left > .metrics-section,
 .app-shell-left > .controls,
 .app-shell-left > .heatmap-section,
 .app-shell-left > .histogram-section {
@@ -259,6 +260,120 @@ header {
   height: auto;
   background: black;
   border-radius: 4px;
+}
+
+.metrics-section {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.metrics-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.metrics-header h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.metrics-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.metrics-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+.metrics-window-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.metrics-window-label select {
+  font-size: 12px;
+  padding: 2px 4px;
+}
+.metrics-status {
+  font-size: 11px;
+}
+.metrics-chart-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.metrics-chart-title {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.metrics-chart {
+  display: block;
+  width: 100%;
+  background: #14181f;
+  border-radius: 4px;
+}
+.metrics-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text);
+}
+.metrics-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  position: relative;
+}
+.metrics-legend-item.has-tip {
+  cursor: help;
+  border-bottom: 1px dotted var(--muted);
+  padding-bottom: 1px;
+}
+.metrics-legend-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 0;
+  margin-right: 2px;
+}
+.metrics-tooltip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 50;
+  width: max-content;
+  max-width: 280px;
+  padding: 8px 10px;
+  background: #14181f;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease-out;
+}
+.metrics-tooltip b {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+}
+.metrics-legend-item.has-tip:hover .metrics-tooltip {
+  opacity: 1;
+  visibility: visible;
 }
 
 .controls {

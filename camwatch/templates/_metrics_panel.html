@@ -1,0 +1,43 @@
+<div class="metrics-frame hidden" id="metrics-frame">
+  <div class="metrics-controls">
+    <label class="metrics-window-label">window
+      <select id="metrics-window">
+        <option value="5m">5 min</option>
+        <option value="1h" selected>1 hour</option>
+        <option value="6h">6 hours</option>
+        <option value="24h">24 hours</option>
+      </select>
+    </label>
+    <span class="metrics-status muted" id="metrics-status"></span>
+  </div>
+  <div class="metrics-chart-wrap">
+    <div class="metrics-chart-title">Stream FPS (frames/s)</div>
+    <canvas class="metrics-chart" id="metrics-chart-fps"></canvas>
+    <div class="metrics-chart-legend" id="metrics-legend-fps"></div>
+  </div>
+  <div class="metrics-chart-wrap">
+    <div class="metrics-chart-title">Inference latency (ms)</div>
+    <canvas class="metrics-chart" id="metrics-chart-yolo"></canvas>
+    <div class="metrics-chart-legend" id="metrics-legend-yolo"></div>
+  </div>
+  <div class="metrics-chart-wrap">
+    <div class="metrics-chart-title">Pipeline lag (ms)</div>
+    <canvas class="metrics-chart" id="metrics-chart-lag"></canvas>
+    <div class="metrics-chart-legend" id="metrics-legend-lag"></div>
+  </div>
+  <div class="metrics-chart-wrap">
+    <div class="metrics-chart-title">Queue depth (frames)</div>
+    <canvas class="metrics-chart" id="metrics-chart-queue"></canvas>
+    <div class="metrics-chart-legend" id="metrics-legend-queue"></div>
+  </div>
+  <div class="metrics-chart-wrap">
+    <div class="metrics-chart-title">Main buffer lag (ms)</div>
+    <canvas class="metrics-chart" id="metrics-chart-buffer"></canvas>
+    <div class="metrics-chart-legend" id="metrics-legend-buffer"></div>
+  </div>
+  <div class="metrics-chart-wrap">
+    <div class="metrics-chart-title">Max inter-frame gap (ms)</div>
+    <canvas class="metrics-chart" id="metrics-chart-gap"></canvas>
+    <div class="metrics-chart-legend" id="metrics-legend-gap"></div>
+  </div>
+</div>

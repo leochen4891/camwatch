@@ -122,6 +122,14 @@
         </div>
       </section>
 
+      <section class="metrics-section">
+        <div class="metrics-header">
+          <h2>Performance</h2>
+          <button type="button" class="muted-btn" id="metrics-toggle" onclick="toggleMetrics()">show</button>
+        </div>
+        {% include "_metrics_panel.html" %}
+      </section>
+
       <section class="controls">
         <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram, #heatmap">
           <label>direction
@@ -1103,6 +1111,344 @@
       let stored = null;
       try { stored = localStorage.getItem(PREVIEW_KEY); } catch {}
       setPreviewVisible(stored === "1");
+    });
+
+    // ---------- performance metrics panel ----------
+    const METRICS_KEY = "camwatch.metrics.visible";
+    const METRICS_WINDOW_KEY = "camwatch.metrics.window";
+    const METRICS_POLL_MS = 10000;
+    // Hover tooltip text per series. Keep under ~3 short sentences so the
+    // popup doesn't dominate the panel; lead with what is measured, follow
+    // with what good/bad looks like.
+    const METRIC_TOOLTIPS = {
+      fps_sub: "Sub-stream (640×480) frames decoded per second from the camera. "
+             + "Reolink E1's nominal sub rate is ~12 fps. Drops here mean the "
+             + "loss is upstream of camwatch — RTSP, network, or the decoder.",
+      fps_main: "Main-stream (high-res) frames reaching the thumb-upgrader buffer. "
+              + "The buffer sub-samples at 10 Hz so this caps near 10. Sustained "
+              + "values well below that mean the main stream is choking — which "
+              + "is what causes HD thumbnail upgrades to fail.",
+      fps_yolo: "Frames the YOLO detection loop actually consumed. If this lags "
+              + "behind sub fps the consumer is dropping frames to keep up. "
+              + "Healthy on this rig is ~5–10 fps depending on traffic.",
+      yolo_ms_p50: "Median per-frame YOLO inference time. Steady-state on Apple "
+                 + "Silicon (MPS) is typically 30–50 ms. Sustained higher values "
+                 + "mean the model+resolution combo is too heavy for realtime.",
+      yolo_ms_p95: "95th-percentile inference time. Occasional spikes (warmup, "
+                 + "thermal, GPU contention) are normal. Sustained high p95 with "
+                 + "low p50 indicates jitter — the loop runs fast on average but "
+                 + "stalls at the tail.",
+      lag_ms_p50: "Median pipeline lag (now − frame ts) at the consumer. "
+                + "Negative values are an anchoring artifact of PTS being pinned "
+                + "to monotonic at the first frame; what matters is the trend — "
+                + "growth over time means the consumer is falling behind realtime.",
+      lag_ms_p95: "95th-percentile lag. Sustained growth across buckets is the "
+                + "clearest signal that YOLO can't keep up with the camera; "
+                + "the queue fills, frames age, lag climbs.",
+      queue_depth_sub: "Frames waiting in the sub-stream reader buffer at drain "
+                     + "time. With queue_size=1 this is always 0 or 1; values "
+                     + "near 1 mean the consumer is right at the camera's frame "
+                     + "interval with no slack.",
+      queue_depth_main: "Frames waiting in the main-stream reader buffer "
+                      + "(size 200). ffmpeg delivers main-stream frames in "
+                      + "post-keyframe bursts so brief spikes are normal. "
+                      + "Sustained high depth = the upgrader can't drain fast "
+                      + "enough — the failure mode behind HD upgrade misses. "
+                      + "(Caveat: this only sees frames in our deque; ffmpeg's "
+                      + "internal buffer is invisible — watch buffer lag below "
+                      + "for the more honest signal.)",
+      buffer_lag_ms_p50: "Median wallclock-vs-PTS lag of the most recently "
+                       + "indexed frame in the high-res TimestampedFrameBuffer. "
+                       + "When main is bursty this oscillates as a sawtooth: "
+                       + "lag accumulates between bursts and drops on each "
+                       + "burst's arrival. Sustained climb without drops = main "
+                       + "stream has stalled; HD thumbnail upgrades will start "
+                       + "failing because the upgrader can't OCR enough frames "
+                       + "to recalibrate the cross-stream offset.",
+      buffer_lag_ms_p95: "95th-percentile of buffer lag samples in the bucket. "
+                       + "Captures the worst case during bursts; useful for "
+                       + "spotting stalls that don't quite move the median.",
+      frame_gap_ms_max_sub: "Longest wallclock interval between two consecutive "
+                          + "sub-stream frames in the bucket. Healthy sub at "
+                          + "~12 fps shows ~80–150 ms; sustained spikes mean the "
+                          + "RTSP/decoder pipeline is stalling.",
+      frame_gap_ms_max_main: "Longest wallclock interval between two consecutive "
+                           + "main-stream frames in the bucket. This is the "
+                           + "burstiness signal: a healthy main shows ~150–300 "
+                           + "ms; when ffmpeg's buffer fills and dumps in bursts "
+                           + "you'll see multi-second spikes (5–30 s gaps are "
+                           + "the smoking gun for HD upgrade failures).",
+    };
+    // Series → (label, color, axis, dasharray). Axis 'left' is the
+    // primary y; 'right' is the secondary y, used for latency on the
+    // YOLO chart and queue depth on the pipeline chart.
+    // Each chart holds series of ONE unit so a single y-axis tells the whole
+    // story. Color palette: blue / green / orange / red — never two shades of
+    // the same hue on the same chart.
+    const METRICS_FPS = [
+      ["fps_sub",  "sub fps",  "#4a90e2", "left", null],   // blue
+      ["fps_main", "main fps", "#7ed957", "left", null],   // green
+      ["fps_yolo", "yolo fps", "#ff8a3d", "left", null],   // orange
+    ];
+    const METRICS_YOLO = [
+      ["yolo_ms_p50", "infer p50 (ms)", "#4a90e2", "left", null],   // blue
+      ["yolo_ms_p95", "infer p95 (ms)", "#e15759", "left", null],   // red
+    ];
+    const METRICS_LAG = [
+      ["lag_ms_p50", "lag p50 (ms)", "#4a90e2", "left", null],   // blue
+      ["lag_ms_p95", "lag p95 (ms)", "#e15759", "left", null],   // red
+    ];
+    const METRICS_QUEUE = [
+      ["queue_depth_sub",  "queue depth sub",  "#7ed957", "left", null],   // green
+      ["queue_depth_main", "queue depth main", "#ff8a3d", "left", null],   // orange
+    ];
+    const METRICS_BUFFER = [
+      ["buffer_lag_ms_p50", "buffer lag p50 (ms)", "#4a90e2", "left", null],   // blue
+      ["buffer_lag_ms_p95", "buffer lag p95 (ms)", "#e15759", "left", null],   // red
+    ];
+    const METRICS_GAP = [
+      ["frame_gap_ms_max_sub",  "max gap sub (ms)",  "#4a90e2", "left", null],   // blue
+      ["frame_gap_ms_max_main", "max gap main (ms)", "#ff8a3d", "left", null],   // orange
+    ];
+    let metricsPollTimer = null;
+    let metricsLastData = null;
+
+    function setMetricsVisible(visible) {
+      const frame = document.getElementById("metrics-frame");
+      const btn = document.getElementById("metrics-toggle");
+      if (!frame || !btn) return;
+      frame.classList.toggle("hidden", !visible);
+      btn.textContent = visible ? "hide" : "show";
+      if (visible) {
+        const sel = document.getElementById("metrics-window");
+        let saved = "1h";
+        try { saved = localStorage.getItem(METRICS_WINDOW_KEY) || "1h"; } catch {}
+        if (sel) sel.value = saved;
+        fetchMetrics();
+        if (!metricsPollTimer) {
+          metricsPollTimer = setInterval(fetchMetrics, METRICS_POLL_MS);
+        }
+      } else {
+        if (metricsPollTimer) {
+          clearInterval(metricsPollTimer);
+          metricsPollTimer = null;
+        }
+      }
+    }
+
+    function toggleMetrics() {
+      const visible = document.getElementById("metrics-frame").classList.contains("hidden");
+      setMetricsVisible(visible);
+      try { localStorage.setItem(METRICS_KEY, visible ? "1" : "0"); } catch {}
+    }
+
+    async function fetchMetrics() {
+      const sel = document.getElementById("metrics-window");
+      const status = document.getElementById("metrics-status");
+      const window = sel ? sel.value : "1h";
+      try { localStorage.setItem(METRICS_WINDOW_KEY, window); } catch {}
+      try {
+        const r = await fetch(`/api/metrics?window=${window}`);
+        if (!r.ok) {
+          if (status) status.textContent = `error: HTTP ${r.status}`;
+          return;
+        }
+        metricsLastData = await r.json();
+        renderMetrics();
+        if (status) {
+          const n = metricsLastData.buckets.length;
+          status.textContent = n === 0 ? "no samples yet" : `${n} buckets · last ${window}`;
+        }
+      } catch (e) {
+        if (status) status.textContent = `error: ${e.message}`;
+      }
+    }
+
+    function renderMetrics() {
+      if (!metricsLastData) return;
+      drawMetricsChart("metrics-chart-fps",    "metrics-legend-fps",    METRICS_FPS);
+      drawMetricsChart("metrics-chart-yolo",   "metrics-legend-yolo",   METRICS_YOLO);
+      drawMetricsChart("metrics-chart-lag",    "metrics-legend-lag",    METRICS_LAG);
+      drawMetricsChart("metrics-chart-queue",  "metrics-legend-queue",  METRICS_QUEUE);
+      drawMetricsChart("metrics-chart-buffer", "metrics-legend-buffer", METRICS_BUFFER);
+      drawMetricsChart("metrics-chart-gap",    "metrics-legend-gap",    METRICS_GAP);
+    }
+
+    function drawMetricsChart(canvasId, legendId, seriesDef) {
+      const canvas = document.getElementById(canvasId);
+      const legend = document.getElementById(legendId);
+      if (!canvas || !legend || !metricsLastData) return;
+      const buckets = metricsLastData.buckets;
+      const series = metricsLastData.series;
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = canvas.parentElement.getBoundingClientRect().width;
+      const cssH = 110;
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+      canvas.style.width = cssW + "px";
+      canvas.style.height = cssH + "px";
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+
+      if (buckets.length === 0) {
+        ctx.fillStyle = "#666";
+        ctx.font = "11px system-ui";
+        ctx.fillText("waiting for samples…", 10, 20);
+        legend.innerHTML = "";
+        return;
+      }
+
+      const padL = 32, padR = 32, padT = 8, padB = 18;
+      const chW = cssW - padL - padR;
+      const chH = cssH - padT - padB;
+
+      // Compute per-axis ranges over the visible series only (skip series
+      // that have no data in this window — they shouldn't influence the
+      // axis scale).
+      const present = seriesDef.filter(([key]) => Array.isArray(series[key]));
+      function axisMax(axis) {
+        let m = 0;
+        for (const [key, , , ax] of present) {
+          if (ax !== axis) continue;
+          for (const v of series[key]) {
+            if (v != null && v > m) m = v;
+          }
+        }
+        return Math.max(m, 1);
+      }
+      const yLeftMax  = axisMax("left");
+      const yRightMax = axisMax("right");
+      const hasRight  = present.some(([, , , ax]) => ax === "right");
+
+      // Frame
+      ctx.strokeStyle = "#3a4150";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + chH); ctx.lineTo(padL + chW, padT + chH);
+      ctx.stroke();
+
+      // Y ticks (left)
+      ctx.fillStyle = "#888";
+      ctx.font = "10px system-ui";
+      const leftTicks = niceTicks(yLeftMax, 4);
+      for (const v of leftTicks) {
+        const y = padT + chH - (v / yLeftMax) * chH;
+        ctx.save();
+        ctx.setLineDash([2, 3]);
+        ctx.strokeStyle = "#2a313e";
+        ctx.beginPath();
+        ctx.moveTo(padL, y); ctx.lineTo(padL + chW, y);
+        ctx.stroke();
+        ctx.restore();
+        ctx.fillText(v.toString(), 4, y + 3);
+      }
+      // Y ticks (right)
+      if (hasRight) {
+        const rightTicks = niceTicks(yRightMax, 4);
+        ctx.fillStyle = "#888";
+        for (const v of rightTicks) {
+          const y = padT + chH - (v / yRightMax) * chH;
+          ctx.fillText(v.toString(), padL + chW + 4, y + 3);
+        }
+      }
+
+      // X-axis time labels — first, middle, last bucket
+      function shortTime(iso) {
+        // ISO like "2026-05-11T13:30:00-04:00" → "13:30"
+        const m = iso.match(/T(\d{2}):(\d{2})/);
+        return m ? `${m[1]}:${m[2]}` : "";
+      }
+      ctx.fillStyle = "#888";
+      ctx.fillText(shortTime(buckets[0]), padL, padT + chH + 12);
+      const mid = buckets[Math.floor(buckets.length / 2)];
+      const midX = padL + (Math.floor(buckets.length / 2) / Math.max(1, buckets.length - 1)) * chW;
+      ctx.fillText(shortTime(mid), midX - 14, padT + chH + 12);
+      const lastLbl = shortTime(buckets[buckets.length - 1]);
+      ctx.fillText(lastLbl, padL + chW - ctx.measureText(lastLbl).width, padT + chH + 12);
+
+      // Plot each series
+      const xStep = buckets.length > 1 ? chW / (buckets.length - 1) : 0;
+      for (const [key, label, color, axis, dash] of present) {
+        const yMax = axis === "right" ? yRightMax : yLeftMax;
+        const data = series[key];
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        if (dash) ctx.setLineDash(dash); else ctx.setLineDash([]);
+        ctx.beginPath();
+        let drawing = false;
+        for (let i = 0; i < data.length; i++) {
+          const v = data[i];
+          if (v == null) {
+            drawing = false;
+            continue;
+          }
+          const x = padL + i * xStep;
+          const y = padT + chH - (v / yMax) * chH;
+          if (!drawing) {
+            ctx.moveTo(x, y);
+            drawing = true;
+          } else {
+            ctx.lineTo(x, y);
+          }
+        }
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      // Legend
+      const parts = present.map(([key, label, color, axis, dash]) => {
+        const data = series[key];
+        let last = null;
+        for (let i = data.length - 1; i >= 0; i--) {
+          if (data[i] != null) { last = data[i]; break; }
+        }
+        const lastStr = last == null ? "—" : last.toFixed(1);
+        const dashStyle = dash ? "border-bottom: 2px dashed " + color
+                               : "border-bottom: 2px solid "  + color;
+        const tip = METRIC_TOOLTIPS[key];
+        const tipHtml = tip
+          ? `<span class="metrics-tooltip"><b>${key}</b><br>${escapeHtml(tip)}</span>`
+          : "";
+        return `<span class="metrics-legend-item${tip ? " has-tip" : ""}">`
+             + `<span class="metrics-legend-swatch" style="${dashStyle}"></span>`
+             + `${label}: <b>${lastStr}</b>${axis === "right" ? " <span class='muted'>(R)</span>" : ""}`
+             + tipHtml
+             + `</span>`;
+      });
+      legend.innerHTML = parts.join("");
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    function niceTicks(maxV, n) {
+      if (maxV <= 0) return [0];
+      const rough = maxV / n;
+      const pow = Math.pow(10, Math.floor(Math.log10(rough)));
+      const norm = rough / pow;
+      let step;
+      if (norm < 1.5) step = 1 * pow;
+      else if (norm < 3) step = 2 * pow;
+      else if (norm < 7) step = 5 * pow;
+      else step = 10 * pow;
+      const out = [];
+      for (let v = 0; v <= maxV + 1e-9; v += step) {
+        out.push(Math.round(v * 100) / 100);
+      }
+      return out;
+    }
+
+    document.getElementById("metrics-window")?.addEventListener("change", fetchMetrics);
+    window.addEventListener("resize", () => { if (metricsLastData) renderMetrics(); });
+
+    document.addEventListener("DOMContentLoaded", () => {
+      let stored = null;
+      try { stored = localStorage.getItem(METRICS_KEY); } catch {}
+      setMetricsVisible(stored === "1");
     });
   </script>
 </body>

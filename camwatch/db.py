@@ -42,6 +42,17 @@ CREATE TABLE IF NOT EXISTS passes (
 );
 CREATE INDEX IF NOT EXISTS passes_captured_at_idx ON passes(captured_at);
 CREATE INDEX IF NOT EXISTS passes_deleted_idx ON passes(deleted);
+
+CREATE TABLE IF NOT EXISTS metrics (
+    ts    TEXT NOT NULL,        -- 5s bucket start, local-aware ISO seconds
+    name  TEXT NOT NULL,        -- 'fps_sub' | 'fps_main' | 'fps_yolo'
+                                -- | 'yolo_ms_p50' | 'yolo_ms_p95'
+                                -- | 'lag_ms_p50' | 'lag_ms_p95'
+                                -- | 'queue_depth'
+    value REAL,
+    PRIMARY KEY (ts, name)
+);
+CREATE INDEX IF NOT EXISTS metrics_ts_idx ON metrics(ts);
 """
 
 
@@ -390,3 +401,48 @@ class Database:
                 "SELECT COUNT(*) FROM passes WHERE deleted = 0 AND known_mph IS NOT NULL"
             ).fetchone()
             return int(n)
+
+    # ---------- metrics (performance timeline) ----------
+
+    def insert_metric_samples(self, ts_iso: str, samples: dict[str, float]) -> None:
+        """Upsert a row per (ts_iso, name). Uses ON CONFLICT REPLACE so a
+        late re-flush for the same bucket overwrites rather than dropping."""
+        if not samples:
+            return
+        rows = [
+            (ts_iso, name, None if value is None else float(value))
+            for name, value in samples.items()
+        ]
+        with self.connect() as conn:
+            conn.executemany(
+                "INSERT INTO metrics (ts, name, value) VALUES (?, ?, ?) "
+                "ON CONFLICT(ts, name) DO UPDATE SET value=excluded.value",
+                rows,
+            )
+
+    def recent_metrics(self, since_iso: str) -> dict[str, list[tuple[str, float | None]]]:
+        """Returns {name: [(ts, value), ...]} for ts >= since_iso, ts-ascending."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT ts, name, value FROM metrics "
+                "WHERE ts >= ? ORDER BY ts ASC",
+                (since_iso,),
+            ).fetchall()
+        out: dict[str, list[tuple[str, float | None]]] = {}
+        for r in rows:
+            out.setdefault(r["name"], []).append(
+                (r["ts"], None if r["value"] is None else float(r["value"]))
+            )
+        return out
+
+    def purge_metrics_older_than(self, days: int) -> int:
+        """Hard-delete metric rows older than `days`. Returns rowcount."""
+        if days <= 0:
+            return 0
+        from datetime import datetime, timedelta, timezone
+        cutoff = (
+            datetime.now(timezone.utc).astimezone() - timedelta(days=days)
+        ).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
+            return cur.rowcount

@@ -35,11 +35,15 @@ import time
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import av
 import av.codec.hwaccel
 import av.error
 import numpy as np
+
+if TYPE_CHECKING:
+    from .metrics import MetricsCollector
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +96,7 @@ class RtspStream:
         bufsize: int | None = 1,
         log_label: str = "stream",
         queue_size: int = 1,
+        metrics: "MetricsCollector | None" = None,
     ) -> None:
         self._url = url
         self._reconnect_delay_s = reconnect_delay_s
@@ -118,6 +123,7 @@ class RtspStream:
         # compared side-by-side.
         self._frames_read = 0
         self._log_label = log_label
+        self._metrics = metrics
         # ffmpeg_options is a string in OPENCV_FFMPEG_CAPTURE_OPTIONS format
         # (e.g. "rtsp_transport;tcp|fflags;nobuffer"). None uses the
         # live-capture default (low-latency). The thumb upgrader passes
@@ -192,6 +198,12 @@ class RtspStream:
                 last_log_count = self._frames_read
                 last_log_pts: float | None = None
                 saw_keyframe = False
+                # Wallclock arrival time of the previous decoded frame, used
+                # to surface bursty delivery to the metrics collector. Stays
+                # None until the second frame so the first frame's "gap"
+                # (which would just be the keyframe-wait warmup) doesn't
+                # pollute the bucket's max.
+                last_arrival_mono: float | None = None
                 try:
                     for packet in container.demux(vstream):
                         if reader_stop.is_set() or self._stop:
@@ -218,6 +230,15 @@ class RtspStream:
                         for frame in decoded:
                             reader_failures[0] = 0
                             self._frames_read += 1
+                            if self._metrics is not None:
+                                self._metrics.record_frame(self._log_label)
+                                arrival_mono = time.monotonic()
+                                if last_arrival_mono is not None:
+                                    self._metrics.record_frame_gap(
+                                        self._log_label,
+                                        arrival_mono - last_arrival_mono,
+                                    )
+                                last_arrival_mono = arrival_mono
                             pts_s = float(frame.time) if frame.pts is not None else None
                             if pts_s is not None:
                                 # Re-anchor PTS (which is stream-relative) to
@@ -285,6 +306,8 @@ class RtspStream:
                     with buf_lock:
                         items = list(latest_buf)
                         latest_buf.clear()
+                    if self._metrics is not None:
+                        self._metrics.record_queue_depth(self._log_label, len(items))
                     if not items:
                         if not new_frame_evt.wait(timeout=2.0):
                             if not reader_thread.is_alive():
@@ -368,6 +391,7 @@ class TimestampedFrameBuffer:
         max_age_s: float = 30.0,
         sample_interval_s: float = 0.25,
         name: str = "ts-stream",
+        metrics: "MetricsCollector | None" = None,
     ) -> None:
         # Open the main stream WITHOUT live-capture's nobuffer/low_delay
         # flags. Empirically (scripts/probe_main_gaps.py), ffmpeg with
@@ -383,6 +407,7 @@ class TimestampedFrameBuffer:
             ffmpeg_options="rtsp_transport;tcp",
             bufsize=None,
             log_label="main",
+            metrics=metrics,
             # Generous queue to absorb worst-case ffmpeg post-keyframe
             # bursts. Observed: ~35s of camera-time delivered in ~5
             # wallclock seconds → 140 frames at 4fps. 200 leaves
@@ -395,6 +420,7 @@ class TimestampedFrameBuffer:
         self._max_age = float(max_age_s)
         self._sample_interval = float(sample_interval_s)
         self._name = name
+        self._metrics = metrics
         self._lock = threading.Lock()
         # Sorted-by-insertion list of (ts, epoch, frame). Sample interval is
         # uniform-ish so insertion order matches ts order; we don't bisect.
@@ -485,6 +511,13 @@ class TimestampedFrameBuffer:
                 self._latest_ts = fr.ts
                 self._latest_epoch = fr.epoch
                 self._evict_locked(now)
+            if self._metrics is not None:
+                # `now - fr.ts` here is wallclock minus the buffer's most-
+                # recently indexed frame's PTS-anchored ts. When main is
+                # bursty this oscillates: lag accumulates between bursts and
+                # drops on each burst's arrival, which the chart will show
+                # as a sawtooth.
+                self._metrics.record_buffer_lag(now - fr.ts)
             if now - last_status_log >= 10.0:
                 last_status_log = now
                 lag = now - fr.ts

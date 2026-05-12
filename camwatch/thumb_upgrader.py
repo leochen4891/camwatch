@@ -37,6 +37,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -46,6 +47,9 @@ from .config import ModelConfig
 from .db import Database
 from .detect import Detector
 from .digit_matcher import DigitMatcher
+
+if TYPE_CHECKING:
+    from .metrics import MetricsCollector
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +88,7 @@ class ThumbUpgrader:
         db: Database,
         target_w: int = 320,
         queue_size: int = 8,
+        metrics: "MetricsCollector | None" = None,
     ) -> None:
         self._rtsp_url = rtsp_url
         self._model_cfg = model
@@ -93,6 +98,7 @@ class ThumbUpgrader:
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
         self._buffer: TimestampedFrameBuffer | None = None
+        self._metrics = metrics
         self._detector: Detector | None = None  # lazy
         # cross_stream_offset = main_ts - sub_ts for the same camera-instant.
         # Computed lazily on the first job by OCR'ing a recent main frame.
@@ -129,6 +135,7 @@ class ThumbUpgrader:
             # samples per second with negligible CPU/memory cost.
             sample_interval_s=0.1,
             name="thumb-stream",
+            metrics=self._metrics,
         )
         self._buffer.start()
         self._thread = threading.Thread(target=self._run, name="thumb-upgrader", daemon=True)

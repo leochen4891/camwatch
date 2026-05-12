@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from .capture_worker import CaptureWorker
 from .config import Config, load_config
 from .db import Database, Pass
+from .metrics import BUCKET_S as METRICS_BUCKET_S, MetricsCollector
 from .preview import PreviewBuffer
 
 log = logging.getLogger(__name__)
@@ -224,12 +225,17 @@ def make_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        worker = CaptureWorker(cfg, db, preview=preview, profile=profile)
+        metrics = MetricsCollector(db)
+        metrics.start()
+        worker = CaptureWorker(
+            cfg, db, preview=preview, profile=profile, metrics=metrics,
+        )
         worker.start()
         app.state.worker = worker
         app.state.cfg = cfg
         app.state.db = db
         app.state.preview = preview
+        app.state.metrics = metrics
         log.info("server startup complete")
         try:
             yield
@@ -237,6 +243,7 @@ def make_app(
             log.info("server shutdown: stopping capture worker")
             worker.stop()
             worker.join(timeout=10)
+            metrics.stop()
 
     app = FastAPI(lifespan=lifespan, title="camwatch")
     if STATIC_DIR.exists():
@@ -520,6 +527,13 @@ def make_app(
                     "retention: %d alarm passes archived, %d non-alarm cleaned on settings save",
                     archived, deleted,
                 )
+        # Performance metrics are retained for 7 days. Hardcoded cap rather
+        # than a user knob: the panel only ever offers a 24h window, and 7d
+        # of 5s buckets is ~120k rows — small enough to keep, big enough to
+        # never need exposing as a setting.
+        purged_metrics = db.purge_metrics_older_than(7)
+        if purged_metrics:
+            log.info("retention: purged %d metric rows older than 7 days", purged_metrics)
         if cfg.passes_days > 0:
             n, items = db.purge_older_than(cfg.passes_days)
             for pid, cp in items:
@@ -552,6 +566,47 @@ def make_app(
             "line_distance_m_north": cal.line_distance_m_north if cal else 0,
             "line_distance_m_south": cal.line_distance_m_south if cal else 0,
             "known_count": len(cal.calibration_points) if cal else 0,
+        })
+
+    @app.get("/api/metrics")
+    async def metrics_api(window: str = "5m"):
+        """Recent performance samples for the perf panel charts.
+
+        ?window= one of 5m, 1h, 6h, 24h. Returns:
+          {
+            "bucket_s": 5,
+            "buckets": ["2026-05-11T13:00:00-04:00", ...],   # ascending
+            "series":  {"fps_sub": [...], "fps_main": [...], ...}
+          }
+        Series and buckets are aligned: series[name][i] is the value at
+        buckets[i], or null if that metric had no sample in that bucket.
+        """
+        window_s_map = {"5m": 300, "1h": 3600, "6h": 21600, "24h": 86400}
+        window_s = window_s_map.get(window, 300)
+        since_dt = (
+            datetime.now(timezone.utc).astimezone()
+            - timedelta(seconds=window_s)
+        )
+        since_iso = since_dt.isoformat(timespec="seconds")
+        raw = db.recent_metrics(since_iso)
+        # Build the union of bucket timestamps across all series so the
+        # client can render aligned line charts without per-series x-axes.
+        all_ts: set[str] = set()
+        for points in raw.values():
+            for ts, _ in points:
+                all_ts.add(ts)
+        buckets = sorted(all_ts)
+        index = {ts: i for i, ts in enumerate(buckets)}
+        series: dict[str, list[float | None]] = {}
+        for name, points in raw.items():
+            row: list[float | None] = [None] * len(buckets)
+            for ts, value in points:
+                row[index[ts]] = value
+            series[name] = row
+        return JSONResponse({
+            "bucket_s": int(METRICS_BUCKET_S),
+            "buckets": buckets,
+            "series": series,
         })
 
     @app.get("/status-badge", response_class=HTMLResponse)
