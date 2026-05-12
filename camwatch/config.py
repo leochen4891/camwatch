@@ -73,6 +73,7 @@ class Config:
     camera: CameraConfig
     model: ModelConfig
     alert_threshold_mph: float
+    enrich_offset_mph: float  # passes >= (threshold - this) get vehicle make/model enrichment
     events_dir: Path
     calibration_path: Path
     max_track_age_s: float
@@ -142,6 +143,7 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
             classes=list(mdl["classes"]),
         ),
         alert_threshold_mph=float(raw["alert"]["threshold_mph"]),
+        enrich_offset_mph=float(raw["alert"].get("enrich_offset_mph", 5.0)),
         events_dir=Path(raw["paths"]["events_dir"]),
         calibration_path=Path(raw["paths"]["calibration"]),
         max_track_age_s=float(raw["speed"]["max_track_age_s"]),
