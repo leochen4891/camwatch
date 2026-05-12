@@ -18,6 +18,15 @@
   <input type="hidden" name="time_ref_date" id="time-ref-date" value="{{ time_ref_date }}" form="filter-form">
 </section>
 {% endif %}
+{% if vehicle_make or vehicle_model or vehicle_color %}
+  <div class="vehicle-filter-chip">
+    Filter:
+    {% if vehicle_make %}<strong>{{ vehicle_make }}</strong>{% endif %}
+    {% if vehicle_model %}<strong>{{ vehicle_model }}</strong>{% endif %}
+    {% if vehicle_color %}<span class="muted">({{ vehicle_color }})</span>{% endif %}
+    <button type="button" class="chip-clear" onclick="clearVehicleFilter()" title="Clear vehicle filter">×</button>
+  </div>
+{% endif %}
 {% if not rows %}
   <p class="empty">No passes match these filters.</p>
 {% else %}

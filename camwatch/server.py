@@ -56,6 +56,22 @@ def _rotate_if_oversized(path: Path, max_bytes: int = 10 * 1024 * 1024, backups:
         log.exception("log rotation failed for %s", path)
 
 
+# Color compatibility map for "filter by this vehicle". Recall-favoring: each
+# queried bucket expands to a small set of acceptable matches so lighting drift
+# between visits doesn't drop the actual car. Hard exclusions (light vs dark,
+# red vs blue/green) still fall out naturally.
+COLOR_MATCHES: dict[str, set[str]] = {
+    "light":  {"light", "yellow", "grey"},
+    "grey":   {"grey", "light", "dark"},
+    "dark":   {"dark", "grey"},
+    "red":    {"red", "brown"},
+    "blue":   {"blue", "dark", "grey"},
+    "green":  {"green", "brown"},
+    "brown":  {"brown", "red", "yellow"},
+    "yellow": {"yellow", "light", "brown"},
+}
+
+
 def computed_mph(p: Pass, dist_n: float, dist_s: float) -> float | None:  # noqa: ARG001
     """Read the canonical speed from the DB. Returns None when the
     homography pipeline couldn't compute a reliable speed (e.g., the
@@ -102,6 +118,11 @@ def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict
         "has_clip": has_clip,
         "has_thumb": has_thumb,
         "thumb_upgrade_status": p.thumb_upgrade_status,
+        "vehicle_make": p.vehicle_make,
+        "vehicle_model": p.vehicle_model,
+        "vehicle_year_range": p.vehicle_year_range,
+        "vehicle_color": p.vehicle_color,
+        "vehicle_confidence": p.vehicle_confidence,
     }
 
 
@@ -265,25 +286,17 @@ def make_app(
         time_ref_date: str | None = None,
         buckets: list[int] = Query(default=[]),
         page: int = 1,
+        vehicle_make: str | None = None,
+        vehicle_model: str | None = None,
+        vehicle_color: str | None = None,
     ):
         return _render_pass_list(
             request, cfg, db, direction, alerts_only,
             time_mask=time_mask, time_ref_date=time_ref_date,
             selected_buckets=buckets, page=page,
+            vehicle_make=vehicle_make, vehicle_model=vehicle_model,
+            vehicle_color=vehicle_color,
         )
-
-    @app.post("/passes/{pass_id}/annotate", response_class=HTMLResponse)
-    async def annotate_pass(request: Request, pass_id: int, known_mph: str = Form(...)):
-        p = db.get_pass(pass_id)
-        if p is None or p.deleted:
-            raise HTTPException(status_code=404, detail="not found")
-        try:
-            value: float | None = float(known_mph) if known_mph.strip() else None
-        except ValueError:
-            raise HTTPException(status_code=400, detail="known_mph must be a number")
-        db.set_known_mph(pass_id, value)
-        recompute_calibration(cfg, db)
-        return _render_pass_row(request, cfg, db, pass_id)
 
     @app.post("/passes/delete")
     async def delete_passes(request: Request):
@@ -618,7 +631,7 @@ def _build_histogram(
 DAY_START_HOUR = 6   # heatmap rows start at 06:00 local
 DAY_END_HOUR = 22    # exclusive: rows stop at 22:00 (last slot is 21:30-22:00)
 SLOTS_PER_DAY = (DAY_END_HOUR - DAY_START_HOUR) * 2  # 32
-DAYS_IN_WEEK = 7
+DAYS_IN_WEEK = 8  # rolling window length for heatmap/list (matches retention.recordings_days)
 TOTAL_SLOTS = DAYS_IN_WEEK * SLOTS_PER_DAY  # 224
 
 
@@ -986,6 +999,9 @@ def _render_pass_list(
     time_mask: str | None = None, time_ref_date: str | None = None,
     selected_buckets: list[int] | None = None,
     page: int = 1,
+    vehicle_make: str | None = None,
+    vehicle_model: str | None = None,
+    vehicle_color: str | None = None,
 ):
     cal = cfg.load_calibration()
     dist_n = cal.line_distance_m_north if cal else 0
@@ -1047,6 +1063,26 @@ def _render_pass_list(
             return _bucket_for(mph) in selected_buckets_set
         rendered_filtered = [r for r in rendered_filtered if in_selected(r)]
 
+    # Vehicle filter: make + model are exact match; color expands via
+    # COLOR_MATCHES (recall-favoring against lighting drift).
+    veh_make = (vehicle_make or "").strip() or None
+    veh_model = (vehicle_model or "").strip() or None
+    veh_color = (vehicle_color or "").strip() or None
+    if veh_make or veh_model or veh_color:
+        color_allowed = COLOR_MATCHES.get(veh_color, {veh_color}) if veh_color else None
+
+        def vehicle_matches(r: dict) -> bool:
+            if r["deleted"]:
+                return True
+            if veh_make and r.get("vehicle_make") != veh_make:
+                return False
+            if veh_model and r.get("vehicle_model") != veh_model:
+                return False
+            if color_allowed is not None and r.get("vehicle_color") not in color_allowed:
+                return False
+            return True
+        rendered_filtered = [r for r in rendered_filtered if vehicle_matches(r)]
+
     total_filtered = len(rendered_filtered)
     total_pages = max(1, (total_filtered + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page, total_pages)
@@ -1066,6 +1102,9 @@ def _render_pass_list(
             "page": page,
             "total_pages": total_pages,
             "total_filtered": total_filtered,
+            "vehicle_make": veh_make,
+            "vehicle_model": veh_model,
+            "vehicle_color": veh_color,
             **heatmap_ctx,
         },
     )

@@ -133,6 +133,9 @@
           </label>
           <label class="checkbox"><input type="checkbox" name="alerts_only" value="true" checked> alerts only</label>
           <input type="hidden" name="page" value="{{ page }}" id="page-input">
+          <input type="hidden" name="vehicle_make" id="vehicle-make" value="">
+          <input type="hidden" name="vehicle_model" id="vehicle-model" value="">
+          <input type="hidden" name="vehicle_color" id="vehicle-color" value="">
         </form>
       </section>
 
@@ -213,8 +216,12 @@
         const buckets = Array.from(
           document.querySelectorAll('#histogram input[name="buckets"]:checked')
         ).map(c => c.value);
+        const vehicle_make = document.getElementById("vehicle-make")?.value || "";
+        const vehicle_model = document.getElementById("vehicle-model")?.value || "";
+        const vehicle_color = document.getElementById("vehicle-color")?.value || "";
         localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
           direction, alerts_only, time_mask, time_ref_date, buckets,
+          vehicle_make, vehicle_model, vehicle_color,
           heatmap_mode: heatmapMode,
         }));
       } catch (e) { /* localStorage may be disabled / full; non-fatal */ }
@@ -262,12 +269,41 @@
         });
       }
 
+      if (typeof s.vehicle_make === "string")
+        document.getElementById("vehicle-make").value = s.vehicle_make;
+      if (typeof s.vehicle_model === "string")
+        document.getElementById("vehicle-model").value = s.vehicle_model;
+      if (typeof s.vehicle_color === "string")
+        document.getElementById("vehicle-color").value = s.vehicle_color;
+
       return true;
+    }
+
+    function filterByVehicleFromBtn(btn) {
+      document.getElementById("vehicle-make").value = btn.dataset.vehMake || "";
+      document.getElementById("vehicle-model").value = btn.dataset.vehModel || "";
+      document.getElementById("vehicle-color").value = btn.dataset.vehColor || "";
+      const pageInput = document.getElementById("page-input");
+      if (pageInput) pageInput.value = "1";
+      saveFilterState();
+      htmx.trigger("#filter-form", "change");
+      // Close any open kebab menu
+      document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
+    }
+
+    function clearVehicleFilter() {
+      document.getElementById("vehicle-make").value = "";
+      document.getElementById("vehicle-model").value = "";
+      document.getElementById("vehicle-color").value = "";
+      const pageInput = document.getElementById("page-input");
+      if (pageInput) pageInput.value = "1";
+      saveFilterState();
+      htmx.trigger("#filter-form", "change");
     }
 
     // ---------- heatmap (week-view time filter) ----------
     const HEATMAP_SLOTS_PER_DAY = 32;       // 06:00-22:00 in 30-min steps
-    const HEATMAP_DAYS_IN_WEEK = 7;
+    const HEATMAP_DAYS_IN_WEEK = 8;  // matches DAYS_IN_WEEK on the server
     const HEATMAP_TOTAL_SLOTS = HEATMAP_SLOTS_PER_DAY * HEATMAP_DAYS_IN_WEEK;
     let heatmapMask = new Array(HEATMAP_TOTAL_SLOTS).fill(true);
 
@@ -474,14 +510,6 @@
         document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
       }
     });
-
-    function startKnownInput(passId) {
-      const row = document.getElementById(`pass-${passId}`);
-      const inputWrap = row.querySelector(".known-input-wrap");
-      inputWrap.classList.remove("hidden");
-      inputWrap.querySelector('input[name="known_mph"]').focus();
-      document.querySelectorAll(".kebab-menu.open").forEach(m => m.classList.remove("open"));
-    }
 
     // Toggle the inline expanded view for a pass row: opens the big image
     // (when there's a thumbnail) and the video player (when there's a clip),
@@ -1033,8 +1061,7 @@
     function rowClick(event, passId) {
       if (
         event.target.closest(".row-actions") ||
-        event.target.closest(".kebab-menu") ||
-        event.target.closest(".known-input-wrap")
+        event.target.closest(".kebab-menu")
       ) {
         return;
       }

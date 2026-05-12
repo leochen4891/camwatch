@@ -34,7 +34,14 @@
     </div>
 
     <div class="meta">
-      <div class="time">{{ p.captured_at[11:19] }} <span class="muted">{{ p.captured_at[:10] }}</span></div>
+      <div class="time-block">
+        <div class="time">{{ p.captured_at[11:19] }} <span class="muted">{{ p.captured_at[:10] }}</span></div>
+        {% if p.vehicle_make or p.vehicle_model %}
+        <div class="vehicle" title="{{ p.vehicle_year_range or '' }}{% if p.vehicle_confidence %} ({{ p.vehicle_confidence }} confidence){% endif %}">
+          {{ p.vehicle_make or '' }}{% if p.vehicle_make and p.vehicle_model %} {% endif %}{{ p.vehicle_model or '' }}
+        </div>
+        {% endif %}
+      </div>
       <div class="dir">{{ p.direction }}</div>
       <div class="speed">
         {% if p.computed_mph is not none %}
@@ -69,25 +76,18 @@
               hx-swap="outerHTML"
               onclick="event.stopPropagation()">✕</button>
 
+      {% if p.vehicle_make or p.vehicle_model %}
       <div class="kebab-wrap" onclick="event.stopPropagation()">
         <button class="kebab" type="button" onclick="toggleMenu(this)" aria-label="actions">⋯</button>
         <div class="kebab-menu">
-          <button type="button" onclick="startKnownInput({{ p.id }})">✎ Set known mph</button>
+          <button type="button"
+                  data-veh-make="{{ p.vehicle_make or '' }}"
+                  data-veh-model="{{ p.vehicle_model or '' }}"
+                  data-veh-color="{{ p.vehicle_color or '' }}"
+                  onclick="filterByVehicleFromBtn(this)">🚗 Filter by this vehicle</button>
         </div>
       </div>
-    </div>
-
-    <div class="known-input-wrap hidden" onclick="event.stopPropagation()">
-      <form hx-post="/passes/{{ p.id }}/annotate"
-            hx-target="#pass-{{ p.id }}"
-            hx-swap="outerHTML">
-        <label>known mph:
-          <input type="number" name="known_mph" step="0.1" min="0" max="200"
-                 value="{{ p.known_mph if p.known_mph is not none else '' }}">
-        </label>
-        <button type="submit">save</button>
-        <button type="button" onclick="this.closest('.known-input-wrap').classList.add('hidden')">cancel</button>
-      </form>
+      {% endif %}
     </div>
 
     {% if p.has_clip %}

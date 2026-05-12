@@ -32,7 +32,13 @@ CREATE TABLE IF NOT EXISTS passes (
     deleted              INTEGER NOT NULL DEFAULT 0,
     thumb_upgrade_status TEXT,  -- NULL=pending/none, 'ok'=upgraded, 'failed'=tried but failed
     speed_mph            REAL,  -- single source of truth for displayed speed (homography)
-    speed_method         TEXT   -- 'regression' (high confidence) | 'median_fallback' (low confidence) | NULL (no speed)
+    speed_method         TEXT,  -- 'regression' (high confidence) | 'median_fallback' (low confidence) | NULL (no speed)
+    vehicle_make         TEXT,
+    vehicle_model        TEXT,
+    vehicle_year_range   TEXT,
+    vehicle_color        TEXT,  -- categorical bucket: light/grey/dark/red/blue/green/brown/yellow
+    vehicle_confidence   TEXT,  -- 'high' | 'medium' | 'low'
+    vehicle_enriched_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS passes_captured_at_idx ON passes(captured_at);
 CREATE INDEX IF NOT EXISTS passes_deleted_idx ON passes(deleted);
@@ -53,6 +59,12 @@ class Pass:
     thumb_upgrade_status: str | None  # None | 'ok' | 'failed'
     speed_mph: float | None  # canonical displayed speed (homography-based for new rows)
     speed_method: str | None  # 'regression' | 'median_fallback' | None — confidence indicator for the UI
+    vehicle_make: str | None
+    vehicle_model: str | None
+    vehicle_year_range: str | None
+    vehicle_color: str | None
+    vehicle_confidence: str | None
+    vehicle_enriched_at: str | None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Pass:
@@ -76,6 +88,12 @@ class Pass:
             thumb_upgrade_status=upgrade_status,
             speed_mph=speed_mph,
             speed_method=speed_method,
+            vehicle_make=row["vehicle_make"] if "vehicle_make" in keys else None,
+            vehicle_model=row["vehicle_model"] if "vehicle_model" in keys else None,
+            vehicle_year_range=row["vehicle_year_range"] if "vehicle_year_range" in keys else None,
+            vehicle_color=row["vehicle_color"] if "vehicle_color" in keys else None,
+            vehicle_confidence=row["vehicle_confidence"] if "vehicle_confidence" in keys else None,
+            vehicle_enriched_at=row["vehicle_enriched_at"] if "vehicle_enriched_at" in keys else None,
         )
 
 
@@ -101,6 +119,12 @@ class Database:
                     ("thumb_upgrade_status", "TEXT"),
                     ("speed_mph", "REAL"),
                     ("speed_method", "TEXT"),
+                    ("vehicle_make", "TEXT"),
+                    ("vehicle_model", "TEXT"),
+                    ("vehicle_year_range", "TEXT"),
+                    ("vehicle_color", "TEXT"),
+                    ("vehicle_confidence", "TEXT"),
+                    ("vehicle_enriched_at", "TEXT"),
                 ]:
                     try:
                         conn.execute(f"ALTER TABLE passes ADD COLUMN {col} {decl}")
