@@ -30,20 +30,35 @@
 {% if not rows %}
   <p class="empty">No passes match these filters.</p>
 {% else %}
-  {% macro paginator() %}
-    {% if total_pages and total_pages > 1 %}
-      <nav class="paginator">
-        <button type="button" onclick="goToPage({{ page - 1 }})"
-                {% if page <= 1 %}disabled{% endif %}>← Prev</button>
-        <span class="muted">Page {{ page }} of {{ total_pages }} · {{ total_filtered }} matches</span>
-        <button type="button" onclick="goToPage({{ page + 1 }})"
-                {% if page >= total_pages %}disabled{% endif %}>Next →</button>
-      </nav>
-    {% endif %}
+  {% macro list_controls() %}
+    {# Top/bottom bar with paginator on the left and per-page selector on
+       the right. The select uses form="filter-form" so HTMX includes it
+       in the next request even though it lives outside the form. #}
+    <nav class="list-controls">
+      <div class="paginator">
+        {% if total_pages and total_pages > 1 %}
+          <button type="button" onclick="goToPage({{ page - 1 }})"
+                  {% if page <= 1 %}disabled{% endif %}>← Prev</button>
+          <span class="muted">Page {{ page }} of {{ total_pages }} · {{ total_filtered }} matches</span>
+          <button type="button" onclick="goToPage({{ page + 1 }})"
+                  {% if page >= total_pages %}disabled{% endif %}>Next →</button>
+        {% else %}
+          <span class="muted">{{ total_filtered }} match{% if total_filtered != 1 %}es{% endif %}</span>
+        {% endif %}
+      </div>
+      <label class="per-page">show
+        <select form="filter-form" name="page_size">
+          {% for n in page_size_options %}
+            <option value="{{ n }}" {% if n == page_size %}selected{% endif %}>{{ n }}</option>
+          {% endfor %}
+        </select>
+        per page
+      </label>
+    </nav>
   {% endmacro %}
-  {{ paginator() }}
+  {{ list_controls() }}
   {% for row in rows %}
     {% include "_pass_row.html" %}
   {% endfor %}
-  {{ paginator() }}
+  {{ list_controls() }}
 {% endif %}

@@ -509,12 +509,21 @@ main { padding: 16px 20px 80px; }
   min-width: 48px;
   min-height: 40px;
 }
+/* Top/bottom bar of the pass list. Paginator + match count on the left;
+   "show N per page" selector on the right. Always visible (even with one
+   page) so the user can change page size before there are enough passes
+   to need pagination. */
+.list-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 0;
+}
 .paginator {
   display: flex;
   align-items: center;
-  justify-content: center;
   gap: 14px;
-  padding: 16px 0;
 }
 .paginator button {
   background: var(--surface-2);
@@ -527,6 +536,20 @@ main { padding: 16px 20px 80px; }
 }
 .paginator button:hover:not(:disabled) { border-color: var(--accent); }
 .paginator button:disabled { opacity: 0.4; cursor: default; }
+.per-page {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.per-page select {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+}
 
 .empty { color: var(--muted); text-align: center; padding: 40px; }
 
@@ -850,13 +873,16 @@ main { padding: 16px 20px 80px; }
   background: var(--surface-2);
 }
 
-/* Expanded view, with a clip: video on top (full width), high-res image below. */
+/* Expanded view, with a clip: high-res image on top, then meta (with the
+   speed prominent), then the video player. The image is what reads first
+   on mobile and lets the user identify the vehicle at a glance before
+   choosing to watch the clip. */
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) {
   grid-template-columns: 1fr auto;
   grid-template-areas:
+    "bigimg  bigimg"
     "meta    actions"
-    "video   video"
-    "bigimg  bigimg";
+    "video   video";
 }
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .big-image-wrap img {
   max-width: 720px;
@@ -865,12 +891,12 @@ main { padding: 16px 20px 80px; }
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .thumb { display: none; }
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .video-wrap > video { max-width: none; }
 
-/* Expanded view, image only (no clip): big image takes the full row. */
+/* Expanded view, image only (no clip): big image on top, meta below. */
 .pass-row:not(.deleted):has(.big-image-wrap:not(.hidden)):not(:has(.video-wrap:not(.hidden))) {
   grid-template-columns: 1fr auto;
   grid-template-areas:
-    "meta   actions"
-    "bigimg bigimg";
+    "bigimg bigimg"
+    "meta   actions";
 }
 .pass-row:not(.deleted):has(.big-image-wrap:not(.hidden)):not(:has(.video-wrap:not(.hidden))) .thumb { display: none; }
 

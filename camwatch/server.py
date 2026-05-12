@@ -293,6 +293,7 @@ def make_app(
         time_ref_date: str | None = None,
         buckets: list[int] = Query(default=[]),
         page: int = 1,
+        page_size: int | None = None,
         vehicle_make: str | None = None,
         vehicle_model: str | None = None,
         vehicle_color: str | None = None,
@@ -300,7 +301,7 @@ def make_app(
         return _render_pass_list(
             request, cfg, db, direction, alerts_only,
             time_mask=time_mask, time_ref_date=time_ref_date,
-            selected_buckets=buckets, page=page,
+            selected_buckets=buckets, page=page, page_size=page_size,
             vehicle_make=vehicle_make, vehicle_model=vehicle_model,
             vehicle_color=vehicle_color,
         )
@@ -979,7 +980,17 @@ def _static_version() -> str:
         return "0"
 
 
-PAGE_SIZE = 100
+DEFAULT_PAGE_SIZE = 100
+ALLOWED_PAGE_SIZES = (10, 20, 50, 100, 200)
+
+
+def _normalize_page_size(value: int | None) -> int:
+    """Clamp `value` to one of ALLOWED_PAGE_SIZES; fall back to default."""
+    try:
+        v = int(value) if value is not None else DEFAULT_PAGE_SIZE
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    return v if v in ALLOWED_PAGE_SIZES else DEFAULT_PAGE_SIZE
 
 
 def _render_index(request: Request, cfg: Config, db: Database):
@@ -1024,8 +1035,9 @@ def _render_index(request: Request, cfg: Config, db: Database):
     heatmap_ctx = _build_heatmap(week_non_deleted, today, selected=today_slots)
 
     total_filtered = len(rendered_filtered)
-    total_pages = max(1, (total_filtered + PAGE_SIZE - 1) // PAGE_SIZE)
-    rows = rendered_filtered[:PAGE_SIZE]
+    page_size = DEFAULT_PAGE_SIZE
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    rows = rendered_filtered[:page_size]
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
@@ -1047,6 +1059,8 @@ def _render_index(request: Request, cfg: Config, db: Database):
             "histogram_total": hist_total,
             "histogram_all_default": hist_all_default,
             "page": 1,
+            "page_size": page_size,
+            "page_size_options": ALLOWED_PAGE_SIZES,
             "total_pages": total_pages,
             "total_filtered": total_filtered,
             **heatmap_ctx,
@@ -1060,6 +1074,7 @@ def _render_pass_list(
     time_mask: str | None = None, time_ref_date: str | None = None,
     selected_buckets: list[int] | None = None,
     page: int = 1,
+    page_size: int | None = None,
     vehicle_make: str | None = None,
     vehicle_model: str | None = None,
     vehicle_color: str | None = None,
@@ -1144,11 +1159,12 @@ def _render_pass_list(
             return True
         rendered_filtered = [r for r in rendered_filtered if vehicle_matches(r)]
 
+    page_size = _normalize_page_size(page_size)
     total_filtered = len(rendered_filtered)
-    total_pages = max(1, (total_filtered + PAGE_SIZE - 1) // PAGE_SIZE)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
     page = min(page, total_pages)
-    start = (page - 1) * PAGE_SIZE
-    rendered = rendered_filtered[start:start + PAGE_SIZE]
+    start = (page - 1) * page_size
+    rendered = rendered_filtered[start:start + page_size]
 
     return TEMPLATES.TemplateResponse(
         request,
@@ -1161,6 +1177,8 @@ def _render_pass_list(
             "include_oob_histogram": True,
             "include_oob_heatmap": True,
             "page": page,
+            "page_size": page_size,
+            "page_size_options": ALLOWED_PAGE_SIZES,
             "total_pages": total_pages,
             "total_filtered": total_filtered,
             "vehicle_make": veh_make,

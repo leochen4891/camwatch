@@ -559,6 +559,29 @@
           videoWrap.classList.remove("hidden");
           setupPlayerPackage(videoWrap, passId);
         }
+        // Scroll so the car image lands just below the sticky page header.
+        // scrollIntoView({block:"start"}) aligns to viewport top 0, which
+        // is hidden under our sticky header — measure the header at scroll
+        // time and subtract it from the target offset. We must also wait
+        // for the bigimg JPEG to load before measuring: scrolling against
+        // a 0-height <img> lands at the wrong document-Y, and the layout
+        // reflow when the image arrives shifts everything down.
+        const doScroll = () => {
+          const target = (imageWrap && !imageWrap.classList.contains("hidden")) ? imageWrap : row;
+          const header = document.querySelector("header");
+          const headerH = header ? header.offsetHeight : 0;
+          const targetTop = target.getBoundingClientRect().top + window.scrollY;
+          window.scrollTo({ top: targetTop - headerH - 6, behavior: "smooth" });
+        };
+        const bigImg = imageWrap ? imageWrap.querySelector("img") : null;
+        if (bigImg && !bigImg.complete) {
+          // Defer until the image finishes loading (or fails). Use 'once'
+          // so we don't pile up listeners across opens.
+          bigImg.addEventListener("load", () => requestAnimationFrame(doScroll), { once: true });
+          bigImg.addEventListener("error", () => requestAnimationFrame(doScroll), { once: true });
+        } else {
+          requestAnimationFrame(doScroll);
+        }
       }
     }
 
@@ -1093,6 +1116,12 @@
     // fold the entry. Interactive controls inside the player (play/pause
     // button, scrubber) explicitly stopPropagation to avoid folding.
     function rowClick(event, passId) {
+      // Bail only when the click landed on a control that has its own
+      // behavior. Clicks on the image, speed chart, and video frame
+      // all close the row — that's the natural "tap to dismiss" gesture
+      // when you're done looking at the expanded view. The player-controls
+      // (play/pause + scrubber) carry their own stopPropagation so they
+      // remain interactive without folding the row.
       if (
         event.target.closest(".row-actions") ||
         event.target.closest(".kebab-menu")
