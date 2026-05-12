@@ -487,15 +487,7 @@
     // Refresh button: re-trigger the filter-form to refetch /passes immediately.
     document.body.addEventListener("click", (e) => {
       if (!e.target.closest("#refresh-list-btn")) return;
-      const btn = document.getElementById("refresh-list-btn");
-      if (btn) btn.classList.add("spinning");
       htmx.trigger("#filter-form", "change");
-    });
-    document.body.addEventListener("htmx:afterRequest", (e) => {
-      const elt = e.detail && e.detail.elt;
-      if (!elt || elt.id !== "filter-form") return;
-      const btn = document.getElementById("refresh-list-btn");
-      if (btn) btn.classList.remove("spinning");
     });
 
     function toggleMenu(btn) {
