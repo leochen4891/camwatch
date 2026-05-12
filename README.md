@@ -162,4 +162,4 @@ Gitignored at runtime: `camwatch.db`, `events/`, `recordings/`, `models/yolo11n.
 - **Camera must not move.** Calibration is tied to the painted-anchor pixel positions. If the camera is bumped, redo the click step.
 - **Auto-paused at night.** When the camera switches to IR illumination (frames go monochrome), detection pauses. Toggle off in settings if you want to capture night data, with the understanding that headlight-only readings have much higher error.
 - **Tracker splits lower confidence.** When BotSORT briefly loses a car (occlusion, YOLO confidence dip) the same physical vehicle gets two track IDs. The tiered regression handles this and flags the pass with a `?` chip; a larger YOLO model would reduce the rate.
-- **Single main stream.** Detection, tracking, clips, and thumbnails all come from the camera's main stream. The earlier dual-stream architecture (sub-stream for detection + main-stream thumbnail upgrades) was retired during the NVIDIA migration — the GPU has enough headroom to run YOLO directly on 2048×1536.
+- **Single main stream.** Detection, tracking, clips, and thumbnails all come from the camera's main stream (2048×1536).

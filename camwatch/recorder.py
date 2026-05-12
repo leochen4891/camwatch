@@ -246,13 +246,8 @@ class ClipRecorder:
         """
         if not clip.frames or self._size is None:
             return
-        # Encode fps from the clip's actual PTS span so playback matches real
-        # time. Hard-coding `self._fps` (defaulting to 10) made every clip
-        # play in slow motion on a 15 fps source — a holdover from when the
-        # capture worker ran against the sub stream and dropped frames
-        # through the single-slot deque, effectively producing ~10 fps. With
-        # the full-coverage main-stream pipeline that bias is gone, so we
-        # derive the rate from the frames in hand.
+        # Encode fps = (N-1) / (last_ts - first_ts) so playback matches real
+        # capture time regardless of the configured camera rate.
         if len(clip.frames) >= 2:
             span = clip.frames[-1].ts - clip.frames[0].ts
             fps = int(round((len(clip.frames) - 1) / span)) if span > 0 else int(round(self._fps))

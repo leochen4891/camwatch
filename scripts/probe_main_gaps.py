@@ -37,8 +37,7 @@ sys.path.insert(0, str(ROOT))
 
 # TCP transport with NO nobuffer/low_delay so ffmpeg keeps decoded-frame
 # backlogs intact — lets us measure whether multi-second fr.ts gaps come
-# from those flags or from real upstream frame loss. (Historical: this
-# matched the now-removed TimestampedFrameBuffer's main-stream opener.)
+# from those flags or from real upstream frame loss.
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp",
