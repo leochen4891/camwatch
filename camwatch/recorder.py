@@ -223,12 +223,14 @@ class ClipRecorder:
                 log.warning("clip on_finalize callback raised: %s", e)
 
     def _write_thumbnail(self, clip: _ActiveClip) -> None:
-        """Save a clean (no overlay) JPEG cropped tight to the focus car.
+        """Save two JPEGs cropped tight to the focus car: a 320 px-wide
+        thumb for list view and an 800 px-wide thumb for the detail view.
 
-        The crop uses the focus track's bbox at midcrossing time, but the
-        IMAGE used is the raw frame from the ring buffer rather than the
-        overlay-rendered frame written into the mp4. So thumbnails have no
-        bbox, no labels, no lines drawn on them.
+        Source frames come from the main-stream ring buffer (2048x1536),
+        so both crops are derived from a single high-res image — no async
+        upgrade needed. The crop is taken from the raw frame, not the
+        overlay-rendered frame written into the .mp4, so thumbnails have
+        no bbox/label/line overlays.
         """
         if not clip.frames:
             return
@@ -249,7 +251,7 @@ class ClipRecorder:
                             best_with_focus = (diff, i, bbox)
                     break
 
-        target_w = 320
+        crop: np.ndarray | None = None
         if best_with_focus is not None:
             _, idx, bbox = best_with_focus
             raw = clip.frames[idx].image
@@ -264,27 +266,24 @@ class ClipRecorder:
             cy1 = max(0, int(round(by1 - pad_y)))
             cx2 = min(fw, int(round(bx2 + pad_x)))
             cy2 = min(fh, int(round(by2 + pad_y)))
-            if cx2 - cx1 < 80 or cy2 - cy1 < 60:
-                thumb = self._fallback_thumb(clip.frames[best_any[1]].image, target_w)
-            else:
-                thumb = raw[cy1:cy2, cx1:cx2]
-                th, tw = thumb.shape[:2]
-                if tw != target_w:
-                    scale = target_w / tw
-                    thumb = cv2.resize(thumb, (target_w, max(1, int(round(th * scale)))))
-        else:
-            thumb = self._fallback_thumb(clip.frames[best_any[1]].image, target_w)
+            if cx2 - cx1 >= 80 and cy2 - cy1 >= 60:
+                crop = raw[cy1:cy2, cx1:cx2]
+        if crop is None:
+            crop = clip.frames[best_any[1]].image
 
-        thumb_path = clip.path[:-4] + ".jpg" if clip.path.endswith(".mp4") else clip.path + ".jpg"
-        cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        base = clip.path[:-4] if clip.path.endswith(".mp4") else clip.path
+        thumb_small = self._resize_to_width(crop, 320)
+        thumb_big = self._resize_to_width(crop, 800)
+        cv2.imwrite(base + ".jpg", thumb_small, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        cv2.imwrite(base + "_big.jpg", thumb_big, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
     @staticmethod
-    def _fallback_thumb(frame: np.ndarray, target_w: int) -> np.ndarray:
+    def _resize_to_width(frame: np.ndarray, target_w: int) -> np.ndarray:
         h, w = frame.shape[:2]
-        if w <= target_w:
+        if w == target_w:
             return frame
         scale = target_w / w
-        return cv2.resize(frame, (target_w, int(round(h * scale))))
+        return cv2.resize(frame, (target_w, max(1, int(round(h * scale)))))
 
     def _render(self, rec: _FrameRec, clip: _ActiveClip) -> np.ndarray:
         img = rec.image.copy()

@@ -35,11 +35,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Mirror the same ffmpeg options the thumb upgrader's TimestampedFrameBuffer
-# now uses: TCP transport, NO nobuffer/low_delay (so ffmpeg keeps decoded-
-# frame backlogs intact). This lets us measure whether the multi-second
-# fr.ts gaps we saw in earlier probes were caused by those flags or by
-# real upstream frame loss.
+# TCP transport with NO nobuffer/low_delay so ffmpeg keeps decoded-frame
+# backlogs intact — lets us measure whether multi-second fr.ts gaps come
+# from those flags or from real upstream frame loss. (Historical: this
+# matched the now-removed TimestampedFrameBuffer's main-stream opener.)
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp",
@@ -57,7 +56,7 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = load_config()
-    url = cfg.camera.rtsp_url_thumb or cfg.camera.rtsp_url
+    url = cfg.camera.rtsp_url
     print(f"opening: {url}")
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     if not cap.isOpened():

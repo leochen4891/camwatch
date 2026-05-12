@@ -111,8 +111,7 @@ def build_main_url() -> str:
     pw = quote(os.environ["REOLINK_PASS"], safe="")
     cfg = yaml.safe_load((REPO / "config/config.yaml").read_text())
     cam = cfg["camera"]
-    path_main = cam.get("path_thumb") or cam["path"].replace("_sub", "_main")
-    return f"rtsp://{user}:{pw}@{cam['host']}:{cam['port']}{path_main}"
+    return f"rtsp://{user}:{pw}@{cam['host']}:{cam['port']}{cam['path']}"
 
 
 def fit_homography(clicks_main: list[tuple[int, int]]) -> np.ndarray | None:

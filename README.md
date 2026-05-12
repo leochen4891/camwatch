@@ -103,10 +103,9 @@ camwatch/
 │                       recorder + DB. Includes stationary-track gate
 │                       (parked-curb suppression) and night-mode (IR) gate.
 ├── recorder.py         Ring buffer; on trigger writes a clip with the grid
-│                       drawn on top + a thumbnail. Caps clip duration at
-│                       last_in_grid_ts + post-roll, so late-firing triggers
-│                       don't pad with dead air.
-├── thumb_upgrader.py   Background main-stream thumb upgrade (PTS-keyed).
+│                       drawn on top + small/big thumbnails. Caps clip
+│                       duration at last_in_grid_ts + post-roll, so
+│                       late-firing triggers don't pad with dead air.
 ├── preview.py          MJPEG buffer + optional grid overlay.
 ├── db.py               SQLite (WAL): passes table with speed_mph + speed_method.
 ├── server.py           FastAPI + Jinja2/HTMX.
@@ -125,8 +124,8 @@ Three things make the speed measurement work:
 `config/config.yaml`:
 
 ```yaml
-camera:        { host, port, path, path_thumb }   # path = sub stream
-model:         { weights: yolo11n.pt, device: mps, conf: 0.35 }
+camera:        { host, port, path, static_frame_path? }   # path = main stream
+model:         { weights: yolo11n.pt, device: auto, conf: 0.35 }
 alert:         { threshold_mph: 40 }
 speed:         { max_track_age_s: 5.0 }
 retention:     { days: 7 }
@@ -134,6 +133,10 @@ clip:          { margin_s: 0.5, capture_min_mph: 0, capture_max_mph: 999 }
 preview:       { show_grid: true }
 capture:       { pause_at_night: true }
 ```
+
+`device: auto` probes for CUDA, then MPS, then CPU. `static_frame_path`
+(optional) loops a JPEG instead of opening RTSP — useful for dev/test when
+the live camera is in use elsewhere.
 
 Most are also editable in-app. Camera credentials in `.env` (`REOLINK_USER`, `REOLINK_PASS`).
 

@@ -1,11 +1,11 @@
 """Live timing diagnostic: compare time.monotonic() vs CV PTS vs OSD ticks.
 
 Goal: figure out which timing source is the truthful representation of when
-the camera actually captured each frame, so we can replace `time.monotonic()`
-in the live capture path if needed.
+the camera actually captured each frame, so we can sanity-check the PTS
+anchor that the live capture path relies on.
 
 What it does:
-  1. Opens the configured RTSP stream (default sub; --stream main supported).
+  1. Opens the configured main-stream RTSP URL.
   2. For ~N seconds (default 60), reads frames in the same low-latency
      pattern the live capture worker uses.
   3. Per frame, records:
@@ -17,9 +17,9 @@ What it does:
      counts so we can see the camera's true fps vs what the deltas claim.
 
 Usage:
-    uv run python scripts/timing_probe.py                     # 60s of sub
-    uv run python scripts/timing_probe.py --stream main       # main stream
-    uv run python scripts/timing_probe.py --secs 30 --no-ocr  # skip OCR
+    uv run python scripts/timing_probe.py                # 60s
+    uv run python scripts/timing_probe.py --secs 30      # 30s
+    uv run python scripts/timing_probe.py --no-ocr       # skip OCR
 """
 
 from __future__ import annotations
@@ -41,10 +41,8 @@ import cv2  # noqa: E402
 from camwatch.config import load_config  # noqa: E402
 from camwatch.ts_reader import read_timestamp  # noqa: E402
 
-# OSD region per stream — main is what we calibrated earlier.
-# For sub (640x480) we proportionally scale the same scene-relative position.
+# OSD pixel rectangle on the Reolink E1 main stream (2048x1536).
 OSD_REGION_MAIN = (700, 1810, 2000, 1910)
-OSD_REGION_SUB = (175, 452, 500, 477)
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -74,25 +72,13 @@ def summarize(name: str, deltas_ms: list[float]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--stream",
-        choices=("sub", "main"),
-        default="sub",
-        help="Which stream to probe. The capture worker uses 'sub'.",
-    )
     parser.add_argument("--secs", type=float, default=60.0, help="seconds to record")
     parser.add_argument("--no-ocr", action="store_true", help="skip OSD OCR")
     args = parser.parse_args()
 
     cfg = load_config()
-    if args.stream == "sub":
-        url = cfg.camera.rtsp_url
-        region = OSD_REGION_SUB
-    else:
-        url = cfg.camera.rtsp_url_thumb
-        region = OSD_REGION_MAIN
-        if url is None:
-            raise SystemExit("camera.path_thumb not configured for main stream")
+    url = cfg.camera.rtsp_url
+    region = OSD_REGION_MAIN
 
     safe_url = url.replace(cfg.camera.password, "***")
     print(f"opening: {safe_url}")

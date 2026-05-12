@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,29 +9,27 @@ from urllib.parse import quote
 import yaml
 from dotenv import load_dotenv
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class CameraConfig:
     host: str
     port: int
-    path: str                       # primary detection stream (sub recommended)
+    path: str                       # main-stream RTSP path on the camera
     user: str
     password: str
-    path_thumb: str | None = None   # optional high-res stream for thumbnail upgrades
+    # When set, the capture worker reads frames from this JPEG (looped at the
+    # camera's nominal rate) instead of opening RTSP. Used for dev/test on
+    # Ubuntu while the Mac is still serving live and the Reolink E1 can't
+    # share its main stream with two clients.
+    static_frame_path: str | None = None
 
     @property
     def rtsp_url(self) -> str:
         u = quote(self.user, safe="")
         p = quote(self.password, safe="")
         return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path}"
-
-    @property
-    def rtsp_url_thumb(self) -> str | None:
-        if not self.path_thumb:
-            return None
-        u = quote(self.user, safe="")
-        p = quote(self.password, safe="")
-        return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path_thumb}"
 
 
 @dataclass
@@ -106,6 +105,28 @@ class Config:
         )
 
 
+def _resolve_device(requested: str | None) -> str:
+    """Return a concrete torch device string from a config value.
+
+    `"auto"` (or missing) probes in order: cuda → mps → cpu. Any other
+    value (`"cuda"`, `"cuda:0"`, `"mps"`, `"cpu"`) is passed through
+    untouched so existing configs keep working. Logged once so the
+    operator can see which backend was chosen on this host.
+    """
+    if requested and requested != "auto":
+        return requested
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def load_config(path: str | Path = "config/config.yaml") -> Config:
     load_dotenv()
 
@@ -126,18 +147,22 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
 
     cam = raw["camera"]
     mdl = raw["model"]
+    device_requested = mdl.get("device")
+    device_resolved = _resolve_device(device_requested)
+    if device_requested in (None, "auto") and device_resolved != (device_requested or "auto"):
+        log.info("model.device=%s resolved to %s", device_requested or "auto", device_resolved)
     return Config(
         camera=CameraConfig(
             host=cam["host"],
             port=int(cam["port"]),
             path=cam["path"],
-            path_thumb=cam.get("path_thumb"),
+            static_frame_path=cam.get("static_frame_path"),
             user=user,
             password=pw,
         ),
         model=ModelConfig(
             weights=mdl["weights"],
-            device=mdl["device"],
+            device=device_resolved,
             conf=float(mdl["conf"]),
             iou=float(mdl["iou"]),
             classes=list(mdl["classes"]),

@@ -1,17 +1,20 @@
 camera:
   host: 192.168.0.227
   port: 554
-  path: /h264Preview_01_sub           # use the sub stream (640x480) for detection + clips.
-                                      # Switch to /h264Preview_01_main if you want full-res but
-                                      # accept higher CPU and ~10s of latency from buffer buildup.
-  path_thumb: /h264Preview_01_main    # optional. If set, every crossing's thumbnail is upgraded
-                                      # to a high-res crop derived from this stream. Adds a parallel
-                                      # RTSP read + one YOLO pass per pass; ~20-30% CPU overhead.
+  path: /h264Preview_01_main          # main stream (2048x1536). Single-stream
+                                      # pipeline: YOLO + tracking + thumbnails
+                                      # all come from this one source.
+  # static_frame_path: calibration_main_frame.jpg
+  #   Optional dev/test mode. When set, the capture worker loops this JPEG
+  #   at the camera's nominal rate instead of opening RTSP. Useful when the
+  #   real camera is being served by another host and we don't want to
+  #   contend for the main stream.
   # User and pass come from .env (REOLINK_USER, REOLINK_PASS)
 
 model:
   weights: yolo11n.pt
-  device: mps              # "mps" on Apple Silicon, "cuda" on NVIDIA, "cpu" elsewhere
+  device: auto             # auto → cuda > mps > cpu. Set explicitly
+                           # ("cuda", "mps", "cpu", "cuda:0") to override.
   conf: 0.35             # daytime default; lower to ~0.20 if you ever run at night
   iou: 0.5
   classes: [2, 3, 5, 7]    # COCO: car, motorcycle, bus, truck

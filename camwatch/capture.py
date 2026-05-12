@@ -1,48 +1,47 @@
 """RTSP frame source with hardware-accelerated decode and reconnect.
 
-The Reolink E1 camera produces frames at ~12fps (sub) / ~20fps (main); the
-YOLO+tracker consumer runs at ~6-10fps. Without intervention, the network
-+ codec pipeline buffers fill up and we end up processing frames many
-seconds old. Three layers of mitigation:
+The Reolink E1 camera produces main-stream frames at ~20fps; the YOLO+tracker
+consumer on the 3060 Ti runs comfortably above that, so we want freshness over
+completeness. Three layers of mitigation keep end-to-end latency close to the
+camera's frame interval:
 
-1. Hardware decode via Apple's VideoToolbox media engine. H.264 NAL units
-   come off the RTSP socket and are handed straight to the SoC's dedicated
-   decode block, which produces NV12 frames at near-zero CPU cost. PyAV
-   does the NV12→BGR24 conversion via libswscale; that plus the surface
+1. Hardware decode via the platform's media engine. On macOS that's Apple's
+   VideoToolbox; on Linux it's NVDEC via libav's `cuda` hwaccel. H.264 NAL
+   units come off the RTSP socket and are handed straight to the GPU's
+   dedicated decode block, which produces frames at near-zero CPU cost. PyAV
+   does the YUV→BGR24 conversion via libswscale; that plus the surface
    download is a few percent of one core, vs ~40% for full software decode.
+   `allow_software_fallback=True` on every config means a missing hwaccel
+   silently degrades to software instead of crashing.
 2. Low-latency demux flags via av.open() options — `rtsp_transport=tcp`
    for reliability + `fflags=nobuffer`, `flags=low_delay` to surface
    frames as soon as they arrive instead of holding a multi-frame jitter
-   buffer. The thumb upgrader's main-stream buffer overrides these via
-   RtspStream(ffmpeg_options=...) when it wants ffmpeg to retain a
-   decoded-frame backlog.
-3. A background reader thread continuously demuxes packets and decodes
-   them into a deque(maxlen=queue_size). With queue_size=1 (the live
-   default) older frames are silently overwritten — the consumer always
-   sees the latest. With queue_size>1 it's a bounded FIFO that drops
-   the oldest on overflow.
-
-Net: end-to-end latency stays close to the camera's frame interval,
-detection always sees fresh state, and the CPU headroom freed by hardware
-decode goes to YOLO+tracking.
+   buffer.
+3. A background reader thread continuously demuxes packets and decodes them
+   into a single-slot `deque(maxlen=1)` — older frames are silently
+   overwritten, so the consumer always sees the latest.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import av
 import av.codec.hwaccel
 import av.error
+import cv2
 import numpy as np
 
 if TYPE_CHECKING:
+    from .config import Config
     from .metrics import MetricsCollector
 
 log = logging.getLogger(__name__)
@@ -55,27 +54,27 @@ _LIVE_OPTIONS: dict[str, str] = {
     "flags": "low_delay",
 }
 
-# Single shared HWAccel config — there's no per-stream state, just the
-# device-type request, so multiple containers can use the same instance.
-_VT_HWACCEL = av.codec.hwaccel.HWAccel(
-    device_type="videotoolbox",
-    allow_software_fallback=True,
-)
+
+def _make_hwaccel() -> "av.codec.hwaccel.HWAccel | None":
+    """Pick the platform's hardware decoder. None means software decode.
+
+    Falls back to software automatically if the requested backend isn't
+    available in the linked libav build (`allow_software_fallback=True`).
+    """
+    if sys.platform == "darwin":
+        return av.codec.hwaccel.HWAccel(
+            device_type="videotoolbox",
+            allow_software_fallback=True,
+        )
+    if sys.platform.startswith("linux"):
+        return av.codec.hwaccel.HWAccel(
+            device_type="cuda",
+            allow_software_fallback=True,
+        )
+    return None
 
 
-def _parse_ffmpeg_options(s: str | None) -> dict[str, str]:
-    """Parse an OPENCV_FFMPEG_CAPTURE_OPTIONS-style string ("k1;v1|k2;v2")
-    into a dict for av.open(options=...). None returns the live default
-    (low-latency)."""
-    if s is None:
-        return dict(_LIVE_OPTIONS)
-    out: dict[str, str] = {}
-    for pair in s.split("|"):
-        if not pair or ";" not in pair:
-            continue
-        k, v = pair.split(";", 1)
-        out[k] = v
-    return out
+_HWACCEL = _make_hwaccel()
 
 
 @dataclass
@@ -92,55 +91,27 @@ class RtspStream:
         url: str,
         reconnect_delay_s: float = 2.0,
         max_consecutive_read_failures: int = 30,
-        ffmpeg_options: str | None = None,
-        bufsize: int | None = 1,
         log_label: str = "stream",
-        queue_size: int = 1,
         metrics: "MetricsCollector | None" = None,
     ) -> None:
         self._url = url
         self._reconnect_delay_s = reconnect_delay_s
         self._max_failures = max_consecutive_read_failures
         self._stop = False
-        # queue_size controls the reader→consumer hand-off:
-        #   1  → single-slot semantics (always keep latest, drop older).
-        #        Right for live capture where freshness > completeness.
-        #   N  → bounded FIFO (deque(maxlen=N), oldest evicted on overflow).
-        #        Right for non-live consumers like the thumb upgrader, where
-        #        we want to retain every frame ffmpeg gives us during a
-        #        backlog burst — single-slot would silently drop ~120 of 140
-        #        burst frames since the consumer can't iterate fast enough.
-        if queue_size < 1:
-            raise ValueError("queue_size must be >= 1")
-        self._queue_size = queue_size
         # Lightweight diagnostic. Counts every successfully decoded frame at
         # the earliest possible point — the inner reader thread, before any
         # of our consumer-side filtering / sampling / single-slot logic. If
         # this counter ticks at the camera's nominal fps, no frames are
         # being lost between the camera and our decoder; any apparent loss
         # downstream is then in our wrapper code, not the network or codec.
-        # Periodically logged with `log_label` so sub and main can be
-        # compared side-by-side.
         self._frames_read = 0
         self._log_label = log_label
         self._metrics = metrics
-        # ffmpeg_options is a string in OPENCV_FFMPEG_CAPTURE_OPTIONS format
-        # (e.g. "rtsp_transport;tcp|fflags;nobuffer"). None uses the
-        # live-capture default (low-latency). The thumb upgrader passes
-        # "rtsp_transport;tcp" alone — without nobuffer/low_delay — so
-        # ffmpeg retains a decoded-frame backlog rather than discarding all
-        # but the latest after a keyframe wait.
-        self._ffmpeg_options = ffmpeg_options
-        # bufsize was OpenCV's CAP_PROP_BUFFERSIZE knob. PyAV exposes no
-        # equivalent; the parameter is retained for API compatibility but
-        # has no effect under the libav-based pipeline.
-        self._bufsize = bufsize
         # session_epoch increments on each reconnect (each new container).
         # Frames yielded from the same RTSP session share an epoch, and that
         # epoch is the validity scope of their ts space — PTS is re-anchored
         # to monotonic at the first frame of every session, so anything that
-        # caches a derived value (e.g. a cross-stream offset) must invalidate
-        # when the epoch advances.
+        # caches a derived value must invalidate when the epoch advances.
         self._session_epoch = 0
         self._container: "av.container.InputContainer | None" = None
 
@@ -174,12 +145,10 @@ class RtspStream:
             self._session_epoch += 1
             current_epoch = self._session_epoch
 
-            # Background reader writes into a deque(maxlen=queue_size). With
-            # maxlen=1 this is identical to a single-slot keep-latest buffer;
-            # with maxlen>1 it's a bounded FIFO that evicts the oldest frame
-            # on overflow (the deque's automatic policy). Consumer drains
-            # every queued frame on each cycle.
-            latest_buf: "deque[tuple[np.ndarray, float]]" = deque(maxlen=self._queue_size)
+            # Background reader writes into a single-slot deque — older
+            # frames are silently overwritten so the consumer always sees
+            # the latest. Consumer drains every queued frame on each cycle.
+            latest_buf: "deque[tuple[np.ndarray, float]]" = deque(maxlen=1)
             buf_lock = threading.Lock()
             new_frame_evt = threading.Event()
             reader_stop = threading.Event()
@@ -280,8 +249,8 @@ class RtspStream:
                                 last_log_count = self._frames_read
                                 if pts_s is not None:
                                     last_log_pts = pts_s
-                            # NV12 (HW surface) → BGR24 numpy via libswscale.
-                            # Implicit IOSurface download + colorspace convert.
+                            # HW surface → BGR24 numpy via libswscale.
+                            # Implicit GPU→CPU download + colorspace convert.
                             image = frame.to_ndarray(format="bgr24")
                             with buf_lock:
                                 latest_buf.append((image, ts))
@@ -297,12 +266,11 @@ class RtspStream:
 
             try:
                 while not self._stop:
-                    # Drain any frames the reader has queued. With queue_size=1
-                    # this returns 0 or 1 items (single-slot semantics); with
-                    # queue_size>1 it returns up to queue_size items in
-                    # arrival order. Yielding inside the lock is wrong (would
-                    # block the reader for the duration of the consumer's
-                    # work), so we copy out then yield.
+                    # Drain any frame the reader has queued. With the
+                    # single-slot deque this returns 0 or 1 items. Yielding
+                    # inside the lock is wrong (would block the reader for
+                    # the duration of the consumer's work), so we copy out
+                    # then yield.
                     with buf_lock:
                         items = list(latest_buf)
                         latest_buf.clear()
@@ -330,18 +298,17 @@ class RtspStream:
 
     def _open(self) -> None:
         log.info(
-            "stream: opening %s (ffmpeg_opts=%s, hwaccel=videotoolbox)",
+            "stream: opening %s (hwaccel=%s)",
             _redact_url(self._url),
-            "default" if self._ffmpeg_options is None else "custom",
+            _HWACCEL.device_type if _HWACCEL is not None else "software",
         )
-        opts = _parse_ffmpeg_options(self._ffmpeg_options)
         # timeout=(open_s, read_s). Bounded read timeout means the demux
         # loop will surface an error within ~5s of the camera disconnecting,
         # so reconnect kicks in quickly.
         container = av.open(
             self._url,
-            options=opts,
-            hwaccel=_VT_HWACCEL,
+            options=dict(_LIVE_OPTIONS),
+            hwaccel=_HWACCEL,
             timeout=(10.0, 5.0),
         )
         self._container = container
@@ -364,187 +331,83 @@ def _redact_url(url: str) -> str:
     return url
 
 
-class TimestampedFrameBuffer:
-    """Parallel high-res RTSP reader indexed by camera-side PTS.
+class StaticFrameStream:
+    """Dev/test source that loops a single JPEG at a fixed rate.
 
-    The main stream's ffmpeg buffer can deliver frames many seconds late
-    relative to the live event we want to correlate with. We use the
-    frame's PTS anchored to `time.monotonic()` at the first frame so each
-    buffered frame's `ts` reflects its true capture time. Callers look up
-    by ts directly — same time domain as `Frame.ts` from RtspStream, so a
-    trigger event's t_a/t_b can be passed straight in.
-
-    The PTS counter is stream-relative (resets on each RTSP session
-    open), so this stream's anchor is independent of the sub-stream's.
-    Pure-PTS matching across the two sessions assumes the camera stamps
-    PTS from a shared internal video clock, so two near-simultaneous
-    session opens produce offsets that cancel — empirically correct for
-    Reolink E1; if it ever drifts, swap to OCR-driven sync.
-
-    Frames are sub-sampled by interval (`sample_interval_s`, default
-    0.25s); the buffer evicts entries older than `max_age_s`.
+    Same shape as `RtspStream` (frames() iterator, stop(), session_epoch),
+    so the capture worker can swap one for the other without caring which.
+    No reader thread, no reconnect — just a sleep loop emitting copies of
+    the loaded image with monotonic `ts` values that advance at `fps`.
     """
 
     def __init__(
         self,
-        url: str,
-        max_age_s: float = 30.0,
-        sample_interval_s: float = 0.25,
-        name: str = "ts-stream",
+        path: str | Path,
+        fps: float = 20.0,
+        log_label: str = "static",
         metrics: "MetricsCollector | None" = None,
     ) -> None:
-        # Open the main stream WITHOUT live-capture's nobuffer/low_delay
-        # flags. Empirically (scripts/probe_main_gaps.py), ffmpeg with
-        # nobuffer flags handles main-stream H.264 by waiting for an IDR
-        # then batch-decoding the queued P/B frames and surfacing only the
-        # latest — leaving multi-second gaps in the fr.ts values our buffer
-        # actually receives. Removing the flags has ffmpeg keep the
-        # decoded-frame backlog so the demuxer drains it one packet at a
-        # time. The upgrader is async w.r.t. the live trigger, so the
-        # extra latency this adds is acceptable.
-        self._stream = RtspStream(
-            url,
-            ffmpeg_options="rtsp_transport;tcp",
-            bufsize=None,
-            log_label="main",
-            metrics=metrics,
-            # Generous queue to absorb worst-case ffmpeg post-keyframe
-            # bursts. Observed: ~35s of camera-time delivered in ~5
-            # wallclock seconds → 140 frames at 4fps. 200 leaves
-            # headroom in case a longer stall happens. Memory peak per
-            # frame at 2048x1536 is ~9.4MB, but the consumer drains
-            # ~1000× faster than the reader fills, so peak occupancy
-            # stays in the single digits except during a burst.
-            queue_size=200,
-        )
-        self._max_age = float(max_age_s)
-        self._sample_interval = float(sample_interval_s)
-        self._name = name
+        self._path = Path(path)
+        if not self._path.exists():
+            raise FileNotFoundError(f"static frame source not found: {self._path}")
+        img = cv2.imread(str(self._path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"cv2 failed to decode static frame: {self._path}")
+        self._image = img
+        self._interval = 1.0 / float(fps)
+        self._log_label = log_label
         self._metrics = metrics
-        self._lock = threading.Lock()
-        # Sorted-by-insertion list of (ts, epoch, frame). Sample interval is
-        # uniform-ish so insertion order matches ts order; we don't bisect.
-        # Epoch is stored per-frame because RTSP reconnect resets the ts
-        # anchor, so a cached cross-stream offset is only valid against
-        # frames from the same epoch.
-        self._frames: list[tuple[float, int, np.ndarray]] = []
-        self._latest_ts: float = 0.0
-        self._latest_epoch: int = 0
-        self._thread: threading.Thread | None = None
-        self._stop_evt = threading.Event()
-        self._last_sample_t: float = 0.0
+        self._stop = False
+        self._session_epoch = 1
 
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
-        self._thread.start()
+    @property
+    def session_epoch(self) -> int:
+        return self._session_epoch
 
     def stop(self) -> None:
-        self._stop_evt.set()
-        self._stream.stop()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        self._stop = True
 
-    def find_frame_at(
-        self, target_ts: float, tolerance_s: float = 1.5
-    ) -> "tuple[float, np.ndarray] | None":
-        """Return the (ts, frame) closest to `target_ts` within tolerance.
-
-        Only frames from the current (latest) epoch are considered — older
-        epochs hold ts values from a stale anchor and are not comparable.
-        """
-        with self._lock:
-            current_epoch = self._latest_epoch
-            best: tuple[float, float, np.ndarray] | None = None
-            for ts, epoch, frame in self._frames:
-                if epoch != current_epoch:
-                    continue
-                delta = abs(ts - target_ts)
-                if delta > tolerance_s:
-                    continue
-                if best is None or delta < best[0]:
-                    best = (delta, ts, frame)
-        if best is None:
-            return None
-        return (best[1], best[2])
-
-    def latest_indexed(self) -> "tuple[float, np.ndarray] | None":
-        """Most recent buffered frame (used for diagnostics)."""
-        with self._lock:
-            if not self._frames:
-                return None
-            ts, _epoch, frame = self._frames[-1]
-            return (ts, frame)
-
-    def current_epoch(self) -> int:
-        """Latest RTSP session epoch the buffer has seen, or 0 if empty."""
-        with self._lock:
-            return self._latest_epoch
-
-    def _run(self) -> None:
-        last_status_log = 0.0
-        n_sampled = 0
-        last_sampled_ts: float = -1e18  # so the first frame is always kept
-        for fr in self._stream.frames():
-            if self._stop_evt.is_set():
-                return
+    def frames(self) -> Iterator[Frame]:
+        log.info(
+            "static stream: looping %s (%dx%d) at %.1f fps",
+            self._path, self._image.shape[1], self._image.shape[0],
+            1.0 / self._interval,
+        )
+        seq = 0
+        next_t = time.monotonic()
+        last_arrival_mono: float | None = None
+        while not self._stop:
             now = time.monotonic()
-            # Sub-sample by *camera-time* (fr.ts) rather than monotonic.
-            # ffmpeg/RTSP buffer pumping delivers frames in bursts; sampling
-            # by monotonic skips most frames within a burst, leaving
-            # multi-second gaps in main_ts space exactly where lookups can
-            # land. Sampling by fr.ts guarantees ≤ sample_interval_s gaps
-            # in the buffer's ts coverage no matter how bursty delivery is.
-            if fr.ts - last_sampled_ts < self._sample_interval:
-                continue
-            last_sampled_ts = fr.ts
-            n_sampled += 1
-            with self._lock:
-                if fr.epoch != self._latest_epoch and self._latest_epoch != 0:
-                    log.info(
-                        "ts buffer: stream reconnected (epoch %d → %d); ts space reset",
-                        self._latest_epoch, fr.epoch,
-                    )
-                self._frames.append((fr.ts, fr.epoch, fr.image))
-                self._latest_ts = fr.ts
-                self._latest_epoch = fr.epoch
-                self._evict_locked(now)
+            if now < next_t:
+                time.sleep(next_t - now)
+            next_t += self._interval
+            seq += 1
+            ts = time.monotonic()
             if self._metrics is not None:
-                # `now - fr.ts` here is wallclock minus the buffer's most-
-                # recently indexed frame's PTS-anchored ts. When main is
-                # bursty this oscillates: lag accumulates between bursts and
-                # drops on each burst's arrival, which the chart will show
-                # as a sawtooth.
-                self._metrics.record_buffer_lag(now - fr.ts)
-            if now - last_status_log >= 10.0:
-                last_status_log = now
-                lag = now - fr.ts
-                log.info(
-                    "ts buffer: latest_ts=%.3f lag=%+.2fs n=%d sampled=%d epoch=%d",
-                    fr.ts, lag, len(self._frames), n_sampled, fr.epoch,
-                )
-                n_sampled = 0
+                self._metrics.record_frame(self._log_label)
+                if last_arrival_mono is not None:
+                    self._metrics.record_frame_gap(
+                        self._log_label, ts - last_arrival_mono,
+                    )
+                last_arrival_mono = ts
+            # copy() so a downstream consumer that mutates (e.g. annotation
+            # overlay) doesn't corrupt the source frame for the next iteration.
+            yield Frame(image=self._image.copy(), ts=ts, seq=seq, epoch=self._session_epoch)
 
-    def _evict_locked(self, now: float) -> None:
-        # Anchor eviction to the buffer's own latest ts rather than to
-        # monotonic-now. ffmpeg/RTSP delivers frames with a variable
-        # pipeline lag (anywhere from 1s to 15s observed); using
-        # monotonic-now as the cutoff causes the buffer's ts coverage to
-        # shrink dramatically during high-lag periods (because latest_ts
-        # is far behind monotonic-now, but eviction proceeds anyway,
-        # cutting into the older end of useful coverage). Anchoring to
-        # latest_ts gives stable "last N seconds of camera-time" coverage
-        # regardless of lag oscillation.
-        if not self._frames:
-            return
-        latest_ts = self._frames[-1][0]
-        cutoff = latest_ts - self._max_age
-        i = 0
-        for ts, _epoch, _frame in self._frames:
-            if ts >= cutoff:
-                break
-            i += 1
-        if i > 0:
-            del self._frames[:i]
+
+def open_frame_source(
+    cfg: "Config",
+    metrics: "MetricsCollector | None" = None,
+) -> "RtspStream | StaticFrameStream":
+    """Pick the live RTSP stream or a static-frame replacement based on cfg."""
+    if cfg.camera.static_frame_path:
+        return StaticFrameStream(
+            cfg.camera.static_frame_path,
+            log_label="main",
+            metrics=metrics,
+        )
+    return RtspStream(
+        cfg.camera.rtsp_url,
+        log_label="main",
+        metrics=metrics,
+    )

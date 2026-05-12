@@ -1,12 +1,12 @@
 """Always-on capture thread for the web UI.
 
 Single-stream mode: detection, tracking, crossings, preview, and clip
-recording all run from the configured RTSP path. The simplest design that
-works.
+recording all run from the configured RTSP path (the camera's main stream,
+2048x1536). YOLO sees the full frame and the recorder's thumbnail comes
+from whatever frame was current at the trigger moment — no async
+high-res upgrade path.
 
-If the camera is configured to use the sub stream (typically 640x480 at
-10fps), YOLO sees the full frame and detection is fast and aligned. The
-calibration ROI is applied as a post-detection filter on each track's
+The calibration ROI is applied as a post-detection filter on each track's
 ground point rather than as a pre-YOLO crop, because cropping a thin road
 belt and letterboxing it to 640x640 squashes cars to a few pixels tall
 and produces phantom detections on road texture.
@@ -22,8 +22,22 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+from .capture import open_frame_source
+from .config import Config
+from .db import Database
+from .detect import Detector, Track
+from .grid_crossing import GridCrossingDetector
+from .homography import Homography
+from .preview import PreviewBuffer
+from .recorder import ClipRecorder
+
+if TYPE_CHECKING:
+    from .capture import RtspStream, StaticFrameStream
+    from .metrics import MetricsCollector
 
 _MPH_PER_MPS = 2.2369362920544
 _FT_TO_M = 0.3048
@@ -137,27 +151,6 @@ def _in_grid(X: float, Y: float) -> bool:
     return (_GRID_X_MIN - _GRID_TOLERANCE_M <= X <= _GRID_X_MAX + _GRID_TOLERANCE_M
             and _GRID_Y_MIN - _GRID_TOLERANCE_M <= Y <= _GRID_Y_MAX + _GRID_TOLERANCE_M)
 
-from typing import TYPE_CHECKING
-
-from .capture import RtspStream
-from .config import Config
-from .db import Database
-from .detect import Detector, Track
-from .digit_matcher import DigitMatcher
-from .grid_crossing import GridCrossingDetector
-from .homography import Homography
-from .preview import PreviewBuffer
-from .recorder import ClipRecorder
-from .thumb_upgrader import ThumbUpgrader
-
-if TYPE_CHECKING:
-    from .metrics import MetricsCollector
-
-# OSD pixel rectangle on the Reolink E1 sub stream (640x480) with the OSD
-# at the bottom of the frame. Used only for the one-time per-epoch sub-
-# stream drift calibration.
-_OSD_REGION_SUB = (175, 452, 500, 477)
-
 log = logging.getLogger(__name__)
 
 
@@ -241,34 +234,13 @@ class CaptureWorker(threading.Thread):
         self._profile = bool(profile)
         self._metrics = metrics
         self._stop_evt = threading.Event()
-        self._stream: RtspStream | None = None
+        self._stream: "RtspStream | StaticFrameStream | None" = None
         self._error: BaseException | None = None
         self._recorder: ClipRecorder | None = None
-        self._upgrader: ThumbUpgrader | None = None
         # Night-mode state, written by the capture loop and read by request
         # handlers (e.g., the live status badge endpoint). Booleans are
         # atomic in CPython, so no lock is needed.
         self._night_mode: bool = False
-        # Sub-stream drift calibration state. drift_sub = sub_ts(T) - wallclock_unix(T)
-        # for any camera-instant T; constant within an RTSP session, but
-        # invalidates on reconnect. We learn it by OCR'ing live sub frames
-        # until we observe an OSD second-tick (consecutive frames with
-        # different OSD seconds), at which point the tick's camera-instant
-        # is known to ~half-a-frame-interval precision (~33ms at 15fps).
-        self._drift_sub: float | None = None
-        self._drift_sub_epoch: int = -1
-        # Sliding history of recent (sub_ts, OSD_dt) for tick detection.
-        # Cleared once drift_sub is established for the current epoch.
-        self._sub_ocr_history: list[tuple[float, datetime]] = []
-        try:
-            self._sub_matcher: DigitMatcher | None = DigitMatcher("templates/sub")
-        except (FileNotFoundError, ValueError) as e:
-            log.warning(
-                "sub-stream DigitMatcher disabled (%s); drift_sub will not "
-                "be calibrated and the upgrader's offset will retain its "
-                "datetime.now()-based pipeline-lag bias", e,
-            )
-            self._sub_matcher = None
         # Homography-based parallel speed measurement. Loaded from
         # config/homography.yaml; if missing, the parallel speed is silently
         # skipped (the existing 2-line method continues unaffected).
@@ -332,67 +304,6 @@ class CaptureWorker(threading.Thread):
         self._stop_evt.set()
         if self._stream is not None:
             self._stream.stop()
-        if self._upgrader is not None:
-            self._upgrader.stop()
-
-    def _maybe_calibrate_sub_drift(self, fr) -> None:
-        """OCR the current sub-stream frame's OSD; if we observe an OSD
-        second-tick relative to the prior OCR'd frame, derive `drift_sub`
-        from the tick midpoint and cache it for this epoch.
-
-        The history list is reset on epoch change (RTSP reconnect) since
-        the new session has a fresh PTS anchor."""
-        if self._drift_sub_epoch != fr.epoch:
-            self._sub_ocr_history = []
-            self._drift_sub_epoch = fr.epoch
-            self._drift_sub = None
-            self._sub_calibration_attempts = 0
-            self._sub_calibration_failures = 0
-        assert self._sub_matcher is not None  # checked by caller
-        self._sub_calibration_attempts = getattr(
-            self, "_sub_calibration_attempts", 0
-        ) + 1
-        dt = self._sub_matcher.read_timestamp(fr.image, _OSD_REGION_SUB)
-        if dt is None:
-            self._sub_calibration_failures = getattr(
-                self, "_sub_calibration_failures", 0
-            ) + 1
-            # Log rate periodically so we know if OCR is broken on this stream.
-            if self._sub_calibration_attempts in (10, 30, 100, 300):
-                log.info(
-                    "sub-stream OCR: %d/%d failures so far during drift "
-                    "calibration on epoch %d",
-                    self._sub_calibration_failures,
-                    self._sub_calibration_attempts, fr.epoch,
-                )
-            return
-        # Sanity: reject any datetime far from now (template matcher does
-        # occasionally pick up junk on heavily occluded crops).
-        from datetime import datetime as _dt, timedelta as _td
-        if abs(dt - _dt.now()) > _td(seconds=60):
-            return
-        self._sub_ocr_history.append((fr.ts, dt))
-        # Keep memory bounded; we only need the most recent ~30 samples.
-        if len(self._sub_ocr_history) > 30:
-            self._sub_ocr_history.pop(0)
-        if len(self._sub_ocr_history) < 2:
-            return
-        ts_old, dt_old = self._sub_ocr_history[-2]
-        ts_new, dt_new = self._sub_ocr_history[-1]
-        delta_seconds = (dt_new - dt_old).total_seconds()
-        if delta_seconds != 1.0:
-            return
-        tick_sub_ts = (ts_old + ts_new) / 2.0
-        tick_wallclock_unix = dt_new.timestamp()
-        self._drift_sub = tick_sub_ts - tick_wallclock_unix
-        self._sub_ocr_history = []  # done; free the memory
-        log.info(
-            "sub-stream drift_sub=%+.3fs (epoch %d) from tick %s→%s "
-            "(ts_old=%.3f ts_new=%.3f gap=%.3fs)",
-            self._drift_sub, fr.epoch,
-            dt_old.strftime("%H:%M:%S"), dt_new.strftime("%H:%M:%S"),
-            ts_old, ts_new, ts_new - ts_old,
-        )
 
     def _save_pass_trajectory_jsonl(
         self,
@@ -559,21 +470,7 @@ class CaptureWorker(threading.Thread):
             )
             self._preview.set_show_grid(self._cfg.preview_show_grid)
 
-        # Optional: parallel high-res stream for thumbnail upgrades.
-        # Indexing is purely PTS-anchored monotonic now; no OCR region needed.
-        thumb_url = self._cfg.camera.rtsp_url_thumb
-        if thumb_url:
-            self._upgrader = ThumbUpgrader(
-                rtsp_url=thumb_url,
-                model=self._cfg.model,
-                db=self._db,
-                metrics=self._metrics,
-            )
-            self._upgrader.start()
-
-        self._stream = RtspStream(
-            self._cfg.camera.rtsp_url, log_label="sub", metrics=self._metrics,
-        )
+        self._stream = open_frame_source(self._cfg, metrics=self._metrics)
         last_purge = time.monotonic()
         purge_interval_s = 3600.0  # check retention once an hour
         prof = _StageTimer() if self._profile else None
@@ -675,17 +572,6 @@ class CaptureWorker(threading.Thread):
                     # how far behind realtime this frame is at the consumer.
                     self._metrics.record_lag(time.monotonic() - fr.ts)
                     self._metrics.record_frame("yolo")
-
-                # Sub-stream drift calibration (runs only when drift_sub is
-                # missing for the current epoch; once we observe an OSD-tick
-                # we cache the result and stop OCR'ing). OCR cost: ~10-20ms
-                # per frame via DigitMatcher; only active during the few
-                # frames it takes to span an OSD-tick (~1-2s after each
-                # session start).
-                if self._sub_matcher is not None and (
-                    self._drift_sub is None or self._drift_sub_epoch != fr.epoch
-                ):
-                    self._maybe_calibrate_sub_drift(fr)
 
                 # Night-mode gate. The Reolink E1 switches to monochrome IR
                 # in low light, where speed measurements are unreliable
@@ -871,103 +757,6 @@ class CaptureWorker(threading.Thread):
                             self._cfg.clip_capture_min_mph,
                             self._cfg.clip_capture_max_mph,
                         )
-                    # Capture sub-stream context for the optional thumbnail
-                    # upgrade. Done before trigger() so the closure below
-                    # binds to these specific values.
-                    sub_h, sub_w = fr.image.shape[:2]
-                    upgrader = self._upgrader
-                    cls_name_for_upgrade = ev.cls_name
-
-                    # Pick the upgrade target temporally (target_ts) and
-                    # spatially (upgrade_bbox). Two strategies, chosen per
-                    # pass:
-                    #   1. (default) **Midpoint of the in-grid trajectory**.
-                    #      The midpoint is most likely to be in an
-                    #      unoccluded portion of the road and is far from
-                    #      grid-edge bbox-jitter. Both target_ts and the
-                    #      bbox come from the *same* frame, so the high-
-                    #      res match's crop region is temporally aligned
-                    #      with where the car actually is.
-                    #   2. **Skip the upgrade entirely** if the trajectory
-                    #      was visibly truncated — the track was lost
-                    #      well short of any grid Y boundary, almost
-                    #      always because of an occluder (a parked car at
-                    #      the south curb is the canonical case). In that
-                    #      situation the high-res match would land on the
-                    #      occluder rather than the moving car. Better to
-                    #      keep the sub-stream thumbnail in place.
-                    midpoint_ts: float | None = None
-                    midpoint_bbox: tuple[float, float, float, float] | None = None
-                    truncated = False
-                    last_in_grid_Y: float = 0.0
-                    if self._homog is not None and traj_for_speed:
-                        in_grid_idx: list[int] = []
-                        for i, (_ts, u, v, _bb) in enumerate(traj_for_speed):
-                            X, Y = self._homog.project(u, v)
-                            if _in_grid(X, Y):
-                                in_grid_idx.append(i)
-                                last_in_grid_Y = Y
-                        if in_grid_idx:
-                            mid_pos = len(in_grid_idx) // 2
-                            mid_i = in_grid_idx[mid_pos]
-                            mid_ts, _, _, mid_bb = traj_for_speed[mid_i]
-                            midpoint_ts = float(mid_ts)
-                            midpoint_bbox = mid_bb
-                            # Truncation: did the last in-grid sample reach
-                            # a grid Y boundary? Boundary is ±7.62 m; well
-                            # short of either side (here, |Y| < 6 m) means
-                            # the track ended in mid-grid, almost certainly
-                            # because of occlusion.
-                            if abs(last_in_grid_Y) < 6.0:
-                                truncated = True
-
-                    target_ts = midpoint_ts if midpoint_ts is not None else (ev.t_b - 0.3)
-                    upgrade_bbox = midpoint_bbox if midpoint_bbox is not None else ev.bbox
-                    target_wallclock = captured_at
-                    target_sub_epoch = fr.epoch
-                    if truncated:
-                        log.info(
-                            "track %d: trajectory truncated at Y=%.2f (likely occluded); "
-                            "skipping high-res thumb upgrade",
-                            ev.track_id, last_in_grid_Y,
-                        )
-
-                    # pass_id isn't known until insert_pass below, but
-                    # on_finalize fires later (after the recorder's post-roll
-                    # completes), so we plumb the pid in via a holder list
-                    # that gets populated immediately after insert_pass.
-                    pid_holder: list[int | None] = [None]
-                    on_finalize = None
-                    if upgrader is not None and upgrade_bbox is not None and not truncated:
-                        thumb_path_pending = str(self._recordings_dir / (clip_name[:-4] + ".jpg"))
-
-                        def on_finalize(
-                            _path=thumb_path_pending,
-                            _cls=cls_name_for_upgrade,
-                            _bbox=upgrade_bbox,
-                            _size=(sub_w, sub_h),
-                            _up=upgrader,
-                            _ts=target_ts,
-                            _wc=target_wallclock,
-                            _ep=target_sub_epoch,
-                            _drift_sub=self._drift_sub,
-                            _holder=pid_holder,
-                        ) -> None:
-                            pid = _holder[0]
-                            if pid is None:
-                                return
-                            _up.enqueue(
-                                pass_id=pid,
-                                thumb_path=_path,
-                                focus_cls_name=_cls,
-                                sub_bbox=_bbox,
-                                sub_frame_size=_size,
-                                target_ts=_ts,
-                                target_wallclock=_wc,
-                                sub_epoch=_ep,
-                                drift_sub_override=_drift_sub,
-                            )
-
                     clip_path = recorder.trigger(
                         name=clip_name,
                         focus_track_id=ev.track_id,
@@ -977,7 +766,6 @@ class CaptureWorker(threading.Thread):
                         t_b=ev.t_b,
                         speed_mph=speed_mph,
                         record_video=in_range,
-                        on_finalize=on_finalize,
                     )
                     # We always set clip_path (the .mp4 base name) so the
                     # thumbnail can be located by stripping ".mp4" → ".jpg".
@@ -993,7 +781,6 @@ class CaptureWorker(threading.Thread):
                         speed_mph=speed_mph,
                         speed_method=speed_method,
                     )
-                    pid_holder[0] = pid
                     if speed_mph is not None:
                         method_a_str = (
                             f"{method_a_mph:.2f}" if method_a_mph == method_a_mph else "—"

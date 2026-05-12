@@ -44,7 +44,7 @@ from camwatch.config import load_config  # noqa: E402
 
 def main() -> int:
     cfg = load_config()
-    url = cfg.camera.rtsp_url_thumb
+    url = cfg.camera.rtsp_url
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         print("could not open")

@@ -112,9 +112,9 @@ class MetricsCollector:
             b.queue_depths.setdefault(label, []).append(int(depth))
 
     def record_buffer_lag(self, dt_s: float) -> None:
-        """How far behind realtime the TimestampedFrameBuffer's most-recently
-        indexed main-stream frame is. Sawtooth pattern here = main is
-        delivering in bursts; sustained climb = main has stalled entirely."""
+        """Legacy: was written by the dual-stream main-stream buffer (now
+        removed). The field stays so historical rows still chart; no caller
+        writes to it post-single-stream migration."""
         with self._lock:
             b = self._bucket()
             b.buffer_lag_ms.append(dt_s * 1000.0)
