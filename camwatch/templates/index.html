@@ -1233,16 +1233,10 @@
       ["lag_ms_p95", "lag p95 (ms)", "#e15759", "left", null],   // red
     ];
     const METRICS_QUEUE = [
-      ["queue_depth_sub",  "queue depth sub",  "#7ed957", "left", null],   // green
-      ["queue_depth_main", "queue depth main", "#ff8a3d", "left", null],   // orange
-    ];
-    const METRICS_BUFFER = [
-      ["buffer_lag_ms_p50", "buffer lag p50 (ms)", "#4a90e2", "left", null],   // blue
-      ["buffer_lag_ms_p95", "buffer lag p95 (ms)", "#e15759", "left", null],   // red
+      ["queue_depth_main", "queue depth", "#ff8a3d", "left", null],   // orange
     ];
     const METRICS_GAP = [
-      ["frame_gap_ms_max_sub",  "max gap sub (ms)",  "#4a90e2", "left", null],   // blue
-      ["frame_gap_ms_max_main", "max gap main (ms)", "#ff8a3d", "left", null],   // orange
+      ["frame_gap_ms_max_main", "max frame gap (ms)", "#ff8a3d", "left", null],   // orange
     ];
     let metricsPollTimer = null;
     let metricsLastData = null;
@@ -1304,7 +1298,6 @@
       drawMetricsChart("metrics-chart-yolo",   "metrics-legend-yolo",   METRICS_YOLO);
       drawMetricsChart("metrics-chart-lag",    "metrics-legend-lag",    METRICS_LAG);
       drawMetricsChart("metrics-chart-queue",  "metrics-legend-queue",  METRICS_QUEUE);
-      drawMetricsChart("metrics-chart-buffer", "metrics-legend-buffer", METRICS_BUFFER);
       drawMetricsChart("metrics-chart-gap",    "metrics-legend-gap",    METRICS_GAP);
     }
 

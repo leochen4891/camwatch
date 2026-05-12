@@ -1,9 +1,11 @@
 """RTSP frame source with hardware-accelerated decode and reconnect.
 
-The Reolink E1 camera produces main-stream frames at ~20fps; the YOLO+tracker
-consumer on the 3060 Ti runs comfortably above that, so we want freshness over
-completeness. Three layers of mitigation keep end-to-end latency close to the
-camera's frame interval:
+The Reolink E1 camera produces main-stream frames at ~15-20fps; the YOLO+
+tracker consumer on the 3060 Ti runs faster than the source on average
+(yolo_track p50 ≈ 35ms vs frame interval ≈ 67ms at 15fps). Goal: process
+every decoded frame rather than dropping any, so clips have full motion
+detail and the speed regression has every available sample. Three layers
+keep this working:
 
 1. Hardware decode via the platform's media engine. On macOS that's Apple's
    VideoToolbox; on Linux it's NVDEC via libav's `cuda` hwaccel. H.264 NAL
@@ -17,9 +19,14 @@ camera's frame interval:
    for reliability + `fflags=nobuffer`, `flags=low_delay` to surface
    frames as soon as they arrive instead of holding a multi-frame jitter
    buffer.
-3. A background reader thread continuously demuxes packets and decodes them
-   into a single-slot `deque(maxlen=1)` — older frames are silently
-   overwritten, so the consumer always sees the latest.
+3. A background reader thread continuously demuxes packets and decodes
+   them into a bounded FIFO (`deque(maxlen=queue_size)`). With the
+   default 150 (≈10s at 15fps, ~1.4 GB peak RAM at 2048×1536 BGR), a
+   typical Reolink burst-and-gap cycle is absorbed without dropping
+   anything — consumer drains the burst during the following gap. The
+   deque only evicts oldest-first when its capacity is exceeded, which
+   only happens during sustained backlog (GPU contention, system load
+   spike) — a real problem the warning log surfaces explicitly.
 """
 
 from __future__ import annotations
@@ -95,20 +102,38 @@ class RtspStream:
         max_consecutive_read_failures: int = 30,
         log_label: str = "stream",
         metrics: "MetricsCollector | None" = None,
+        # 150 frames ≈ 10s at 15fps, ~1.4 GB peak RAM at 2048×1536 BGR.
+        # Sized to absorb Reolink's burst-and-gap delivery pattern without
+        # frame loss given the 3060 Ti's headroom; if the queue ever fills
+        # up it means processing is genuinely behind, not just bursty —
+        # the warning log surfaces that.
+        queue_size: int = 150,
+        # Backlog-depth warning fires when drained depth stays above
+        # `warn_threshold * queue_size` for `warn_sustain_s` consecutive
+        # consumer cycles. Defaults: half the queue, sustained 5s. A
+        # backlog of 75 frames means we're 5s behind real-time — worth
+        # investigating before we lose anything.
+        warn_threshold: float = 0.5,
+        warn_sustain_s: float = 5.0,
     ) -> None:
+        if queue_size < 1:
+            raise ValueError("queue_size must be >= 1")
         self._url = url
         self._reconnect_delay_s = reconnect_delay_s
         self._max_failures = max_consecutive_read_failures
         self._stop = False
         # Lightweight diagnostic. Counts every successfully decoded frame at
         # the earliest possible point — the inner reader thread, before any
-        # of our consumer-side filtering / sampling / single-slot logic. If
-        # this counter ticks at the camera's nominal fps, no frames are
-        # being lost between the camera and our decoder; any apparent loss
-        # downstream is then in our wrapper code, not the network or codec.
+        # of our consumer-side filtering / sampling logic. If this counter
+        # ticks at the camera's nominal fps, no frames are being lost
+        # between the camera and our decoder; any apparent loss downstream
+        # is then in our wrapper code, not the network or codec.
         self._frames_read = 0
         self._log_label = log_label
         self._metrics = metrics
+        self._queue_size = int(queue_size)
+        self._warn_threshold_depth = max(1, int(queue_size * float(warn_threshold)))
+        self._warn_sustain_s = float(warn_sustain_s)
         # session_epoch increments on each reconnect (each new container).
         # Frames yielded from the same RTSP session share an epoch, and that
         # epoch is the validity scope of their ts space — PTS is re-anchored
@@ -147,10 +172,13 @@ class RtspStream:
             self._session_epoch += 1
             current_epoch = self._session_epoch
 
-            # Background reader writes into a single-slot deque — older
-            # frames are silently overwritten so the consumer always sees
-            # the latest. Consumer drains every queued frame on each cycle.
-            latest_buf: "deque[tuple[np.ndarray, float]]" = deque(maxlen=1)
+            # Background reader writes into a bounded FIFO deque. Under
+            # normal load it sits near-empty (consumer outpaces source).
+            # During Reolink's burst phases it grows by a few frames and
+            # drains during the following gap. Only sustained overflow
+            # (depth at maxlen) drops oldest frames — and `_check_backlog`
+            # below warns well before we reach that point.
+            latest_buf: "deque[tuple[np.ndarray, float]]" = deque(maxlen=self._queue_size)
             buf_lock = threading.Lock()
             new_frame_evt = threading.Event()
             reader_stop = threading.Event()
@@ -266,18 +294,43 @@ class RtspStream:
             reader_thread = threading.Thread(target=reader, name="rtsp-reader", daemon=True)
             reader_thread.start()
 
+            # Sustained-backlog detector. `over_since` holds the monotonic
+            # time at which the drained depth first crossed
+            # `_warn_threshold_depth` and has stayed there continuously.
+            # The warning fires once each time the sustain window is met,
+            # then resets — so a chronically-overloaded box keeps emitting
+            # at the cadence the warning condition itself defines.
+            over_since: float | None = None
             try:
                 while not self._stop:
-                    # Drain any frame the reader has queued. With the
-                    # single-slot deque this returns 0 or 1 items. Yielding
+                    # Drain everything the reader has queued. items is a
+                    # FIFO snapshot — under typical load len(items) is 1
+                    # or 2; during a Reolink burst it can be 3-5; only
+                    # under genuine backlog does it climb higher. Yielding
                     # inside the lock is wrong (would block the reader for
                     # the duration of the consumer's work), so we copy out
                     # then yield.
                     with buf_lock:
                         items = list(latest_buf)
                         latest_buf.clear()
+                    depth = len(items)
                     if self._metrics is not None:
-                        self._metrics.record_queue_depth(self._log_label, len(items))
+                        self._metrics.record_queue_depth(self._log_label, depth)
+                    now = time.monotonic()
+                    if depth >= self._warn_threshold_depth:
+                        if over_since is None:
+                            over_since = now
+                        elif now - over_since >= self._warn_sustain_s:
+                            log.warning(
+                                "stream %s: backlog depth=%d (>= %d) sustained for "
+                                "%.1fs — consumer is falling behind real-time; "
+                                "investigate GPU contention or system load",
+                                self._log_label, depth,
+                                self._warn_threshold_depth, now - over_since,
+                            )
+                            over_since = now  # rate-limit: re-warn after each sustain window
+                    else:
+                        over_since = None
                     if not items:
                         if not new_frame_evt.wait(timeout=2.0):
                             if not reader_thread.is_alive():

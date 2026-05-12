@@ -246,7 +246,19 @@ class ClipRecorder:
         """
         if not clip.frames or self._size is None:
             return
-        fps = int(round(self._fps))
+        # Encode fps from the clip's actual PTS span so playback matches real
+        # time. Hard-coding `self._fps` (defaulting to 10) made every clip
+        # play in slow motion on a 15 fps source — a holdover from when the
+        # capture worker ran against the sub stream and dropped frames
+        # through the single-slot deque, effectively producing ~10 fps. With
+        # the full-coverage main-stream pipeline that bias is gone, so we
+        # derive the rate from the frames in hand.
+        if len(clip.frames) >= 2:
+            span = clip.frames[-1].ts - clip.frames[0].ts
+            fps = int(round((len(clip.frames) - 1) / span)) if span > 0 else int(round(self._fps))
+            fps = max(1, fps)
+        else:
+            fps = int(round(self._fps))
         w, h = self._size
         tb = Fraction(1, fps)
         # `movflags=+faststart` rewrites the file at close so the moov atom
