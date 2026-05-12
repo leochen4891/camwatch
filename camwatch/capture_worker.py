@@ -398,7 +398,7 @@ class CaptureWorker(threading.Thread):
             "speed_method": speed_method,  # 'regression' | 'median_fallback' | None
             "speed_window_half_m": float(half_window_used_m),
             "n_frames": len(rows),
-            "frame_size_sub": list(self._homog.frame_size_sub),
+            "frame_size": list(self._homog.frame_size),
         }
 
         with open(out_path, "w") as f:

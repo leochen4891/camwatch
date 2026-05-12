@@ -597,7 +597,7 @@
       return `
         <div class="player-pkg" data-pass-id="${passId}">
           <div class="video-frame">
-            <video class="player-video" src="/passes/${passId}/clip" playsinline autoplay></video>
+            <video class="player-video" src="/passes/${passId}/clip" playsinline autoplay preload="auto"></video>
             <canvas class="grid-overlay"></canvas>
           </div>
           <div class="player-controls" onclick="event.stopPropagation()">
@@ -639,10 +639,40 @@
       video.addEventListener("pause", syncPP);
       video.addEventListener("ended", syncPP);
       let scrubbing = false;
+      // Coalesce video.currentTime writes during fast drag: Chrome will
+      // otherwise queue every input event's seek and only paint when the
+      // drag stops. One seek per requestAnimationFrame is enough — with
+      // all-intra encoding every frame is a keyframe, so fastSeek (when
+      // available) gives instant paint without quality loss.
+      let pendingSeek = null;
+      let seekScheduled = false;
+      function scheduleSeek(t) {
+        pendingSeek = t;
+        if (seekScheduled) return;
+        seekScheduled = true;
+        requestAnimationFrame(() => {
+          seekScheduled = false;
+          if (pendingSeek === null) return;
+          const target = pendingSeek;
+          pendingSeek = null;
+          if (typeof video.fastSeek === "function") {
+            video.fastSeek(target);
+          } else {
+            video.currentTime = target;
+          }
+        });
+      }
       scrub.addEventListener("input", () => {
         if (!isFinite(video.duration)) return;
         scrubbing = true;
-        video.currentTime = (scrub.value / 1000) * video.duration;
+        const t = (scrub.value / 1000) * video.duration;
+        scheduleSeek(t);
+        // Update the chart marker + time label directly from the slider —
+        // we can't rely on the video element's `timeupdate` here because
+        // browsers throttle it heavily during fast scrubbing, leaving the
+        // chart/label frozen until you release.
+        timeLbl.textContent = `${fmtTime(t)} / ${fmtTime(video.duration)}`;
+        renderChartMarker(t);
       });
       scrub.addEventListener("change", () => { scrubbing = false; });
       video.addEventListener("timeupdate", () => {
@@ -670,7 +700,7 @@
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, r.width, r.height);
         if (!homog) return;
-        const [Fw, Fh] = homog.frame_size_sub;  // 640, 480
+        const [Fw, Fh] = homog.frame_size;  // 2048, 1536
         const sx = r.width / Fw, sy = r.height / Fh;
         const H = homog.H;
         // Hinv via cofactors
@@ -813,11 +843,11 @@
           return;
         }
         const Vvals = samples.map(s => s.v_inst_mph);
-        // Use the sub-stream frame width as the X axis range so the dot's
+        // Use the main-stream frame width as the X axis range so the dot's
         // horizontal position on the chart corresponds directly to the car's
         // horizontal position in the video.
         const uMin = 0;
-        const uMax = (m.frame_size_sub && m.frame_size_sub[0]) || 640;
+        const uMax = (m.frame_size && m.frame_size[0]) || 2048;
         const vMin = 0;
         const vMax = Math.max(40, Math.ceil(Math.max(...Vvals) / 10) * 10 + 5);
         chartGeo = { samples, padL, padR, padT, padB, chW, chH,
@@ -993,7 +1023,7 @@
           + `speed=<b>${speedStr}</b>${methodStr} · `
           + `${m.n_frames} frames`;
       }
-      function renderChartMarker() {
+      function renderChartMarker(overrideVideoTime) {
         if (!chartGeo) return;
         // Re-draw whole chart then overlay marker (simpler than diff buffer)
         drawChart();
@@ -1013,9 +1043,13 @@
         // recorded at a fixed fps, e.g. 10), but trajectory ts/ct is in real
         // seconds (camera ran at ~14 fps). They don't match 1:1, so we scale
         // video time by (clipDur / video.duration) to recover real time.
+        // During scrubbing, the caller passes the slider-derived video time
+        // directly because the video element's currentTime hasn't caught up
+        // to the seek yet (browsers throttle seeks during fast drag).
         const vDur = video.duration;
         const scaleVT = (isFinite(vDur) && vDur > 0) ? (clipDur / vDur) : 1;
-        const t = video.currentTime * scaleVT;
+        const baseVT = (overrideVideoTime !== undefined) ? overrideVideoTime : video.currentTime;
+        const t = baseVT * scaleVT;
         let bestI = 0, bestD = Math.abs(samples[0].ct - t);
         for (let i = 1; i < samples.length; i++) {
           const d = Math.abs(samples[i].ct - t);

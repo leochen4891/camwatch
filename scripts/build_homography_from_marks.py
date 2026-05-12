@@ -18,10 +18,9 @@ Speed = |dY/dt| in this frame (the road runs along Y), independent of the
 assumed road width — the 5 ft east-curb spacing alone fixes the Y-axis
 scale.
 
-Pixel coords from the marking session are in main-stream space (2048x1536).
-The live capture worker runs on the sub-stream (640x480), same FOV / 4:3
-aspect / 3.2× linear scale, so we divide by 3.2 to get sub-stream pixel
-coords, then fit H mapping sub-stream pixels → meters.
+Pixel coords from the marking session are in main-stream space (2048x1536),
+which is also what the live capture worker now sees. H is fit directly
+against main-stream pixels → meters.
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ BACKUP_HOMOG = REPO / "config" / "homography.gps_v1.yaml"
 
 FT_TO_M = 0.3048
 SPACING_FT = 5.0
-MAIN_TO_SUB = 3.2  # 2048/640 = 1536/480
+FRAME_W, FRAME_H = 2048, 1536  # main-stream resolution H is fit against
 ROAD_WIDTH_FT = 30.0  # ~matches GPS-derived 30.1 ft; only affects X-axis, not speed
 
 
@@ -63,29 +62,20 @@ def main() -> None:
     pts = data["points"]
     if len(pts) != 13:
         raise SystemExit(f"expected 13 marked points, got {len(pts)}")
-    main_pixels: dict[int, tuple[int, int]] = {
-        int(p["idx"]): tuple(p["pixel"]) for p in pts
+    main_pixels: dict[int, tuple[float, float]] = {
+        int(p["idx"]): (float(p["pixel"][0]), float(p["pixel"][1])) for p in pts
     }
     if set(main_pixels.keys()) != set(range(1, 14)):
         raise SystemExit(f"expected indices 1..13, got {sorted(main_pixels.keys())}")
 
-    # Convert main-stream pixel coords → sub-stream pixel coords
-    sub_pixels = {
-        idx: (u / MAIN_TO_SUB, v / MAIN_TO_SUB)
-        for idx, (u, v) in main_pixels.items()
-    }
-
-    # Build the 22-anchor calibration set:
+    # Build the 13-anchor calibration set against main-stream pixels:
     #   - 4 corners (raw clicks): NE=1, SE=11, NW=12, SW=13
-    #   - 9 smoothed inner east-curb anchors: each is the projection of a
-    #     kernel-smoothed fraction onto the NE→SE pixel-space line.
-    #   - 9 derived inner west-curb anchors: at the same smoothed fraction
-    #     along the NW→SW pixel-space line.
-    NE = sub_pixels[1]
-    SE = sub_pixels[11]
-    NW = sub_pixels[12]
-    SW = sub_pixels[13]
-    inner_dots = [sub_pixels[i] for i in range(2, 11)]  # points 2..10
+    #   - 9 inner east-curb anchors at raw click positions.
+    NE = main_pixels[1]
+    SE = main_pixels[11]
+    NW = main_pixels[12]
+    SW = main_pixels[13]
+    inner_dots = [main_pixels[i] for i in range(2, 11)]  # points 2..10
 
     def frac_along(p: tuple[float, float]) -> float:
         vx = SE[0] - NE[0]
@@ -108,7 +98,7 @@ def main() -> None:
         ("NW (point 12)", 12, world_for(12)),
         ("SW (point 13)", 13, world_for(13)),
     ]:
-        src_anchors.append(sub_pixels[idx])
+        src_anchors.append(main_pixels[idx])
         dst_anchors.append(world_xy)
         anchor_labels.append(label)
 
@@ -119,7 +109,7 @@ def main() -> None:
     # rendered grid lines miss the dots. Trusting raw clicks puts each
     # grid line through the dot it represents.
     for idx, y_ft in zip(range(2, 11), inner_y_ft):
-        src_anchors.append(sub_pixels[idx])
+        src_anchors.append(main_pixels[idx])
         dst_anchors.append((0.0, y_ft * FT_TO_M))
         anchor_labels.append(f"east-curb @ Y={y_ft:+}ft (raw pt{idx})")
 
@@ -131,7 +121,7 @@ def main() -> None:
         raise SystemExit("findHomography returned None — check input geometry")
 
     # Reprojection diagnostics — show per-anchor residual
-    print(f"{'#':>3}  {'anchor':<38}  {'sub px':>16}  {'projected (m)':>20}  {'target (m)':>20}  {'err (m)':>8}")
+    print(f"{'#':>3}  {'anchor':<38}  {'main px':>16}  {'projected (m)':>20}  {'target (m)':>20}  {'err (m)':>8}")
     print("-" * 120)
     errors_m: list[float] = []
     for i in range(len(src_anchors)):
@@ -157,22 +147,16 @@ def main() -> None:
     payload = {
         "homography": {
             "H": H.tolist(),
-            "frame_size_sub": [640, 480],
-            "frame_size_main": [2048, 1536],
-            "main_to_sub_scale": MAIN_TO_SUB,
+            "frame_size": [FRAME_W, FRAME_H],
             "origin": "point 6 — east curb, camera's perpendicular",
             "axes": "+X = east (toward camera); +Y = along road toward point 1 (north-ish)",
             "road_width_ft": ROAD_WIDTH_FT,
             "spacing_ft": SPACING_FT,
-            "method": "13-anchor (4 corners + 9 raw east-curb clicks) least-squares fit",
+            "method": "13-anchor (4 corners + 9 raw east-curb clicks) least-squares fit, main-stream pixels",
             "max_reprojection_error_m": err_max,
             "mean_reprojection_error_m": err_mean,
-            "pixel_pts_sub": [
-                {"idx": i, "u": float(sub_pixels[i][0]), "v": float(sub_pixels[i][1])}
-                for i in range(1, 14)
-            ],
-            "pixel_pts_main": [
-                {"idx": i, "u": int(main_pixels[i][0]), "v": int(main_pixels[i][1])}
+            "pixel_pts": [
+                {"idx": i, "u": float(main_pixels[i][0]), "v": float(main_pixels[i][1])}
                 for i in range(1, 14)
             ],
             "meter_pts": [

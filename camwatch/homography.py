@@ -1,8 +1,8 @@
 """Homography-based pixel→ground-plane projection and trajectory speed.
 
 Loads the 3×3 matrix from `config/homography.yaml` (built by
-`scripts/build_homography_from_marks.py`). The matrix maps sub-stream
-pixel coordinates (640×480) to road-plane meters in a coordinate
+`scripts/build_homography_from_marks.py`). The matrix maps main-stream
+pixel coordinates (2048×1536) to road-plane meters in a coordinate
 system whose origin is at "point 6" (the east curb directly across
 from the camera) with +Y running along the road toward "point 1"
 (north-ish).
@@ -30,9 +30,9 @@ MPH_PER_MPS = 2.2369362920544
 
 @dataclass
 class Homography:
-    H: np.ndarray                # 3×3, sub-stream pixel → meters
+    H: np.ndarray                # 3×3, main-stream pixel → meters
     inv_H: np.ndarray            # for visualization / inverse projection
-    frame_size_sub: tuple[int, int]
+    frame_size: tuple[int, int]
     mean_reproj_err_m: float
     max_reproj_err_m: float
 
@@ -50,13 +50,13 @@ class Homography:
         return cls(
             H=H,
             inv_H=np.linalg.inv(H),
-            frame_size_sub=tuple(data.get("frame_size_sub", (640, 480))),
+            frame_size=tuple(data.get("frame_size", (2048, 1536))),
             mean_reproj_err_m=float(data.get("mean_reprojection_error_m", 0.0)),
             max_reproj_err_m=float(data.get("max_reprojection_error_m", 0.0)),
         )
 
     def project(self, u: float, v: float) -> tuple[float, float]:
-        """Sub-stream pixel (u, v) → road-plane meters (X, Y)."""
+        """Main-stream pixel (u, v) → road-plane meters (X, Y)."""
         p = self.H @ np.array([float(u), float(v), 1.0])
         return float(p[0] / p[2]), float(p[1] / p[2])
 

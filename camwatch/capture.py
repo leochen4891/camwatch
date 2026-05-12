@@ -55,8 +55,10 @@ _LIVE_OPTIONS: dict[str, str] = {
 }
 
 
-def _make_hwaccel() -> "av.codec.hwaccel.HWAccel | None":
-    """Pick the platform's hardware decoder. None means software decode.
+def _make_hwaccel() -> "tuple[av.codec.hwaccel.HWAccel | None, str]":
+    """Pick the platform's hardware decoder. Returns (HWAccel-or-None, name)
+    where name is just a label for logging — PyAV's HWAccel doesn't expose
+    its device_type as an attribute, so we keep it alongside.
 
     Falls back to software automatically if the requested backend isn't
     available in the linked libav build (`allow_software_fallback=True`).
@@ -65,16 +67,16 @@ def _make_hwaccel() -> "av.codec.hwaccel.HWAccel | None":
         return av.codec.hwaccel.HWAccel(
             device_type="videotoolbox",
             allow_software_fallback=True,
-        )
+        ), "videotoolbox"
     if sys.platform.startswith("linux"):
         return av.codec.hwaccel.HWAccel(
             device_type="cuda",
             allow_software_fallback=True,
-        )
-    return None
+        ), "cuda"
+    return None, "software"
 
 
-_HWACCEL = _make_hwaccel()
+_HWACCEL, _HWACCEL_NAME = _make_hwaccel()
 
 
 @dataclass
@@ -300,7 +302,7 @@ class RtspStream:
         log.info(
             "stream: opening %s (hwaccel=%s)",
             _redact_url(self._url),
-            _HWACCEL.device_type if _HWACCEL is not None else "software",
+            _HWACCEL_NAME,
         )
         # timeout=(open_s, read_s). Bounded read timeout means the demux
         # loop will surface an error within ~5s of the camera disconnecting,

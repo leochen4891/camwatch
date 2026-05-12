@@ -22,9 +22,11 @@ import collections
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import av
 import cv2
 import numpy as np
 
@@ -196,21 +198,27 @@ class ClipRecorder:
         # Always write the thumbnail; skip the .mp4 when the caller said so
         # (e.g., a pass outside the configured speed-capture range).
         if clip.record_video:
-            # Try H.264 (avc1) first; modern browsers play it natively. Fall back to
-            # MPEG-4 Part 2 (mp4v) if the OpenCV build doesn't ship libx264 — Chrome
-            # won't play those, but at least the file is on disk for ffplay/VLC.
-            fourcc = cv2.VideoWriter_fourcc(*"avc1")
-            writer = cv2.VideoWriter(clip.path, fourcc, self._fps, self._size)
-            if not writer.isOpened():
-                log.warning("avc1 fourcc not available, falling back to mp4v at %s", clip.path)
+            # H.264 via PyAV's libx264. We bypass cv2.VideoWriter because on
+            # Ubuntu the avc1 fourcc resolves to h264_v4l2m2m (a hardware
+            # encoder that isn't available on most boxes) and silently fails,
+            # leaving an unplayable mp4v fallback that browsers won't decode.
+            # PyAV is already a hard dep for RTSP decode; libx264 is shipped
+            # with the same FFmpeg build.
+            try:
+                self._write_clip_h264(clip)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "H.264 encode failed for %s (%s); falling back to mp4v",
+                    clip.path, e,
+                )
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(clip.path, fourcc, self._fps, self._size)
-            if not writer.isOpened():
-                log.warning("clip writer failed to open at %s", clip.path)
-            else:
-                for rec in clip.frames:
-                    writer.write(self._render(rec, clip))
-                writer.release()
+                if not writer.isOpened():
+                    log.warning("clip writer failed to open at %s", clip.path)
+                else:
+                    for rec in clip.frames:
+                        writer.write(self._render(rec, clip))
+                    writer.release()
         self._write_thumbnail(clip)
         log.debug(
             "clip closed: %s (%d frames, video=%s)",
@@ -221,6 +229,56 @@ class ClipRecorder:
                 clip.on_finalize()
             except Exception as e:  # noqa: BLE001
                 log.warning("clip on_finalize callback raised: %s", e)
+
+    def _write_clip_h264(self, clip: _ActiveClip) -> None:
+        """Encode the clip's frames as H.264/AVC in an MP4 container.
+
+        Uses libx264 (CPU) at preset=veryfast, crf=23 — fast enough that
+        a few-second clip finishes encoding in well under a second on this
+        hardware, and the output is browser-playable (which mp4v isn't).
+        Raises on any failure so the caller can fall back.
+
+        Sets stream.time_base = 1/fps and frame.pts = i explicitly. Letting
+        the encoder auto-assign PTS leaves them all at 0 (libx264 default
+        time_base is 1/10240, not 1/fps) — the resulting file's duration
+        metadata is 0.1s regardless of frame count, which makes browsers
+        stall on playback.
+        """
+        if not clip.frames or self._size is None:
+            return
+        fps = int(round(self._fps))
+        w, h = self._size
+        tb = Fraction(1, fps)
+        # `movflags=+faststart` rewrites the file at close so the moov atom
+        # lives at the front — needed for the browser to seek before the
+        # full file is downloaded.
+        container = av.open(clip.path, mode="w", options={"movflags": "+faststart"})
+        try:
+            stream = container.add_stream("libx264", rate=fps)
+            stream.width = w
+            stream.height = h
+            stream.pix_fmt = "yuv420p"
+            # All-intra: every frame is a keyframe (g=1, bf=0). The clip is
+            # only a few seconds long, so the size penalty is small and the
+            # scrubber becomes instantly responsive — every frame is its own
+            # seek point.
+            stream.options = {
+                "preset": "veryfast",
+                "crf": "23",
+                "g": "1",
+                "bf": "0",
+            }
+            for i, rec in enumerate(clip.frames):
+                img = self._render(rec, clip)
+                frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+                frame.pts = i
+                frame.time_base = tb
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        finally:
+            container.close()
 
     def _write_thumbnail(self, clip: _ActiveClip) -> None:
         """Save two JPEGs cropped tight to the focus car: a 320 px-wide

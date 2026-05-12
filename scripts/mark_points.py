@@ -45,8 +45,7 @@ FT_TO_M = 0.3048
 
 def overlay_grid_from_homography(img: np.ndarray) -> np.ndarray:
     """Draw the current homography's 5ft major grid + axes onto img (returned
-    as a copy). Sub-stream H is mapped back to main-stream pixels via the
-    saved scale factor. No marker dots — those are what the user is re-clicking."""
+    as a copy). H now maps main-stream pixels directly, so no scale factor."""
     import math
     if not HOMOG_YAML.exists():
         print(f"WARNING: {HOMOG_YAML} not found — no grid overlay")
@@ -54,7 +53,6 @@ def overlay_grid_from_homography(img: np.ndarray) -> np.ndarray:
     data = yaml.safe_load(HOMOG_YAML.read_text())["homography"]
     H = np.array(data["H"], dtype=np.float64)
     Hinv = np.linalg.inv(H)
-    scale = float(data["main_to_sub_scale"])
 
     out = img.copy()
 
@@ -62,8 +60,8 @@ def overlay_grid_from_homography(img: np.ndarray) -> np.ndarray:
         p = Hinv @ np.array([X, Y, 1.0])
         if abs(p[2]) < 1e-9:
             return None
-        u = p[0] / p[2] * scale
-        v = p[1] / p[2] * scale
+        u = p[0] / p[2]
+        v = p[1] / p[2]
         if not (math.isfinite(u) and math.isfinite(v)):
             return None
         return int(round(u)), int(round(v))

@@ -370,11 +370,10 @@ def make_app(
         data = yaml.safe_load(path.read_text())["homography"]
         return JSONResponse({
             "H": data["H"],
-            "frame_size_sub": data.get("frame_size_sub", [640, 480]),
-            "main_to_sub_scale": data.get("main_to_sub_scale", 3.2),
+            "frame_size": data.get("frame_size", [2048, 1536]),
             "spacing_ft": data.get("spacing_ft", 5.0),
             "road_width_ft": data.get("road_width_ft", 30.0),
-            "pixel_pts_sub": data.get("pixel_pts_sub", []),
+            "pixel_pts": data.get("pixel_pts", []),
             "meter_pts": data.get("meter_pts", []),
         })
 
@@ -400,7 +399,14 @@ def make_app(
         if latest is None:
             raise HTTPException(status_code=503, detail="preview not ready")
         _, jpeg = latest
-        return Response(content=jpeg, media_type="image/jpeg")
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            # Cloudflare aggressively caches image responses by default; without
+            # an explicit no-store the tunnel serves stale frames to external
+            # clients for hours while local consumers see the live feed.
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/preview/stream")
     async def get_preview_stream():
