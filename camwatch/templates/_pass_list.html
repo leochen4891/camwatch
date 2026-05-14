@@ -3,7 +3,7 @@
          hx-get="/passes"
          hx-trigger="change"
          hx-target="#pass-list"
-         hx-include="#filter-form, #histogram, #heatmap">
+         hx-include="#filter-form, #histogram, #heatmap, [name=page_size]">
   {% include "_histogram.html" %}
 </section>
 {% endif %}
@@ -12,7 +12,7 @@
          hx-get="/passes"
          hx-trigger="change"
          hx-target="#pass-list"
-         hx-include="#filter-form, #histogram, #heatmap">
+         hx-include="#filter-form, #histogram, #heatmap, [name=page_size]">
   {% include "_heatmap.html" %}
   <input type="hidden" name="time_mask" id="time-mask" value="{{ time_mask }}" form="filter-form">
   <input type="hidden" name="time_ref_date" id="time-ref-date" value="{{ time_ref_date }}" form="filter-form">
@@ -25,6 +25,15 @@
     {% if vehicle_model %}<strong>{{ vehicle_model }}</strong>{% endif %}
     {% if vehicle_color %}<span class="muted">({{ vehicle_color }})</span>{% endif %}
     <button type="button" class="chip-clear" onclick="clearVehicleFilter()" title="Clear vehicle filter">×</button>
+  </div>
+{% endif %}
+{% if pass_ids_active %}
+  <div class="vehicle-filter-chip">
+    Pass IDs: <strong>{{ pass_ids_active }}</strong>
+    {% if pass_ids_missing %}
+      <span class="muted">({{ pass_ids_missing | length }} not found: {{ pass_ids_missing | join(', ') }})</span>
+    {% endif %}
+    <button type="button" class="chip-clear" onclick="clearPassIdsFilter()" title="Clear pass-IDs filter">×</button>
   </div>
 {% endif %}
 {% if not rows %}
@@ -47,7 +56,7 @@
         {% endif %}
       </div>
       <label class="per-page">show
-        <select form="filter-form" name="page_size">
+        <select form="filter-form" name="page_size" onchange="onPageSizeChange()">
           {% for n in page_size_options %}
             <option value="{{ n }}" {% if n == page_size %}selected{% endif %}>{{ n }}</option>
           {% endfor %}

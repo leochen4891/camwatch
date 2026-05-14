@@ -7,12 +7,11 @@ every decoded frame rather than dropping any, so clips have full motion
 detail and the speed regression has every available sample. Three layers
 keep this working:
 
-1. Hardware decode via the platform's media engine. On macOS that's Apple's
-   VideoToolbox; on Linux it's NVDEC via libav's `cuda` hwaccel. H.264 NAL
-   units come off the RTSP socket and are handed straight to the GPU's
-   dedicated decode block, which produces frames at near-zero CPU cost. PyAV
-   does the YUV→BGR24 conversion via libswscale; that plus the surface
-   download is a few percent of one core, vs ~40% for full software decode.
+1. Hardware decode via NVDEC (libav's `cuda` hwaccel). H.264 NAL units come
+   off the RTSP socket and are handed straight to the GPU's dedicated decode
+   block, which produces frames at near-zero CPU cost. PyAV does the
+   YUV→BGR24 conversion via libswscale; that plus the surface download is a
+   few percent of one core, vs ~40% for full software decode.
    `allow_software_fallback=True` on every config means a missing hwaccel
    silently degrades to software instead of crashing.
 2. Low-latency demux flags via av.open() options — `rtsp_transport=tcp`

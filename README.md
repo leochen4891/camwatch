@@ -44,7 +44,7 @@ cp config/config.example.yaml config/config.yaml
 uv run python scripts/test_stream.py      # smoke test: ~10-25 fps to /tmp/
 ```
 
-Prerequisites: a Reolink camera with RTSP enabled, Python 3.12, and a GPU for inference. Currently tested on Linux + NVIDIA (CUDA, RTX 3060) and on macOS Apple Silicon (MPS). `device: auto` picks the right backend at startup.
+Prerequisites: a Reolink camera with RTSP enabled, Python 3.12, and an NVIDIA GPU for inference. Currently tested on Linux + CUDA on an RTX 3060. `device: auto` resolves to CUDA at startup, with CPU as a fallback for non-GPU dev boxes.
 
 ## Calibration
 
@@ -144,7 +144,7 @@ preview:       { show_grid: true }
 capture:       { pause_at_night: true }
 ```
 
-`device: auto` probes for CUDA, then MPS, then CPU. `static_frame_path` (optional) loops a JPEG instead of opening RTSP, useful for dev/test when the live camera is in use elsewhere.
+`device: auto` probes for CUDA, then falls back to CPU. `static_frame_path` (optional) loops a JPEG instead of opening RTSP, useful for dev/test when the live camera is in use elsewhere.
 
 Most are also editable in-app. Camera credentials in `.env` (`REOLINK_USER`, `REOLINK_PASS`).
 

@@ -484,53 +484,65 @@ class CaptureWorker(threading.Thread):
                 if self._stop_evt.is_set():
                     break
 
-                # Periodic retention sweep — two phases:
-                #   1. Recordings older than recordings_days: delete clip + thumbs, NULL clip_path
-                #   2. Pass rows older than passes_days: hard-delete row + per-pass jsonl
+                # Periodic retention sweep — three phases:
+                #   1. clips_days: delete .mp4 only (thumbnail stays, DB row stays)
+                #   2. thumbs_days: delete .jpg (archive alarm thumbs), NULL clip_path
+                #   3. passes_days: hard-delete row + per-pass jsonl
                 if time.monotonic() - last_purge > purge_interval_s:
                     last_purge = time.monotonic()
                     events_dir = self._cfg.events_dir
+                    threshold_mph = float(self._cfg.alert_threshold_mph)
+                    archive_dir = Path("recordings_archive")
 
-                    days_recordings = int(self._cfg.recordings_days or 0)
-                    if days_recordings > 0:
-                        rec_items = self._db.purge_recordings_older_than(days_recordings)
-                        threshold_mph = float(self._cfg.alert_threshold_mph)
-                        archive_dir = Path("recordings_archive")
-                        if rec_items:
+                    days_clips = int(self._cfg.clips_days or 0)
+                    if days_clips > 0:
+                        clip_items = self._db.passes_with_clip_older_than(days_clips)
+                        removed_clips = 0
+                        for _pid, cp, _speed in clip_items:
+                            if Path(cp).exists():
+                                try:
+                                    Path(cp).unlink(missing_ok=True)
+                                    removed_clips += 1
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("clip cleanup: %s: %s", cp, e)
+                        if removed_clips:
+                            log.info(
+                                "retention: removed %d .mp4 files (clips_days=%d)",
+                                removed_clips, days_clips,
+                            )
+
+                    days_thumbs = int(self._cfg.thumbs_days or 0)
+                    if days_thumbs > 0:
+                        thumb_items = self._db.purge_thumbs_older_than(days_thumbs)
+                        if thumb_items:
                             archive_dir.mkdir(parents=True, exist_ok=True)
                         archived = 0
                         deleted = 0
-                        for pid, cp, speed in rec_items:
-                            base = cp[:-4]
-                            thumb_small = base + ".jpg"
-                            thumb_big = base + "_big.jpg"
+                        for _pid, cp, speed in thumb_items:
+                            thumb = cp[:-4] + ".jpg" if cp.endswith(".mp4") else cp + ".jpg"
+                            # Belt-and-braces: nuke the .mp4 if it survived phase 1.
+                            try:
+                                Path(cp).unlink(missing_ok=True)
+                            except Exception as e:  # noqa: BLE001
+                                log.debug("late clip cleanup: %s: %s", cp, e)
                             if speed is not None and speed >= threshold_mph:
-                                # Alarm pass: rescue thumbnails only; delete the .mp4.
-                                # Per-pass jsonl follows the standard passes-sweep flow.
-                                for src in (thumb_small, thumb_big):
-                                    if Path(src).exists():
-                                        try:
-                                            shutil.move(src, archive_dir / Path(src).name)
-                                        except Exception as e:  # noqa: BLE001
-                                            log.debug("archive move %s: %s", src, e)
-                                try:
-                                    Path(cp).unlink(missing_ok=True)
-                                except Exception as e:  # noqa: BLE001
-                                    log.debug("recordings cleanup (alarm clip): %s: %s", cp, e)
-                                archived += 1
-                            else:
-                                # Non-alarm: delete clip + thumbs (jsonl stays for passes-sweep)
-                                for path in (cp, thumb_small, thumb_big):
+                                if Path(thumb).exists():
                                     try:
-                                        Path(path).unlink(missing_ok=True)
+                                        shutil.move(thumb, archive_dir / Path(thumb).name)
+                                        archived += 1
                                     except Exception as e:  # noqa: BLE001
-                                        log.debug("recordings cleanup: %s: %s", path, e)
-                                deleted += 1
+                                        log.debug("archive move %s: %s", thumb, e)
+                            else:
+                                try:
+                                    Path(thumb).unlink(missing_ok=True)
+                                    deleted += 1
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("thumb cleanup: %s: %s", thumb, e)
                         if archived or deleted:
                             log.info(
-                                "retention: %d alarm passes archived, %d non-alarm cleaned "
-                                "(recordings_days=%d, threshold=%.1f mph)",
-                                archived, deleted, days_recordings, threshold_mph,
+                                "retention: %d alarm thumbs archived, %d non-alarm deleted "
+                                "(thumbs_days=%d, threshold=%.1f mph)",
+                                archived, deleted, days_thumbs, threshold_mph,
                             )
 
                     # Metrics retention: hardcoded 7-day cap. ~120k rows max,
@@ -547,7 +559,6 @@ class CaptureWorker(threading.Thread):
                             if cp:
                                 paths_to_unlink.append(cp)
                                 paths_to_unlink.append(cp[:-4] + ".jpg")
-                                paths_to_unlink.append(cp[:-4] + "_big.jpg")
                             paths_to_unlink.append(str(events_dir / f"pass_{pid}.jsonl"))
                             for path in paths_to_unlink:
                                 try:

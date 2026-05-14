@@ -20,9 +20,8 @@ class CameraConfig:
     user: str
     password: str
     # When set, the capture worker reads frames from this JPEG (looped at the
-    # camera's nominal rate) instead of opening RTSP. Used for dev/test on
-    # Ubuntu while the Mac is still serving live and the Reolink E1 can't
-    # share its main stream with two clients.
+    # camera's nominal rate) instead of opening RTSP. Used for dev/test when
+    # the real camera isn't available or shouldn't be contended with.
     static_frame_path: str | None = None
 
     @property
@@ -76,8 +75,12 @@ class Config:
     events_dir: Path
     calibration_path: Path
     max_track_age_s: float
-    recordings_days: int = 0  # 0 = no auto-delete; controls clip/thumb deletion (sets clip_path=NULL)
-    passes_days: int = 0  # 0 = no auto-delete; controls DB row + per-pass jsonl hard-deletion
+    # Three-phase retention. Set any to 0 to disable that phase.
+    # Typical layout: clips_days < thumbs_days < passes_days.
+    clips_days: int = 14   # delete .mp4 only; the thumb + DB row survive
+    thumbs_days: int = 90  # delete .jpg too; NULLs clip_path so the UI hides playback affordances
+    passes_days: int = 365 # hard-delete the DB row + per-pass jsonl
+    heatmap_days: int = 8  # trailing window for the activity heatmap (max 14)
     clip_margin_s: float = 0.5  # pre/post-roll padding around the crossing window
     clip_capture_min_mph: float = 0.0  # passes below this speed are logged but skip clip
     clip_capture_max_mph: float = 999.0  # passes above this speed are logged but skip clip
@@ -108,10 +111,9 @@ class Config:
 def _resolve_device(requested: str | None) -> str:
     """Return a concrete torch device string from a config value.
 
-    `"auto"` (or missing) probes in order: cuda → mps → cpu. Any other
-    value (`"cuda"`, `"cuda:0"`, `"mps"`, `"cpu"`) is passed through
-    untouched so existing configs keep working. Logged once so the
-    operator can see which backend was chosen on this host.
+    `"auto"` (or missing) probes in order: cuda → cpu. Any other value
+    (`"cuda"`, `"cuda:0"`, `"cpu"`) is passed through untouched so
+    existing configs keep working.
     """
     if requested and requested != "auto":
         return requested
@@ -121,10 +123,20 @@ def _resolve_device(requested: str | None) -> str:
         return "cpu"
     if torch.cuda.is_available():
         return "cuda"
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return "mps"
     return "cpu"
+
+
+def _pick_retention_days(raw: dict, key: str, legacy_default: int) -> int:
+    """Read `retention.<key>` from a parsed config, falling back to the
+    Mac-era `recordings_days` (or even older `days`) single-knob if the new
+    split keys are absent. Returns 0 only if the user explicitly set 0."""
+    r = raw.get("retention") or {}
+    if key in r and r[key] is not None:
+        return int(r[key])
+    legacy = r.get("recordings_days", r.get("days"))
+    if legacy is not None:
+        return int(legacy)
+    return legacy_default
 
 
 def load_config(path: str | Path = "config/config.yaml") -> Config:
@@ -172,14 +184,10 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         events_dir=Path(raw["paths"]["events_dir"]),
         calibration_path=Path(raw["paths"]["calibration"]),
         max_track_age_s=float(raw["speed"]["max_track_age_s"]),
-        recordings_days=int(
-            (raw.get("retention") or {}).get(
-                "recordings_days",
-                (raw.get("retention") or {}).get("days", 0),
-            )
-            or 0
-        ),
-        passes_days=int((raw.get("retention") or {}).get("passes_days", 0) or 0),
+        clips_days=_pick_retention_days(raw, "clips_days", legacy_default=14),
+        thumbs_days=_pick_retention_days(raw, "thumbs_days", legacy_default=90),
+        passes_days=int((raw.get("retention") or {}).get("passes_days", 365) or 0),
+        heatmap_days=max(1, min(14, int((raw.get("heatmap") or {}).get("days", 8) or 8))),
         clip_margin_s=float((raw.get("clip") or {}).get("margin_s", 0.5) or 0.5),
         clip_capture_min_mph=float((raw.get("clip") or {}).get("capture_min_mph", 0.0) or 0.0),
         clip_capture_max_mph=float((raw.get("clip") or {}).get("capture_max_mph", 999.0) or 999.0),

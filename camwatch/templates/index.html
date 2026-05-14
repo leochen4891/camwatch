@@ -87,19 +87,35 @@
 
       <section class="settings-section">
         <h3>Storage retention</h3>
-        <p class="muted-text">Two phases. <code>0</code> on either knob disables that phase.</p>
+        <p class="muted-text">Three phases, in order. <code>0</code> on any knob disables that phase. Typical layout: clips &lt; thumbnails &lt; pass records.</p>
         <div class="setting-row">
-          <label>Recordings (clips + thumbnails)</label>
-          <input type="number" name="recordings_days" value="{{ recordings_days }}" step="1" min="0" max="3650">
+          <label>Video clips (<code>.mp4</code>)</label>
+          <input type="number" name="clips_days" value="{{ clips_days }}" step="1" min="0" max="3650">
           <span>days</span>
         </div>
-        <p class="muted-text">After this many days, <code>.mp4</code> and thumbnails are deleted from disk. The pass row stays (without playback) so stats remain intact.</p>
+        <p class="muted-text">After this many days the <code>.mp4</code> is deleted. The thumbnail and DB row stay — the row just loses its playback button.</p>
+        <div class="setting-row">
+          <label>Thumbnails (<code>.jpg</code>)</label>
+          <input type="number" name="thumbs_days" value="{{ thumbs_days }}" step="1" min="0" max="3650">
+          <span>days</span>
+        </div>
+        <p class="muted-text">After this many days the <code>.jpg</code> is removed too (alarm-pass thumbs are moved to <code>recordings_archive/</code>). The DB row remains.</p>
         <div class="setting-row">
           <label>Pass records (DB row + detection logs)</label>
           <input type="number" name="passes_days" value="{{ passes_days }}" step="1" min="0" max="3650">
           <span>days</span>
         </div>
-        <p class="muted-text">After this many days, the pass row and its <code>events/pass_*.jsonl</code> are hard-deleted. Set higher than recordings if you want long-term stats.</p>
+        <p class="muted-text">After this many days the pass row and its <code>events/pass_*.jsonl</code> are hard-deleted.</p>
+      </section>
+
+      <section class="settings-section">
+        <h3>Activity heatmap</h3>
+        <div class="setting-row">
+          <label>Rolling window</label>
+          <input type="number" name="heatmap_days" value="{{ heatmap_days }}" step="1" min="1" max="14">
+          <span>days</span>
+        </div>
+        <p class="muted-text">Trailing-N-day window for the activity heatmap and the histogram that feeds off it. Range: 1–14. Page reload needed for the new window to take effect on the open tab.</p>
       </section>
 
       <div class="settings-footer">
@@ -131,7 +147,7 @@
       </section>
 
       <section class="controls">
-        <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram, #heatmap">
+        <form id="filter-form" hx-get="/passes" hx-target="#pass-list" hx-trigger="change, every 10s" hx-include="#filter-form, #histogram, #heatmap, [name=page_size]">
           <label>direction
             <select name="direction">
               <option value="">all</option>
@@ -144,6 +160,7 @@
           <input type="hidden" name="vehicle_make" id="vehicle-make" value="">
           <input type="hidden" name="vehicle_model" id="vehicle-model" value="">
           <input type="hidden" name="vehicle_color" id="vehicle-color" value="">
+          <input type="hidden" name="pass_ids" id="pass-ids-hidden" value="">
         </form>
       </section>
 
@@ -151,7 +168,7 @@
                hx-get="/passes"
                hx-trigger="change"
                hx-target="#pass-list"
-               hx-include="#filter-form, #histogram, #heatmap">
+               hx-include="#filter-form, #histogram, #heatmap, [name=page_size]">
         {% include "_histogram.html" %}
       </section>
 
@@ -159,7 +176,7 @@
                hx-get="/passes"
                hx-trigger="change"
                hx-target="#pass-list"
-               hx-include="#filter-form, #histogram, #heatmap">
+               hx-include="#filter-form, #histogram, #heatmap, [name=page_size]">
         {% include "_heatmap.html" %}
         <input type="hidden" name="time_mask" id="time-mask" value="{{ time_mask }}" form="filter-form">
         <input type="hidden" name="time_ref_date" id="time-ref-date" value="{{ time_ref_date }}" form="filter-form">
@@ -168,6 +185,11 @@
 
     <main class="app-shell-right">
       <div class="list-toolbar">
+        <div class="pass-ids-filter">
+          <input type="text" id="pass-ids-input" placeholder="filter by pass IDs: 1626, 1647, …"
+                 autocomplete="off" spellcheck="false">
+          <button type="button" class="muted-btn" id="pass-ids-apply">Filter</button>
+        </div>
         <button type="button" class="muted-btn refresh-btn" id="refresh-list-btn"
                 title="Refresh list" aria-label="Refresh list">↻</button>
       </div>
@@ -227,9 +249,11 @@
         const vehicle_make = document.getElementById("vehicle-make")?.value || "";
         const vehicle_model = document.getElementById("vehicle-model")?.value || "";
         const vehicle_color = document.getElementById("vehicle-color")?.value || "";
+        const page_size = document.querySelector('select[name="page_size"]')?.value || "";
         localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
           direction, alerts_only, time_mask, time_ref_date, buckets,
           vehicle_make, vehicle_model, vehicle_color,
+          page_size,
           heatmap_mode: heatmapMode,
         }));
       } catch (e) { /* localStorage may be disabled / full; non-fatal */ }
@@ -284,6 +308,13 @@
       if (typeof s.vehicle_color === "string")
         document.getElementById("vehicle-color").value = s.vehicle_color;
 
+      if (typeof s.page_size === "string" && s.page_size) {
+        const sel = document.querySelector('select[name="page_size"]');
+        if (sel && Array.from(sel.options).some(o => o.value === s.page_size)) {
+          sel.value = s.page_size;
+        }
+      }
+
       return true;
     }
 
@@ -311,7 +342,7 @@
 
     // ---------- heatmap (week-view time filter) ----------
     const HEATMAP_SLOTS_PER_DAY = 32;       // 06:00-22:00 in 30-min steps
-    const HEATMAP_DAYS_IN_WEEK = 8;  // matches DAYS_IN_WEEK on the server
+    const HEATMAP_DAYS_IN_WEEK = {{ heatmap_days }};  // matches DAYS_IN_WEEK on the server
     const HEATMAP_TOTAL_SLOTS = HEATMAP_SLOTS_PER_DAY * HEATMAP_DAYS_IN_WEEK;
     let heatmapMask = new Array(HEATMAP_TOTAL_SLOTS).fill(true);
 
@@ -498,6 +529,48 @@
       htmx.trigger("#filter-form", "change");
     });
 
+    // Per-page selector lives inside #pass-list (form-associated externally
+    // via form="filter-form"). htmx hx-include grabs it by [name=page_size]
+    // so the value carries on every refresh; the onchange handler here
+    // resets to page 1, persists the choice, and fires the form's change.
+    function onPageSizeChange() {
+      const pageInput = document.getElementById("page-input");
+      if (pageInput) pageInput.value = "1";
+      saveFilterState();
+      htmx.trigger("#filter-form", "change");
+    }
+
+    // pass_ids filter: paste a comma/space-separated list of pass IDs and
+    // jump straight to those rows (bypasses every other filter on the server
+    // side). Not persisted across reloads — it's a spot-check tool.
+    function applyPassIdsFilter() {
+      const inp = document.getElementById("pass-ids-input");
+      const hidden = document.getElementById("pass-ids-hidden");
+      if (!inp || !hidden) return;
+      hidden.value = inp.value.trim();
+      const pageInput = document.getElementById("page-input");
+      if (pageInput) pageInput.value = "1";
+      htmx.trigger("#filter-form", "change");
+    }
+    function clearPassIdsFilter() {
+      const inp = document.getElementById("pass-ids-input");
+      const hidden = document.getElementById("pass-ids-hidden");
+      if (!inp || !hidden) return;
+      inp.value = "";
+      if (hidden.value === "") return;  // already clear
+      hidden.value = "";
+      htmx.trigger("#filter-form", "change");
+    }
+    document.body.addEventListener("click", (e) => {
+      if (e.target.closest("#pass-ids-apply")) applyPassIdsFilter();
+    });
+    document.body.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.target.id === "pass-ids-input") {
+        e.preventDefault();
+        applyPassIdsFilter();
+      }
+    });
+
     function toggleMenu(btn) {
       const menu = btn.nextElementSibling;
       const wasOpen = menu.classList.contains("open");
@@ -521,6 +594,11 @@
       const imageWrap = row.querySelector(".big-image-wrap");
       if (!videoWrap && !imageWrap) return;
 
+      // Capture this row's viewport-Y at click time, before any layout
+      // changes (closing siblings, expanding self). On collapse we use it
+      // to scroll the row back to where the user clicked from.
+      const preOpenTop = row.getBoundingClientRect().top;
+
       // Close any other expanded row first.
       document.querySelectorAll(".pass-row").forEach(other => {
         if (other === row) return;
@@ -540,6 +618,12 @@
       const isOpen = (videoWrap && !videoWrap.classList.contains("hidden"))
                   || (imageWrap && !imageWrap.classList.contains("hidden"));
       if (isOpen) {
+        // Read the row's stored pre-open position (set when we expanded
+        // it) and use it to restore scroll after the wraps collapse and
+        // the layout reflows. Falls back to the click-time top if the
+        // dataset is missing for any reason.
+        const storedTop = parseFloat(row.dataset.preOpenTop);
+        const targetTop = Number.isFinite(storedTop) ? storedTop : preOpenTop;
         if (videoWrap) {
           videoWrap.querySelector("video")?.pause();
           videoWrap.innerHTML = "";
@@ -549,7 +633,18 @@
           imageWrap.innerHTML = "";
           imageWrap.classList.add("hidden");
         }
+        delete row.dataset.preOpenTop;
+        // After collapse, re-measure and shift the viewport so the row
+        // lands back at targetTop.
+        requestAnimationFrame(() => {
+          const newTop = row.getBoundingClientRect().top;
+          const dy = newTop - targetTop;
+          if (Math.abs(dy) > 1) {
+            window.scrollBy({ top: dy, behavior: "smooth" });
+          }
+        });
       } else {
+        row.dataset.preOpenTop = String(preOpenTop);
         if (imageWrap) {
           imageWrap.innerHTML = `<img src="/passes/${passId}/thumb?big=1" alt="">`;
           imageWrap.classList.remove("hidden");
@@ -1128,6 +1223,11 @@
       ) {
         return;
       }
+      // If the mouseup ended a text selection (user dragged to highlight
+      // the time, pass id, etc.), don't toggle — that drag is intent to
+      // copy, not to expand.
+      const sel = window.getSelection && window.getSelection();
+      if (sel && sel.toString().length > 0) return;
       togglePlay(passId);
     }
 
@@ -1193,9 +1293,9 @@
               + "the consumer is falling behind the camera and the bounded "
               + "queue is dropping the overflow.",
       yolo_ms_p50: "Median per-frame YOLO inference time. With yolo11l on "
-                 + "the 3060 Ti (CUDA) the steady-state target is ~30–40 ms; "
-                 + "on Apple Silicon (MPS) ~30–50 ms. Sustained higher means "
-                 + "the model+resolution combo is too heavy for realtime.",
+                 + "the 3060 Ti (CUDA) the steady-state target is ~30–40 ms. "
+                 + "Sustained higher means the model+resolution combo is too "
+                 + "heavy for realtime.",
       yolo_ms_p95: "95th-percentile inference time. Occasional spikes (warmup, "
                  + "thermal, GPU contention) are normal. Sustained high p95 with "
                  + "low p50 indicates jitter — the loop runs fast on average but "

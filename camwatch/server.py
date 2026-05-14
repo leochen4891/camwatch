@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from contextlib import asynccontextmanager
@@ -124,6 +125,7 @@ def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict
         "vehicle_year_range": p.vehicle_year_range,
         "vehicle_color": p.vehicle_color,
         "vehicle_confidence": p.vehicle_confidence,
+        "deleted_at": p.deleted_at,
     }
 
 
@@ -222,6 +224,7 @@ def make_app(
     # but is no longer invoked at boot.
 
     preview = PreviewBuffer()
+    _apply_heatmap_days(cfg.heatmap_days)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -297,6 +300,7 @@ def make_app(
         vehicle_make: str | None = None,
         vehicle_model: str | None = None,
         vehicle_color: str | None = None,
+        pass_ids: str | None = None,
     ):
         return _render_pass_list(
             request, cfg, db, direction, alerts_only,
@@ -304,6 +308,7 @@ def make_app(
             selected_buckets=buckets, page=page, page_size=page_size,
             vehicle_make=vehicle_make, vehicle_model=vehicle_model,
             vehicle_color=vehicle_color,
+            pass_ids=pass_ids,
         )
 
     @app.post("/passes/delete")
@@ -452,8 +457,10 @@ def make_app(
     async def save_settings(
         request: Request,
         threshold_mph: float = Form(...),
-        recordings_days: int = Form(default=0),
+        clips_days: int = Form(default=0),
+        thumbs_days: int = Form(default=0),
         passes_days: int = Form(default=0),
+        heatmap_days: int = Form(default=8),
         clip_margin_s: float = Form(default=0.5),
         clip_capture_min_mph: float = Form(default=0.0),
         clip_capture_max_mph: float = Form(default=999.0),
@@ -464,14 +471,21 @@ def make_app(
         margin = max(0.0, float(clip_margin_s))
         cap_min = max(0.0, float(clip_capture_min_mph))
         cap_max = max(cap_min, float(clip_capture_max_mph))
-        # Persist threshold, retention, clip and preview settings to config.yaml
+        clips_d = max(0, int(clips_days))
+        thumbs_d = max(0, int(thumbs_days))
+        passes_d = max(0, int(passes_days))
+        heatmap_d = max(1, min(14, int(heatmap_days)))
+        # Persist to config.yaml.
         with cfg_path.open() as f:
             data = yaml.safe_load(f) or {}
         data.setdefault("alert", {})["threshold_mph"] = float(threshold_mph)
         retention_section = data.setdefault("retention", {})
-        retention_section["recordings_days"] = max(0, int(recordings_days))
-        retention_section["passes_days"] = max(0, int(passes_days))
-        retention_section.pop("days", None)  # drop legacy single-knob key
+        retention_section["clips_days"] = clips_d
+        retention_section["thumbs_days"] = thumbs_d
+        retention_section["passes_days"] = passes_d
+        retention_section.pop("recordings_days", None)  # superseded by clips/thumbs split
+        retention_section.pop("days", None)  # legacy single-knob key
+        data.setdefault("heatmap", {})["days"] = heatmap_d
         clip_section = data.setdefault("clip", {})
         clip_section["margin_s"] = margin
         clip_section["capture_min_mph"] = cap_min
@@ -481,8 +495,11 @@ def make_app(
         with cfg_path.open("w") as f:
             yaml.safe_dump(data, f, sort_keys=False)
         cfg.alert_threshold_mph = float(threshold_mph)
-        cfg.recordings_days = max(0, int(recordings_days))
-        cfg.passes_days = max(0, int(passes_days))
+        cfg.clips_days = clips_d
+        cfg.thumbs_days = thumbs_d
+        cfg.passes_days = passes_d
+        cfg.heatmap_days = heatmap_d
+        _apply_heatmap_days(heatmap_d)
         cfg.clip_margin_s = margin
         cfg.clip_capture_min_mph = cap_min
         cfg.clip_capture_max_mph = cap_max
@@ -496,42 +513,51 @@ def make_app(
         preview = getattr(request.app.state, "preview", None)
         if preview is not None:
             preview.set_show_grid(bool(preview_show_grid))
-        # Trigger immediate sweeps for both retention phases
-        if cfg.recordings_days > 0:
-            rec_items = db.purge_recordings_older_than(cfg.recordings_days)
-            threshold_mph = float(cfg.alert_threshold_mph)
-            archive_dir = Path("recordings_archive")
-            if rec_items:
+        threshold = float(cfg.alert_threshold_mph)
+        archive_dir = Path("recordings_archive")
+        # Phase 1: clips_days — delete .mp4 only.
+        if cfg.clips_days > 0:
+            clip_items = db.passes_with_clip_older_than(cfg.clips_days)
+            removed_clips = 0
+            for _pid, cp, _speed in clip_items:
+                if Path(cp).exists():
+                    try:
+                        Path(cp).unlink(missing_ok=True)
+                        removed_clips += 1
+                    except Exception:
+                        pass
+            if removed_clips:
+                log.info("retention: removed %d .mp4 files on settings save", removed_clips)
+        # Phase 2: thumbs_days — delete .jpg (archive for alarm passes), NULL clip_path.
+        if cfg.thumbs_days > 0:
+            thumb_items = db.purge_thumbs_older_than(cfg.thumbs_days)
+            if thumb_items:
                 archive_dir.mkdir(parents=True, exist_ok=True)
             archived = 0
             deleted = 0
-            for pid, cp, speed in rec_items:
-                base = cp[:-4]
-                thumb_small = base + ".jpg"
-                thumb_big = base + "_big.jpg"
-                if speed is not None and speed >= threshold_mph:
-                    # Alarm: archive thumbnails only; delete the .mp4.
-                    for src in (thumb_small, thumb_big):
-                        if Path(src).exists():
-                            try:
-                                shutil.move(src, archive_dir / Path(src).name)
-                            except Exception:
-                                pass
-                    try:
-                        Path(cp).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    archived += 1
-                else:
-                    for path in (cp, thumb_small, thumb_big):
+            for _pid, cp, speed in thumb_items:
+                thumb = cp[:-4] + ".jpg" if cp.endswith(".mp4") else cp + ".jpg"
+                # Also remove the .mp4 if it somehow outlived clips_days.
+                try:
+                    Path(cp).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if speed is not None and speed >= threshold:
+                    if Path(thumb).exists():
                         try:
-                            Path(path).unlink(missing_ok=True)
+                            shutil.move(thumb, archive_dir / Path(thumb).name)
+                            archived += 1
                         except Exception:
                             pass
-                    deleted += 1
+                else:
+                    try:
+                        Path(thumb).unlink(missing_ok=True)
+                        deleted += 1
+                    except Exception:
+                        pass
             if archived or deleted:
                 log.info(
-                    "retention: %d alarm passes archived, %d non-alarm cleaned on settings save",
+                    "retention: %d alarm thumbs archived, %d non-alarm deleted on settings save",
                     archived, deleted,
                 )
         # Performance metrics are retained for 7 days. Hardcoded cap rather
@@ -548,7 +574,6 @@ def make_app(
                 if cp:
                     paths_to_unlink.append(cp)
                     paths_to_unlink.append(cp[:-4] + ".jpg")
-                    paths_to_unlink.append(cp[:-4] + "_big.jpg")
                 paths_to_unlink.append(str(cfg.events_dir / f"pass_{pid}.jsonl"))
                 for path in paths_to_unlink:
                     try:
@@ -693,8 +718,17 @@ def _build_histogram(
 DAY_START_HOUR = 6   # heatmap rows start at 06:00 local
 DAY_END_HOUR = 22    # exclusive: rows stop at 22:00 (last slot is 21:30-22:00)
 SLOTS_PER_DAY = (DAY_END_HOUR - DAY_START_HOUR) * 2  # 32
-DAYS_IN_WEEK = 8  # rolling window length for heatmap/list (matches retention.recordings_days)
-TOTAL_SLOTS = DAYS_IN_WEEK * SLOTS_PER_DAY  # 224
+DAYS_IN_WEEK = 8  # heatmap rolling window length; reassigned at startup
+                  # and on settings save from cfg.heatmap_days (1..14).
+TOTAL_SLOTS = DAYS_IN_WEEK * SLOTS_PER_DAY
+
+
+def _apply_heatmap_days(n: int) -> None:
+    """Rebind the heatmap window length. Called from create_app() at
+    startup and from the settings POST handler when the user changes it."""
+    global DAYS_IN_WEEK, TOTAL_SLOTS
+    DAYS_IN_WEEK = max(1, min(14, int(n)))
+    TOTAL_SLOTS = DAYS_IN_WEEK * SLOTS_PER_DAY
 
 
 def _today_local() -> date:
@@ -960,6 +994,7 @@ def _build_heatmap(
         "heatmap_max_count": max_count,
         "heatmap_max_avg_mph": max_avg,
         "heatmap_max_top_mph": max_top,
+        "heatmap_days": DAYS_IN_WEEK,
         "time_mask": initial_mask,
         "time_ref_date": today.isoformat(),
     }
@@ -980,7 +1015,7 @@ def _static_version() -> str:
         return "0"
 
 
-DEFAULT_PAGE_SIZE = 100
+DEFAULT_PAGE_SIZE = 20
 ALLOWED_PAGE_SIZES = (10, 20, 50, 100, 200)
 
 
@@ -1045,8 +1080,10 @@ def _render_index(request: Request, cfg: Config, db: Database):
             "static_v": _static_version(),
             "rows": rows,
             "threshold": threshold,
-            "recordings_days": cfg.recordings_days,
+            "clips_days": cfg.clips_days,
+            "thumbs_days": cfg.thumbs_days,
             "passes_days": cfg.passes_days,
+            "heatmap_days": cfg.heatmap_days,
             "clip_margin_s": cfg.clip_margin_s,
             "clip_capture_min_mph": cfg.clip_capture_min_mph,
             "clip_capture_max_mph": cfg.clip_capture_max_mph,
@@ -1078,11 +1115,59 @@ def _render_pass_list(
     vehicle_make: str | None = None,
     vehicle_model: str | None = None,
     vehicle_color: str | None = None,
+    pass_ids: str | None = None,
 ):
     cal = cfg.load_calibration()
     dist_n = cal.line_distance_m_north if cal else 0
     dist_s = cal.line_distance_m_south if cal else 0
     threshold = cfg.alert_threshold_mph
+
+    # Explicit pass-ID lookup: bypass every other filter and the time window.
+    # Used for spot-checks (e.g. enrichment QA). Order matches the input list,
+    # and the histogram/heatmap are left alone so the user can return to their
+    # normal filter view by clearing this input.
+    if pass_ids and pass_ids.strip():
+        ids: list[int] = []
+        seen: set[int] = set()
+        for tok in re.split(r"[,\s]+", pass_ids.strip()):
+            if not tok:
+                continue
+            try:
+                pid = int(tok)
+            except ValueError:
+                continue
+            if pid not in seen:
+                seen.add(pid)
+                ids.append(pid)
+        rendered: list[dict] = []
+        for pid in ids:
+            p = db.get_pass(pid)
+            if p is None:
+                continue
+            rendered.append(render_pass(p, dist_n, dist_s, threshold))
+        return TEMPLATES.TemplateResponse(
+            request,
+            "_pass_list.html",
+            {
+                "rows": rendered,
+                "histogram": [],
+                "histogram_total": 0,
+                "histogram_all_default": True,
+                "include_oob_histogram": False,
+                "include_oob_heatmap": False,
+                "page": 1,
+                "page_size": max(len(rendered), 1),
+                "page_size_options": ALLOWED_PAGE_SIZES,
+                "total_pages": 1,
+                "total_filtered": len(rendered),
+                "vehicle_make": None,
+                "vehicle_model": None,
+                "vehicle_color": None,
+                "pass_ids_active": pass_ids.strip(),
+                "pass_ids_missing": [pid for pid in ids if not any(r["id"] == pid for r in rendered)],
+            },
+        )
+
     direction = direction if direction in ("N", "S") else None
     selected_buckets_set: set[int] = set(selected_buckets or [])
     page = max(1, int(page or 1))
@@ -1109,9 +1194,42 @@ def _render_pass_list(
         )],
     )
     rendered_week = [render_pass(p, dist_n, dist_s, threshold) for p in week_rows]
-    heatmap_ctx = _build_heatmap(
-        [r for r in rendered_week if not r["deleted"]], today, selected_slots,
+
+    # Speed-bucket + vehicle predicates, extracted so they can narrow the
+    # heatmap input as well as the list. The slot mask is deliberately NOT
+    # applied to the heatmap (the heatmap is its own picker for that axis).
+    veh_make = (vehicle_make or "").strip() or None
+    veh_model = (vehicle_model or "").strip() or None
+    veh_color = (vehicle_color or "").strip() or None
+    color_allowed = (
+        COLOR_MATCHES.get(veh_color, {veh_color}) if veh_color else None
     )
+    vehicle_active = bool(veh_make or veh_model or veh_color)
+
+    def speed_bucket_matches(r: dict) -> bool:
+        if not selected_buckets_set:
+            return True
+        mph = r["computed_mph"]
+        return mph is not None and _bucket_for(mph) in selected_buckets_set
+
+    def vehicle_matches(r: dict) -> bool:
+        if not vehicle_active:
+            return True
+        if veh_make and r.get("vehicle_make") != veh_make:
+            return False
+        if veh_model and r.get("vehicle_model") != veh_model:
+            return False
+        if color_allowed is not None and r.get("vehicle_color") not in color_allowed:
+            return False
+        return True
+
+    # Heatmap rows: everything except the slot mask. Deleted rows are dropped
+    # for cell counts (heatmap is a live-density view, not a deletion log).
+    heatmap_rows = [
+        r for r in rendered_week
+        if not r["deleted"] and speed_bucket_matches(r) and vehicle_matches(r)
+    ]
+    heatmap_ctx = _build_heatmap(heatmap_rows, today, selected_slots)
 
     # Filter the rendered week rows by the slot mask in Python.
     if selected_slots is None:
@@ -1128,36 +1246,24 @@ def _render_pass_list(
     hist_rows = [r for r in rendered_filtered if not r["deleted"]]
     histogram, hist_total, hist_all_default = _build_histogram(hist_rows, threshold, selected_buckets_set)
 
-    # Speed-bucket selection narrows further (deleted rows pass through).
+    # Speed-bucket selection narrows further (deleted rows pass through so the
+    # ↩ Revert affordance stays visible regardless of facet).
     if selected_buckets_set:
-        def in_selected(r: dict) -> bool:
-            if r["deleted"]:
-                return True
-            mph = r["computed_mph"]
-            if mph is None:
-                return False
-            return _bucket_for(mph) in selected_buckets_set
-        rendered_filtered = [r for r in rendered_filtered if in_selected(r)]
+        rendered_filtered = [r for r in rendered_filtered if r["deleted"] or speed_bucket_matches(r)]
 
     # Vehicle filter: make + model are exact match; color expands via
     # COLOR_MATCHES (recall-favoring against lighting drift).
-    veh_make = (vehicle_make or "").strip() or None
-    veh_model = (vehicle_model or "").strip() or None
-    veh_color = (vehicle_color or "").strip() or None
-    if veh_make or veh_model or veh_color:
-        color_allowed = COLOR_MATCHES.get(veh_color, {veh_color}) if veh_color else None
+    if vehicle_active:
+        rendered_filtered = [r for r in rendered_filtered if r["deleted"] or vehicle_matches(r)]
 
-        def vehicle_matches(r: dict) -> bool:
-            if r["deleted"]:
-                return True
-            if veh_make and r.get("vehicle_make") != veh_make:
-                return False
-            if veh_model and r.get("vehicle_model") != veh_model:
-                return False
-            if color_allowed is not None and r.get("vehicle_color") not in color_allowed:
-                return False
-            return True
-        rendered_filtered = [r for r in rendered_filtered if vehicle_matches(r)]
+    # Auto-hide stale soft-deletes: keep the ↩ Revert affordance visible for
+    # 60s after deletion, then drop the row from the list entirely. Rows
+    # without a deleted_at (pre-migration deletes) are treated as already stale.
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(timespec="seconds")
+    rendered_filtered = [
+        r for r in rendered_filtered
+        if not r["deleted"] or (r.get("deleted_at") and r["deleted_at"] >= stale_cutoff)
+    ]
 
     page_size = _normalize_page_size(page_size)
     total_filtered = len(rendered_filtered)

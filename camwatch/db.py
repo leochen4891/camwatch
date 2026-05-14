@@ -76,6 +76,7 @@ class Pass:
     vehicle_color: str | None
     vehicle_confidence: str | None
     vehicle_enriched_at: str | None
+    deleted_at: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Pass:
@@ -105,6 +106,7 @@ class Pass:
             vehicle_color=row["vehicle_color"] if "vehicle_color" in keys else None,
             vehicle_confidence=row["vehicle_confidence"] if "vehicle_confidence" in keys else None,
             vehicle_enriched_at=row["vehicle_enriched_at"] if "vehicle_enriched_at" in keys else None,
+            deleted_at=row["deleted_at"] if "deleted_at" in keys else None,
         )
 
 
@@ -136,6 +138,7 @@ class Database:
                     ("vehicle_color", "TEXT"),
                     ("vehicle_confidence", "TEXT"),
                     ("vehicle_enriched_at", "TEXT"),
+                    ("deleted_at", "TEXT"),
                 ]:
                     try:
                         conn.execute(f"ALTER TABLE passes ADD COLUMN {col} {decl}")
@@ -220,14 +223,6 @@ class Database:
             )
             return cur.rowcount
 
-    def set_thumb_upgrade_status(self, pass_id: int, status: str | None) -> None:
-        """Record whether the high-res thumbnail upgrade succeeded."""
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE passes SET thumb_upgrade_status = ? WHERE id = ?",
-                (status, int(pass_id)),
-            )
-
     def set_known_mph(self, pass_id: int, known_mph: float | None) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -238,11 +233,13 @@ class Database:
     def soft_delete(self, ids: list[int]) -> int:
         if not ids:
             return 0
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with self.connect() as conn:
             placeholders = ",".join("?" * len(ids))
             cur = conn.execute(
-                f"UPDATE passes SET deleted = 1 WHERE id IN ({placeholders})",
-                [int(i) for i in ids],
+                f"UPDATE passes SET deleted = 1, deleted_at = ? WHERE id IN ({placeholders})",
+                [now, *[int(i) for i in ids]],
             )
             return cur.rowcount
 
@@ -252,18 +249,38 @@ class Database:
         with self.connect() as conn:
             placeholders = ",".join("?" * len(ids))
             cur = conn.execute(
-                f"UPDATE passes SET deleted = 0 WHERE id IN ({placeholders})",
+                f"UPDATE passes SET deleted = 0, deleted_at = NULL WHERE id IN ({placeholders})",
                 [int(i) for i in ids],
             )
             return cur.rowcount
 
-    def purge_recordings_older_than(
+    def passes_with_clip_older_than(
         self, days: int
     ) -> list[tuple[int, str, float | None]]:
-        """Drop only the clip + thumbnail files for passes older than `days`.
-        NULLs `clip_path` in the row so the pass survives as a stats record;
-        returns [(id, original_clip_path, speed_mph), ...]. The caller uses
-        speed_mph to decide whether to archive (alarm passes) or hard-delete."""
+        """Return [(id, clip_path, speed_mph), ...] for passes captured more
+        than `days` ago that still have a `clip_path` recorded. Used by the
+        clips-retention sweep to delete .mp4 files. Does NOT mutate the row;
+        the .mp4 deletion is idempotent so re-listing across sweeps is safe."""
+        if days <= 0:
+            return []
+        from datetime import datetime, timedelta, timezone
+        cutoff = (
+            datetime.now(timezone.utc).astimezone() - timedelta(days=days)
+        ).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            rows = list(conn.execute(
+                "SELECT id, clip_path, speed_mph FROM passes WHERE captured_at < ? AND clip_path IS NOT NULL",
+                (cutoff,),
+            ))
+            return [(r["id"], r["clip_path"], r["speed_mph"]) for r in rows]
+
+    def purge_thumbs_older_than(
+        self, days: int
+    ) -> list[tuple[int, str, float | None]]:
+        """Drop thumbnail files for passes older than `days` and NULL their
+        `clip_path` so future sweeps skip them. Returns [(id, clip_path, speed_mph)]
+        captured at the moment of the sweep — callers use speed_mph to decide
+        whether to archive (alarm passes) or hard-delete the .jpg."""
         if days <= 0:
             return []
         from datetime import datetime, timedelta, timezone

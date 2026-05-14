@@ -288,14 +288,13 @@ class ClipRecorder:
             container.close()
 
     def _write_thumbnail(self, clip: _ActiveClip) -> None:
-        """Save two JPEGs cropped tight to the focus car: a 320 px-wide
-        thumb for list view and an 800 px-wide thumb for the detail view.
-
-        Source frames come from the main-stream ring buffer (2048x1536),
-        so both crops are derived from a single high-res image — no async
-        upgrade needed. The crop is taken from the raw frame, not the
-        overlay-rendered frame written into the .mp4, so thumbnails have
-        no bbox/label/line overlays.
+        """Save one JPEG cropped tight to the focus car, sized for the
+        detail view (800 px wide). The list view's small thumb element is
+        130 px wide and downscales this in the browser — extra bandwidth
+        is on the order of ~100 KB per row, acceptable for a single-user
+        UI. The crop is taken from the raw frame, not the overlay-rendered
+        frame written into the .mp4, so the thumb has no bbox/label/line
+        overlays.
         """
         if not clip.frames:
             return
@@ -337,10 +336,8 @@ class ClipRecorder:
             crop = clip.frames[best_any[1]].image
 
         base = clip.path[:-4] if clip.path.endswith(".mp4") else clip.path
-        thumb_small = self._resize_to_width(crop, 320)
-        thumb_big = self._resize_to_width(crop, 800)
-        cv2.imwrite(base + ".jpg", thumb_small, [cv2.IMWRITE_JPEG_QUALITY, 82])
-        cv2.imwrite(base + "_big.jpg", thumb_big, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        thumb = self._resize_to_width(crop, 800)
+        cv2.imwrite(base + ".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
     @staticmethod
     def _resize_to_width(frame: np.ndarray, target_w: int) -> np.ndarray:

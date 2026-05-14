@@ -3,13 +3,13 @@
    time_mask, time_ref_date #}
 <div class="heatmap-title">
   <span class="heatmap-title-text">Activity heatmap</span>
-  <span class="muted">(trailing 8 days · 6am-10pm rows + edge overflow)</span>
+  <span class="muted">(trailing {{ heatmap_days }} days · 6am-10pm rows + edge overflow)</span>
   <span class="heatmap-mode" role="group" aria-label="Color by">
     <button type="button" class="heatmap-mode-btn active" data-mode="count">Count</button>
     <button type="button" class="heatmap-mode-btn" data-mode="speed">Speed</button>
   </span>
 </div>
-<div class="heatmap-grid">
+<div class="heatmap-grid" style="--heatmap-days: {{ heatmap_days }}">
   <button type="button" class="heatmap-corner" id="heatmap-toggle-all"
           title="Toggle all slots"
           style="grid-column: 1; grid-row: 1;">⊞</button>
