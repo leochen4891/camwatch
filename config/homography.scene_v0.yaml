@@ -1,0 +1,126 @@
+homography:
+  H:
+  - - 0.003786949396516022
+    - -0.15711399491757264
+    - 75.14982157777571
+  - - -0.024982554613400085
+    - 0.004728457486849516
+    - 37.58469288082147
+  - - 0.00015491903467151045
+    - -0.006288318664216658
+    - 1.0
+  frame_size:
+  - 2560
+  - 1440
+  origin: "point 6 \u2014 east curb, camera's perpendicular"
+  axes: +X = east (toward camera); +Y = along road toward point 1 (north-ish)
+  road_width_ft: 30.0
+  spacing_ft: 5.0
+  method: 17-anchor (14 east-curb + 3 west-curb raw clicks) least-squares fit, main-stream
+    pixels
+  max_reprojection_error_m: 1.2483066535667289
+  mean_reprojection_error_m: 0.6339889340471287
+  pixel_pts:
+  - idx: 1
+    u: 2211.0
+    v: 539.0
+  - idx: 2
+    u: 2104.0
+    v: 533.0
+  - idx: 3
+    u: 1990.0
+    v: 526.0
+  - idx: 4
+    u: 1869.0
+    v: 522.0
+  - idx: 5
+    u: 1738.0
+    v: 512.0
+  - idx: 6
+    u: 1605.0
+    v: 509.0
+  - idx: 7
+    u: 1470.0
+    v: 506.0
+  - idx: 8
+    u: 1334.0
+    v: 504.0
+  - idx: 9
+    u: 1205.0
+    v: 501.0
+  - idx: 10
+    u: 1077.0
+    v: 499.0
+  - idx: 11
+    u: 962.0
+    v: 501.0
+  - idx: 12
+    u: 848.0
+    v: 502.0
+  - idx: 13
+    u: 742.0
+    v: 506.0
+  - idx: 14
+    u: 645.0
+    v: 507.0
+  - idx: 15
+    u: 874.0
+    v: 418.0
+  - idx: 16
+    u: 1131.0
+    v: 414.0
+  - idx: 17
+    u: 2061.0
+    v: 450.0
+  meter_pts:
+  - idx: 1
+    X: 0.0
+    Y: 7.62
+  - idx: 2
+    X: 0.0
+    Y: 6.096
+  - idx: 3
+    X: 0.0
+    Y: 4.572
+  - idx: 4
+    X: 0.0
+    Y: 3.048
+  - idx: 5
+    X: 0.0
+    Y: 1.524
+  - idx: 6
+    X: 0.0
+    Y: 0.0
+  - idx: 7
+    X: 0.0
+    Y: -1.524
+  - idx: 8
+    X: 0.0
+    Y: -3.048
+  - idx: 9
+    X: 0.0
+    Y: -4.572
+  - idx: 10
+    X: 0.0
+    Y: -6.096
+  - idx: 11
+    X: 0.0
+    Y: -7.62
+  - idx: 12
+    X: 0.0
+    Y: -9.144
+  - idx: 13
+    X: 0.0
+    Y: -10.668000000000001
+  - idx: 14
+    X: 0.0
+    Y: -12.192
+  - idx: 15
+    X: -9.144
+    Y: -12.192
+  - idx: 16
+    X: -9.144
+    Y: -7.62
+  - idx: 17
+    X: -9.144
+    Y: 7.62

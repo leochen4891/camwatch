@@ -2,8 +2,9 @@
 
 Loads the 3×3 matrix from `config/homography.yaml` (built by
 `scripts/build_homography_from_marks.py`). The matrix maps main-stream
-pixel coordinates (2048×1536) to road-plane meters in a coordinate
-system whose origin is at "point 6" (the east curb directly across
+pixel coordinates (resolution depends on the camera; recorded in the
+yaml's `frame_size`) to road-plane meters in a coordinate system whose
+origin is at "point 6" (the east curb directly across
 from the camera) with +Y running along the road toward "point 1"
 (north-ish).
 
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import cv2
 import numpy as np
 import yaml
 
@@ -30,11 +32,17 @@ MPH_PER_MPS = 2.2369362920544
 
 @dataclass
 class Homography:
-    H: np.ndarray                # 3×3, main-stream pixel → meters
+    H: np.ndarray                # 3×3, undistorted-pixel → meters
     inv_H: np.ndarray            # for visualization / inverse projection
     frame_size: tuple[int, int]
     mean_reproj_err_m: float
     max_reproj_err_m: float
+    # Optional intrinsics + distortion. When both are present, project() runs
+    # cv2.undistortPoints before applying H. Built by
+    # scripts/fit_distortion_from_scene.py for the CX410W; older configs
+    # without K/D fall back to plain pinhole (no undistort).
+    K: np.ndarray | None = None
+    D: np.ndarray | None = None
 
     @classmethod
     def load(cls, path: Path | str) -> "Homography | None":
@@ -47,129 +55,109 @@ class Homography:
             log.warning("failed to load homography from %s: %s; speed-by-homography disabled", path, e)
             return None
         H = np.array(data["H"], dtype=np.float64)
+        K = np.array(data["K"], dtype=np.float64) if "K" in data else None
+        D = np.array(data["D"], dtype=np.float64).reshape(-1) if "D" in data else None
         return cls(
             H=H,
             inv_H=np.linalg.inv(H),
             frame_size=tuple(data.get("frame_size", (2048, 1536))),
             mean_reproj_err_m=float(data.get("mean_reprojection_error_m", 0.0)),
             max_reproj_err_m=float(data.get("max_reprojection_error_m", 0.0)),
+            K=K,
+            D=D,
         )
 
     def project(self, u: float, v: float) -> tuple[float, float]:
-        """Main-stream pixel (u, v) → road-plane meters (X, Y)."""
-        p = self.H @ np.array([float(u), float(v), 1.0])
+        """Main-stream pixel (u, v) → road-plane meters (X, Y).
+
+        If K + D are loaded, the input pixel is run through
+        cv2.undistortPoints first so H operates on undistorted coords.
+        """
+        if self.K is not None and self.D is not None:
+            pt = np.array([[[float(u), float(v)]]], dtype=np.float64)
+            undist = cv2.undistortPoints(pt, self.K, self.D, P=self.K).reshape(2)
+            uu, vv = float(undist[0]), float(undist[1])
+        else:
+            uu, vv = float(u), float(v)
+        p = self.H @ np.array([uu, vv, 1.0])
         return float(p[0] / p[2]), float(p[1] / p[2])
 
-    def speed_from_trajectory(
+    def world_to_pixel(self, X: float, Y: float) -> tuple[float, float]:
+        """Inverse of project(): road meters (X, Y) → distorted pixel (u, v).
+
+        If K + D are loaded, applies cv2.projectPoints to re-distort after
+        inv_H so the output lands where the world point actually appears in
+        the lens-distorted image. Used for drawing world-aligned overlays.
+        """
+        p = self.inv_H @ np.array([float(X), float(Y), 1.0])
+        if abs(p[2]) < 1e-9:
+            return float("nan"), float("nan")
+        u_undist = p[0] / p[2]
+        v_undist = p[1] / p[2]
+        if self.K is None or self.D is None:
+            return float(u_undist), float(v_undist)
+        x_cam = (u_undist - self.K[0, 2]) / self.K[0, 0]
+        y_cam = (v_undist - self.K[1, 2]) / self.K[1, 1]
+        pts3d = np.array([[[x_cam, y_cam, 1.0]]], dtype=np.float64)
+        out, _ = cv2.projectPoints(pts3d, np.zeros(3), np.zeros(3), self.K, self.D)
+        return float(out[0, 0, 0]), float(out[0, 0, 1])
+
+    def world_polyline(self, X1: float, Y1: float, X2: float, Y2: float, n: int = 32) -> np.ndarray:
+        """Sample a straight world-space segment into a dense pixel-space polyline
+        that follows the lens curvature. Returns Nx2 int32 (u, v) array."""
+        ts = np.linspace(0.0, 1.0, n)
+        pts: list[tuple[int, int]] = []
+        for t in ts:
+            X = X1 + (X2 - X1) * t
+            Y = Y1 + (Y2 - Y1) * t
+            u, v = self.world_to_pixel(X, Y)
+            if not (np.isfinite(u) and np.isfinite(v)):
+                continue
+            pts.append((int(round(u)), int(round(v))))
+        return np.array(pts, dtype=np.int32) if pts else np.zeros((0, 2), dtype=np.int32)
+
+    def running_avg_speed(
         self,
         samples: Sequence[tuple[float, float, float]],
-    ) -> tuple[float, float, int]:
-        """Fit speed from a list of (t_seconds, ground_u_pixel, ground_v_pixel).
+        min_samples: int = 5,
+    ) -> tuple[float, list[float], int]:
+        """Cumulative-distance / cumulative-time speed from the first sample.
 
-        Returns (mph, r_squared, n). Both X(t) and Y(t) are linear-regressed;
-        speed is the magnitude of the velocity vector, so it works whether the
-        car is going purely along Y, or has some lane-change component in X.
+        For each frame i ≥ min_samples-1, returns the running average speed
+        from sample 0 to sample i: `mph_i = (cum_arc_length / (t_i - t_0))`.
+        The final value is the headline speed.
+
+        Robust to PTS-burst stutter: a brief cluster of frames sharing nearly
+        identical timestamps doesn't perturb the totals — once timestamps
+        recover, `cum_dist / cum_dt` returns to the true speed. (Contrast with
+        a per-frame v_inst chart, where the same burst produces 100-600 mph
+        spikes.)
+
+        Returns:
+            (final_mph, per_frame_running, n_samples).
+            `final_mph` is NaN if fewer than `min_samples` samples or the
+            cumulative dt never becomes positive. `per_frame_running[i]` is
+            NaN until enough samples have accumulated.
         """
         n = len(samples)
-        if n < 3:
-            return float("nan"), 0.0, n
-        ts = np.array([s[0] for s in samples], dtype=np.float64)
-        Xs = np.empty(n, dtype=np.float64)
-        Ys = np.empty(n, dtype=np.float64)
-        for i, (_, u, v) in enumerate(samples):
-            X, Y = self.project(u, v)
-            Xs[i] = X
-            Ys[i] = Y
-        A = np.vstack([ts, np.ones_like(ts)]).T
-        slope_x, _ = np.linalg.lstsq(A, Xs, rcond=None)[0]
-        slope_y, _ = np.linalg.lstsq(A, Ys, rcond=None)[0]
-        # R² on the dominant (Y) axis since the road is along Y.
-        Y_pred = slope_y * ts + (Ys.mean() - slope_y * ts.mean())
-        ss_res = float(np.sum((Ys - Y_pred) ** 2))
-        ss_tot = float(np.sum((Ys - Ys.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
-        v_mps = float(np.hypot(slope_x, slope_y))
-        return v_mps * MPH_PER_MPS, r2, n
-
-    def centered_speed_y_regression(
-        self,
-        samples: Sequence[tuple[float, float, float]],
-        half_window_m: float,
-    ) -> tuple[float, float, int]:
-        """Speed estimate via linear regression of Y vs t over samples whose
-        projected Y is within ±half_window_m of Y=0 (the camera's
-        perpendicular line, where homography reprojection error is smallest).
-
-        Returns (mph, r_squared, n_samples). The fit is Y = m·t + b; speed is
-        |m| in m/s converted to mph. Equivalent to "average speed across the
-        central 2·half_window_m of the road," anchored at the most accurate
-        portion of the calibrated grid.
-
-        If fewer than 3 samples fall inside the window the fit is unreliable
-        and we return (nan, 0.0, n).
-        """
-        if len(samples) < 3:
-            return float("nan"), 0.0, 0
-        ts_filt: list[float] = []
-        Ys_filt: list[float] = []
-        for ts, u, v in samples:
-            _X, Y = self.project(u, v)
-            if -half_window_m <= Y <= half_window_m:
-                ts_filt.append(float(ts))
-                Ys_filt.append(float(Y))
-        n = len(ts_filt)
-        if n < 3:
-            return float("nan"), 0.0, n
-        ts_arr = np.array(ts_filt, dtype=np.float64)
-        Ys_arr = np.array(Ys_filt, dtype=np.float64)
-        A = np.vstack([ts_arr, np.ones_like(ts_arr)]).T
-        slope_y, intercept = np.linalg.lstsq(A, Ys_arr, rcond=None)[0]
-        Y_pred = slope_y * ts_arr + intercept
-        ss_res = float(np.sum((Ys_arr - Y_pred) ** 2))
-        ss_tot = float(np.sum((Ys_arr - Ys_arr.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
-        return abs(float(slope_y)) * MPH_PER_MPS, r2, n
-
-    def median_speed_in_grid(
-        self,
-        samples: Sequence[tuple[float, float, float]],
-        grid_x_min: float, grid_x_max: float,
-        grid_y_min: float, grid_y_max: float,
-        tolerance_m: float = 0.5,
-    ) -> tuple[float, int]:
-        """Method-A speed estimator: project each sample, compute per-frame
-        v_inst between consecutive samples that are BOTH inside the grid
-        (with tolerance), then take the median.
-
-        Robust to per-frame bbox jitter and to homography extrapolation at
-        the trajectory edges. Returns (median_mph, n_samples_used). If fewer
-        than 2 in-grid pairs exist, returns (nan, 0).
-        """
-        if len(samples) < 2:
-            return float("nan"), 0
-        xmin = grid_x_min - tolerance_m
-        xmax = grid_x_max + tolerance_m
-        ymin = grid_y_min - tolerance_m
-        ymax = grid_y_max + tolerance_m
-        projected: list[tuple[float, float, float, bool]] = []
+        per_frame: list[float] = [float("nan")] * n
+        if n < max(2, min_samples):
+            return float("nan"), per_frame, n
+        projected: list[tuple[float, float, float]] = []
         for ts, u, v in samples:
             X, Y = self.project(u, v)
-            in_grid = (xmin <= X <= xmax and ymin <= Y <= ymax)
-            projected.append((ts, X, Y, in_grid))
-        v_inst: list[float] = []
-        for i in range(1, len(projected)):
-            ts_i, X_i, Y_i, ig_i = projected[i]
-            ts_p, X_p, Y_p, ig_p = projected[i - 1]
-            if not (ig_i and ig_p):
-                continue
-            dt = ts_i - ts_p
-            if dt <= 0:
-                continue
-            d = ((X_i - X_p) ** 2 + (Y_i - Y_p) ** 2) ** 0.5
-            v_inst.append((d / dt) * MPH_PER_MPS)
-        if len(v_inst) < 2:
-            return float("nan"), len(v_inst)
-        v_inst.sort()
-        n = len(v_inst)
-        median = (v_inst[n // 2] if n % 2 else (v_inst[n // 2 - 1] + v_inst[n // 2]) / 2.0)
-        return median, n
+            projected.append((float(ts), float(X), float(Y)))
+        t0 = projected[0][0]
+        cum_dist = 0.0
+        last_valid = float("nan")
+        for i in range(1, n):
+            ti, Xi, Yi = projected[i]
+            _tp, Xp, Yp = projected[i - 1]
+            cum_dist += ((Xi - Xp) ** 2 + (Yi - Yp) ** 2) ** 0.5
+            cum_dt = ti - t0
+            if (i + 1) >= min_samples and cum_dt > 0:
+                mph = (cum_dist / cum_dt) * MPH_PER_MPS
+                per_frame[i] = mph
+                last_valid = mph
+        return last_valid, per_frame, n
+

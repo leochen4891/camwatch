@@ -829,11 +829,6 @@ main { padding: 16px 20px 80px; }
   background: black;
   object-fit: contain;
 }
-.player-pkg .grid-overlay {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
 .player-pkg .player-controls {
   display: flex;
   align-items: center;

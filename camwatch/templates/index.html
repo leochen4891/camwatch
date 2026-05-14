@@ -697,26 +697,21 @@
     }
 
     // ============================================================
-    // Player package: <video> + grid canvas overlay + custom bottom
-    // controls + speed-vs-position chart with video-synced marker.
+    // Player package: <video> + custom bottom controls + speed-vs-position
+    // chart with video-synced marker.
+    //
+    // The grid overlay was removed: it was drawn live from the current
+    // homography, which mis-aligned for clips recorded under an older
+    // calibration. The per-pass speed chart is self-contained (X, Y, v_inst
+    // are pre-projected and frozen in events/pass_<id>.jsonl) so the
+    // headline speed and chart remain correct across recalibrations.
     // ============================================================
-
-    // Cached homography (loaded once on demand). Cleared on calibration change.
-    let _homogCache = null;
-    async function fetchHomography() {
-      if (_homogCache) return _homogCache;
-      const r = await fetch("/api/homography");
-      if (!r.ok) return null;
-      _homogCache = await r.json();
-      return _homogCache;
-    }
 
     function playerPackageHTML(passId) {
       return `
         <div class="player-pkg" data-pass-id="${passId}">
           <div class="video-frame">
             <video class="player-video" src="/passes/${passId}/clip" playsinline autoplay preload="auto"></video>
-            <canvas class="grid-overlay"></canvas>
           </div>
           <div class="player-controls" onclick="event.stopPropagation()">
             <button type="button" class="player-pp" aria-label="play / pause">▶</button>
@@ -733,7 +728,6 @@
 
     async function setupPlayerPackage(rootEl, passId) {
       const video = rootEl.querySelector(".player-video");
-      const overlay = rootEl.querySelector(".grid-overlay");
       const ppBtn = rootEl.querySelector(".player-pp");
       const scrub = rootEl.querySelector(".player-scrub");
       const timeLbl = rootEl.querySelector(".player-time");
@@ -804,89 +798,6 @@
         timeLbl.textContent = `0:00 / ${fmtTime(video.duration)}`;
       });
 
-      // ---- grid overlay --------------------------------------------
-      const homog = await fetchHomography();
-      function drawGrid() {
-        const ctx = overlay.getContext("2d");
-        // size canvas to displayed video dims
-        const r = video.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        overlay.width = Math.round(r.width * dpr);
-        overlay.height = Math.round(r.height * dpr);
-        overlay.style.width = r.width + "px";
-        overlay.style.height = r.height + "px";
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, r.width, r.height);
-        if (!homog) return;
-        const [Fw, Fh] = homog.frame_size;  // 2048, 1536
-        const sx = r.width / Fw, sy = r.height / Fh;
-        const H = homog.H;
-        // Hinv via cofactors
-        function inv3(M) {
-          const [[a,b,c],[d,e,f],[g,h,i]] = M;
-          const det = a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
-          if (Math.abs(det) < 1e-12) return null;
-          const inv = [
-            [(e*i-f*h)/det,  -(b*i-c*h)/det,  (b*f-c*e)/det],
-            [-(d*i-f*g)/det,  (a*i-c*g)/det,  -(a*f-c*d)/det],
-            [(d*h-e*g)/det,  -(a*h-b*g)/det,  (a*e-b*d)/det],
-          ];
-          return inv;
-        }
-        const Hinv = inv3(H);
-        if (!Hinv) return;
-        function m2disp(X, Y) {
-          const w = Hinv[2][0]*X + Hinv[2][1]*Y + Hinv[2][2];
-          if (Math.abs(w) < 1e-9) return null;
-          const u = (Hinv[0][0]*X + Hinv[0][1]*Y + Hinv[0][2]) / w;
-          const v = (Hinv[1][0]*X + Hinv[1][1]*Y + Hinv[1][2]) / w;
-          return [u * sx, v * sy];
-        }
-        const FT_TO_M = 0.3048;
-        const RW = (homog.road_width_ft || 30) * FT_TO_M;
-        const xMin = -RW - 1, xMax = 1;
-        const yMin = -25 * FT_TO_M - 1, yMax = 25 * FT_TO_M + 1;
-        // 5ft cyan major lines (horizontal cross-sections)
-        ctx.strokeStyle = "rgba(0, 220, 255, 0.65)";
-        ctx.lineWidth = 1;
-        for (let n = -5; n <= 5; n++) {
-          const Y = n * 5 * FT_TO_M;
-          const a = m2disp(xMin, Y), b = m2disp(xMax, Y);
-          if (a && b) {
-            ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
-          }
-        }
-        // 1ft sub-grid (lighter)
-        ctx.strokeStyle = "rgba(0, 220, 255, 0.25)";
-        for (let n = -25; n <= 25; n++) {
-          if (n % 5 === 0) continue;
-          const Y = n * FT_TO_M;
-          const a = m2disp(xMin, Y), b = m2disp(xMax, Y);
-          if (a && b) {
-            ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
-          }
-        }
-        // Yellow rectangle (calibration boundary)
-        ctx.strokeStyle = "rgba(255, 220, 0, 0.85)";
-        ctx.lineWidth = 1.5;
-        const corners = [
-          [0, 25*FT_TO_M], [0, -25*FT_TO_M],
-          [-RW, -25*FT_TO_M], [-RW, 25*FT_TO_M],
-        ];
-        const cp = corners.map(([X,Y]) => m2disp(X, Y));
-        if (cp.every(p => p)) {
-          ctx.beginPath();
-          ctx.moveTo(cp[0][0], cp[0][1]);
-          for (let i = 1; i < cp.length; i++) ctx.lineTo(cp[i][0], cp[i][1]);
-          ctx.closePath();
-          ctx.stroke();
-        }
-      }
-      // Draw grid only on specific events — NOT a ResizeObserver, which
-      // can cause feedback loops since the canvas size changes per redraw.
-      video.addEventListener("loadedmetadata", drawGrid);
-      window.addEventListener("resize", drawGrid);
-
       // ---- speed chart --------------------------------------------
       let trajectory = null;  // { manifest, samples }
       let chartGeo = null;    // axis-mapping cache for marker
@@ -941,33 +852,45 @@
           ? m.clip_end_ts
           : Math.max(m.t_a_pts, m.t_b_pts) + fallbackPost;
         const clipDur = clipEnd - clipStart;
-        // ±half_window for the centered-regression speed. Read from the
-        // manifest if present (new JSONLs); fall back to ±15 ft for older
-        // JSONLs that pre-date the field. We then derive `in_speed_window`
-        // per row from each sample's Y (always present), so old captures
-        // get the highlighting / fitted line too.
-        const halfWindowM = (m.speed_window_half_m != null && isFinite(m.speed_window_half_m))
-          ? m.speed_window_half_m : (15.0 * 0.3048);
-        const samples = trajectory.samples
-          .filter(s => s.v_inst_mph != null)
-          .map(s => ({
-            ...s,
-            ct: s.ts - clipStart,
-            in_speed_window: (s.in_speed_window === true)
-              || (s.Y != null && Math.abs(s.Y) <= halfWindowM),
-          }));
-        if (samples.length < 2) {
+        const samples = trajectory.samples.map(s => ({
+          ...s,
+          ct: s.ts - clipStart,
+        }));
+        // Derive v_running_mph on the fly for older JSONLs that pre-date
+        // the field. Uses the saved X/Y/ts (projected at record time under
+        // the then-active homography), so the value matches what would
+        // have been written had this code existed when the clip was made.
+        const MPH_PER_MPS = 2.2369362920544;
+        const MIN_RUNNING_SAMPLES = 5;
+        if (samples.length > 0) {
+          let cumDist = 0;
+          const t0 = samples[0].ts;
+          for (let i = 1; i < samples.length; i++) {
+            if (samples[i].X == null || samples[i - 1].X == null) continue;
+            const dx = samples[i].X - samples[i - 1].X;
+            const dy = samples[i].Y - samples[i - 1].Y;
+            cumDist += Math.hypot(dx, dy);
+            const cumDt = samples[i].ts - t0;
+            if (samples[i].v_running_mph == null
+                && (i + 1) >= MIN_RUNNING_SAMPLES && cumDt > 0) {
+              samples[i].v_running_mph = (cumDist / cumDt) * MPH_PER_MPS;
+            }
+          }
+        }
+        const haveAny = samples.some(s => s.v_running_mph != null || s.v_inst_mph != null);
+        if (!haveAny || samples.length < 2) {
           legend.textContent = "(not enough samples)";
           return;
         }
-        const Vvals = samples.map(s => s.v_inst_mph);
-        // Use the main-stream frame width as the X axis range so the dot's
-        // horizontal position on the chart corresponds directly to the car's
-        // horizontal position in the video.
+        // Y-axis range driven by v_running first (smoother), then v_inst
+        // (capped — bursts can spike to hundreds of mph).
+        const vRunningVals = samples.map(s => s.v_running_mph).filter(v => v != null);
+        const vInstClipped = samples.map(s => s.v_inst_mph).filter(v => v != null && v < 100);
+        const allVals = vRunningVals.concat(vInstClipped);
         const uMin = 0;
         const uMax = (m.frame_size && m.frame_size[0]) || 2048;
         const vMin = 0;
-        const vMax = Math.max(40, Math.ceil(Math.max(...Vvals) / 10) * 10 + 5);
+        const vMax = Math.max(40, Math.ceil(Math.max(...allVals, 0) / 10) * 10 + 5);
         chartGeo = { samples, padL, padR, padT, padB, chW, chH,
                      uMin, uMax, vMin, vMax, clipStart, clipDur };
 
@@ -978,27 +901,6 @@
         ctx.beginPath();
         ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + chH); ctx.lineTo(padL + chW, padT + chH);
         ctx.stroke();
-
-        // Shade the U range where samples were inside the centered ±N ft
-        // window used for the regression-based reported speed. Falls back to
-        // no shading if the JSONL pre-dates the in_speed_window field.
-        const inWinSamples = samples.filter(s => s.in_speed_window === true);
-        if (inWinSamples.length >= 2) {
-          const inUmin = Math.min(...inWinSamples.map(s => s.u));
-          const inUmax = Math.max(...inWinSamples.map(s => s.u));
-          const xLo = padL + (inUmin - uMin) / (uMax - uMin) * chW;
-          const xHi = padL + (inUmax - uMin) / (uMax - uMin) * chW;
-          ctx.fillStyle = "rgba(74, 144, 226, 0.10)";
-          ctx.fillRect(xLo, padT, xHi - xLo, chH);
-          ctx.save();
-          ctx.setLineDash([3, 3]);
-          ctx.strokeStyle = "rgba(74, 144, 226, 0.55)";
-          ctx.beginPath();
-          ctx.moveTo(xLo, padT); ctx.lineTo(xLo, padT + chH);
-          ctx.moveTo(xHi, padT); ctx.lineTo(xHi, padT + chH);
-          ctx.stroke();
-          ctx.restore();
-        }
 
         // Dotted horizontal gridlines every 10 mph
         ctx.save();
@@ -1031,112 +933,55 @@
         ctx.fillText("car position in frame", padL + chW/2 - 60, padT + chH + 24);
         ctx.fillText("mph", 2, 10);
 
-        // Line: connect consecutive in-grid samples directly. Earlier we
-        // broke the line at "large" time gaps to avoid drawing through
-        // missing data, but it broke on every minor detection hiccup
-        // (e.g., a single dropped frame at 15 fps creates a 130 ms gap
-        // that's invisible in the video). Now we keep the line continuous;
-        // brief detection gaps just produce a slightly steeper segment in
-        // that span, which honestly represents the data.
-        ctx.strokeStyle = "#4a90e2"; ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        samples.forEach((s, i) => {
-          const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
-          const y = padT + chH - (s.v_inst_mph - vMin) / (vMax - vMin) * chH;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        });
-        ctx.stroke();
-
-        // Dots at each detection. In-window samples (those that contributed
-        // to the regression-based reported speed) get a slightly larger,
-        // fully-opaque dot; out-of-window samples are dimmed so the user can
-        // see at a glance which points the headline number was derived from.
+        // v_inst dots: faded, mostly diagnostic. Bursts in PTS produce
+        // huge values; we clip the y-coord to the chart area so a 600 mph
+        // dot doesn't render off-screen confusing the user.
         samples.forEach(s => {
+          if (s.v_inst_mph == null) return;
           const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
-          const y = padT + chH - (s.v_inst_mph - vMin) / (vMax - vMin) * chH;
-          const inWin = s.in_speed_window === true;
-          ctx.fillStyle = inWin ? "#4a90e2" : "rgba(74, 144, 226, 0.35)";
+          const yRaw = padT + chH - (s.v_inst_mph - vMin) / (vMax - vMin) * chH;
+          const y = Math.max(padT, Math.min(padT + chH, yRaw));
+          const clipped = (y !== yRaw);
+          ctx.fillStyle = clipped ? "rgba(180, 90, 90, 0.55)" : "rgba(74, 144, 226, 0.45)";
           ctx.beginPath();
-          ctx.arc(x, y, inWin ? 3 : 2, 0, Math.PI*2);
+          ctx.arc(x, y, 2, 0, Math.PI * 2);
           ctx.fill();
         });
 
-        // Linear least-squares regression on the highlighted (in-window)
-        // v_inst points. v_inst = slope · u + intercept. The line is drawn
-        // from the leftmost to rightmost in-window sample's u. For a steady-
-        // speed car the line will be roughly horizontal at the reported
-        // speed; if the car is accelerating/decelerating through the window,
-        // the line tilts and you can see it visually.
-        // Speed-fit visualization. Both 'regression' (primary ±15 ft) and
-        // 'regression_wide' (widened ±25 ft) use the same math — the
-        // shaded window already reflects which size was used, so the same
-        // best-fit-through-in-window-samples line renders for both. We
-        // change the line color to amber when widened so it visually
-        // matches the low-confidence "?" icon in the row.
-        // Legacy 'median_fallback' (older JSONLs) → dashed amber line at
-        // the reported speed across the chart.
-        const speedMethod = m.speed_method;
-        const reportedMphForLine = (m.speed_mph != null && isFinite(m.speed_mph))
-          ? m.speed_mph : null;
-        if (speedMethod === 'median_fallback' && reportedMphForLine != null) {
-          const yMed = padT + chH - (reportedMphForLine - vMin) / (vMax - vMin) * chH;
-          ctx.save();
-          ctx.strokeStyle = "#d8a52e";
+        // v_running line: cumulative arc length / cumulative time. This is
+        // the canonical signal that drives the headline speed.
+        const runningSeq = samples.filter(s => s.v_running_mph != null);
+        if (runningSeq.length >= 2) {
+          ctx.strokeStyle = "#4a90e2";
           ctx.lineWidth = 2;
-          ctx.setLineDash([5, 4]);
           ctx.beginPath();
-          ctx.moveTo(padL, yMed); ctx.lineTo(padL + chW, yMed);
-          ctx.stroke();
-          ctx.restore();
-        } else if (inWinSamples.length >= 2) {
-          const n = inWinSamples.length;
-          let sumU = 0, sumV = 0, sumUV = 0, sumUU = 0;
-          inWinSamples.forEach(s => {
-            sumU  += s.u;
-            sumV  += s.v_inst_mph;
-            sumUV += s.u * s.v_inst_mph;
-            sumUU += s.u * s.u;
+          runningSeq.forEach((s, i) => {
+            const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
+            const y = padT + chH - (s.v_running_mph - vMin) / (vMax - vMin) * chH;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
           });
-          const denom = (n * sumUU) - (sumU * sumU);
-          if (Math.abs(denom) > 1e-9) {
-            const slope     = ((n * sumUV) - (sumU * sumV)) / denom;
-            const intercept = (sumV - slope * sumU) / n;
-            const uA = Math.min(...inWinSamples.map(s => s.u));
-            const uB = Math.max(...inWinSamples.map(s => s.u));
-            const vA = slope * uA + intercept;
-            const vB = slope * uB + intercept;
-            const xA = padL + (uA - uMin) / (uMax - uMin) * chW;
-            const xB = padL + (uB - uMin) / (uMax - uMin) * chW;
-            const yA = padT + chH - (vA - vMin) / (vMax - vMin) * chH;
-            const yB = padT + chH - (vB - vMin) / (vMax - vMin) * chH;
-            // Amber when widened, orange for the normal primary window.
-            ctx.strokeStyle = (speedMethod === 'regression_wide') ? "#d8a52e" : "#ff8a3d";
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(xA, yA); ctx.lineTo(xB, yB);
-            ctx.stroke();
-          }
+          ctx.stroke();
+          // Final running value = headline. Mark with a slightly bigger dot.
+          const last = runningSeq[runningSeq.length - 1];
+          const lx = padL + (last.u - uMin) / (uMax - uMin) * chW;
+          const ly = padT + chH - (last.v_running_mph - vMin) / (vMax - vMin) * chH;
+          ctx.fillStyle = "#4a90e2";
+          ctx.beginPath();
+          ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+          ctx.fill();
         }
 
-        // Canonical speed: prefer manifest's `speed_mph` (new schema), fall
-        // back to `v_homog_mph` (older JSONLs). Either way it's the same
-        // homography-derived value.
+        // Legend. The canonical speed is the running average at exit (same
+        // value the manifest reports). v_homog_mph is kept for compat with
+        // legacy schema.
         const canonicalSpeed = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
         const speedStr = (canonicalSpeed != null && isFinite(canonicalSpeed))
           ? `${canonicalSpeed.toFixed(2)} mph` : "—";
-        const halfWindowFt = (m.speed_window_half_m != null)
-          ? (m.speed_window_half_m / 0.3048).toFixed(0) : null;
-        let methodStr;
-        if (speedMethod === 'median_fallback') {
-          methodStr = ` · <span style="color:#d8a52e">median fallback over ${samples.length} samples (low confidence)</span>`;
-        } else if (speedMethod === 'regression_wide' && halfWindowFt) {
-          methodStr = ` · <span style="color:#d8a52e">regression on <b>${inWinSamples.length}</b> samples (widened to ±${halfWindowFt} ft)</span>`;
-        } else if (halfWindowFt && inWinSamples.length >= 2) {
-          methodStr = ` · regression on <b>${inWinSamples.length}</b> samples (±${halfWindowFt} ft)`;
-        } else {
-          methodStr = "";
-        }
+        const speedMethod = m.speed_method;
+        const methodStr = (speedMethod === 'running_avg')
+          ? ` · running_avg over <b>${runningSeq.length}</b> samples`
+          : (speedMethod ? ` · ${speedMethod}` : "");
         legend.innerHTML = `pass <b>${m.pass_id}</b> ${m.direction}-bound · `
           + `speed=<b>${speedStr}</b>${methodStr} · `
           + `${m.n_frames} frames`;
@@ -1174,16 +1019,19 @@
           if (d < bestD) { bestD = d; bestI = i; }
         }
         const s = samples[bestI];
+        // Marker rides the v_running line (the canonical signal). If the
+        // current sample doesn't have a v_running yet (early samples), fall
+        // back to v_inst so the marker stays visible.
         const u_at_t = s.u;
-        const v_at_t = s.v_inst_mph;
+        const v_at_t = (s.v_running_mph != null) ? s.v_running_mph : s.v_inst_mph;
+        if (v_at_t == null) return;
+        const yRaw = padT + chH - (v_at_t - vMin) / (vMax - vMin) * chH;
         const x = padL + (u_at_t - uMin) / (uMax - uMin) * chW;
-        const y = padT + chH - (v_at_t - vMin) / (vMax - vMin) * chH;
+        const y = Math.max(padT, Math.min(padT + chH, yRaw));
         ctx.fillStyle = "#ffeb3b";
         ctx.strokeStyle = "#000";
         ctx.lineWidth = 1.5;
         ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
-        // Speed value next to the dot (uses the interpolated v_at_t so the
-        // label matches the dot position exactly)
         const lbl = `${v_at_t.toFixed(1)} mph`;
         ctx.font = "bold 12px system-ui";
         const tw = ctx.measureText(lbl).width;

@@ -1,6 +1,7 @@
 """Click points on a full-resolution main-stream frame.
 
-Grabs a fresh frame from the MAIN stream (2048x1536) and opens it for
+Grabs a fresh frame from the MAIN stream (whatever its native resolution
+is — 2048x1536 on the old E1, 2560x1440 on the CX410) and opens it for
 clicking. Each click adds a numbered point. The numbering is stable
 (point 1 stays point 1 even if you undo later points), so you can
 describe what each point is afterwards (e.g. "1 is the manhole cover,

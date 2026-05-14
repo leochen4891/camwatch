@@ -56,7 +56,7 @@ _FT_TO_M = 0.3048
 # them while keeping the in-grid portion continuous.
 _GRID_X_MIN = -35.0 * _FT_TO_M  # 5 ft west of the actual west curb (-30 ft)
 _GRID_X_MAX = 0.0               # east curb (camera-side; tight is fine)
-_GRID_Y_MIN = -25.0 * _FT_TO_M  # south
+_GRID_Y_MIN = -40.0 * _FT_TO_M  # south — extended along with the calibration
 _GRID_Y_MAX = +25.0 * _FT_TO_M  # north
 _GRID_TOLERANCE_M = 0.5
 # West edge is extended past the physical curb because the bbox bottom-
@@ -77,22 +77,14 @@ _GRID_TOLERANCE_M = 0.5
 _STATIONARY_WINDOW_FRAMES = 30
 _STATIONARY_SPREAD_M = 0.5
 
-# Centered Y-vs-t regression window for the canonical reported speed.
-# Samples whose projected Y is within ±_CENTERED_HALF_WINDOW_M of Y=0 (the
-# camera's perpendicular line) are used to fit Y = m·t + b; speed = |m|.
-# Anchoring at Y=0 puts the measurement in the part of the grid with the
-# smallest homography reprojection error.
-#
-# Tiered widening: try the primary (±15 ft) window first. When there are
-# too few samples in it for a stable fit — fast vehicles, frame drops, or
-# tracker splits — expand to ±25 ft (the full grid). Wider samples include
-# the noisier grid edges where homography reprojection is largest, so we
-# only fall back to the wider window when the primary one isn't enough.
-# A single noisy fast pass should be smoothed by more samples; a clean
-# slow pass with plenty of in-window samples stays on the tighter fit.
-_CENTERED_HALF_WINDOW_M = 15.0 * _FT_TO_M  # primary: ±15 ft = ±4.572 m
-_WIDER_HALF_WINDOW_M    = 25.0 * _FT_TO_M  # fallback: ±25 ft = full grid Y-extent
-_MIN_PRIMARY_SAMPLES    = 6                # widen when primary window has < this
+# Reported speed: cumulative-distance / cumulative-time from grid entry.
+# At each in-grid sample i (1-indexed): mph_i = arc_length(0..i) / (t_i - t_0).
+# The headline is the running average at grid exit. Robust to PTS-burst
+# stutter — a brief cluster of frames sharing nearly identical timestamps
+# doesn't perturb the totals, only the per-frame v_inst readings.
+# Wait for this many samples before computing (1-2 samples are too noisy
+# to be useful even as a "current" reading).
+_MIN_RUNNING_SAMPLES = 5
 
 # Night-mode (IR) gate. The Reolink E1 switches to monochrome IR illumination
 # in low light; speed measurements from those frames are unreliable because
@@ -261,6 +253,13 @@ class CaptureWorker(threading.Thread):
             int,
             deque[tuple[float, float, float, tuple[float, float, float, float]]],
         ] = {}
+        # Per-track hysteresis: once a track has been strictly inside the
+        # grid at least once, subsequent samples can drift up to
+        # _GRID_TOLERANCE_M past the strict bounds and still accumulate.
+        # Until that strict-entry happens we ignore samples in the tolerance
+        # band (avoids logging a trajectory for a car that only ever rides
+        # the slack zone at the curb).
+        self._entered_strict: dict[int, bool] = {}
 
     def is_night_mode(self) -> bool:
         """Latest night-mode state computed by the capture loop. Read by
@@ -313,18 +312,16 @@ class CaptureWorker(threading.Thread):
         traj: list[tuple[float, float, float, tuple[float, float, float, float]]],
         speed_mph: float | None,
         speed_method: str | None = None,
-        half_window_used_m: float = _CENTERED_HALF_WINDOW_M,
     ) -> None:
-        """Write per-frame trajectory + per-frame v_inst to events/pass_<pid>.jsonl.
+        """Write per-frame trajectory to events/pass_<pid>.jsonl.
 
         Format:
           line 0: manifest dict with pass-level metadata
-          line 1+: one dict per frame in the track's trajectory, with the
-                   real-PTS-anchored timestamp, ground-point pixel, full bbox,
-                   homography-projected (X, Y), and the instantaneous speed
-                   computed from this frame and the previous one.
-
-        v_inst on the first frame is null (no prior frame to diff against).
+          line 1+: one dict per frame, with PTS-anchored timestamp, ground
+                   pixel, bbox, homography-projected (X, Y), instantaneous
+                   speed (consecutive-frame diff — diagnostic), and the
+                   running average since the first sample (the canonical
+                   per-frame speed; final value matches the headline).
         """
         if self._homog is None or not traj:
             return
@@ -332,9 +329,6 @@ class CaptureWorker(threading.Thread):
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"pass_{pid}.jsonl"
 
-        # Project each frame's ground-point through H, then derive v_inst from
-        # consecutive (X, Y, t) triples. Done here once rather than per-frame
-        # in the hot loop.
         projected: list[tuple[float, float, float, tuple, float, float]] = []
         for ts, u, v, bb in traj:
             X, Y = self._homog.project(u, v)
@@ -342,21 +336,27 @@ class CaptureWorker(threading.Thread):
 
         rows: list[dict] = []
         t0 = projected[0][0]
+        cum_dist = 0.0
         for i, (ts, u, v, bb, X, Y) in enumerate(projected):
             in_grid = _in_grid(X, Y)
             v_inst_mph: float | None = None
-            # Only compute / publish v_inst when BOTH this frame and the prior
-            # frame lie inside the calibrated grid. Outside the grid the
-            # homography is extrapolating and the velocity reading would be
-            # unreliable, so we suppress it from the chart.
-            if i > 0 and in_grid:
+            v_running_mph: float | None = None
+            if i > 0:
                 ts_p, _, _, _, X_p, Y_p = projected[i - 1]
-                if _in_grid(X_p, Y_p):
-                    dt = ts - ts_p
-                    if dt > 0:
-                        d = ((X - X_p) ** 2 + (Y - Y_p) ** 2) ** 0.5
-                        v_inst_mph = (d / dt) * _MPH_PER_MPS
-            in_speed_window = abs(Y) <= half_window_used_m
+                dt_step = ts - ts_p
+                d_step = ((X - X_p) ** 2 + (Y - Y_p) ** 2) ** 0.5
+                cum_dist += d_step
+                # v_inst: only when both this and prior frame are in-grid
+                # (preserves the existing per-frame diagnostic; gets noisy
+                # spikes when PTS bursts cluster frames in time).
+                if in_grid and _in_grid(X_p, Y_p) and dt_step > 0:
+                    v_inst_mph = (d_step / dt_step) * _MPH_PER_MPS
+                # v_running: cumulative distance / cumulative time. Starts
+                # at min-samples and is the canonical speed signal — robust
+                # to PTS-burst stutter that breaks v_inst.
+                cum_dt = ts - t0
+                if (i + 1) >= _MIN_RUNNING_SAMPLES and cum_dt > 0:
+                    v_running_mph = (cum_dist / cum_dt) * _MPH_PER_MPS
             rows.append({
                 "frame": i,
                 "ts": ts,
@@ -367,8 +367,8 @@ class CaptureWorker(threading.Thread):
                 "X": X,
                 "Y": Y,
                 "in_grid": in_grid,
-                "in_speed_window": in_speed_window,
                 "v_inst_mph": v_inst_mph,
+                "v_running_mph": v_running_mph,
             })
 
         # Clip start = first crossing minus pre-roll. The recorder writes the
@@ -395,8 +395,7 @@ class CaptureWorker(threading.Thread):
             # legend that reads from manifest. Same canonical speed.
             "v_homog_mph": speed_mph if speed_mph is not None else float("nan"),
             "speed_mph": speed_mph,
-            "speed_method": speed_method,  # 'regression' | 'median_fallback' | None
-            "speed_window_half_m": float(half_window_used_m),
+            "speed_method": speed_method,  # 'running_avg' | None
             "n_frames": len(rows),
             "frame_size": list(self._homog.frame_size),
         }
@@ -446,6 +445,11 @@ class CaptureWorker(threading.Thread):
             self._recordings_dir,
             pre_seconds_before_a=self._cfg.clip_margin_s,
             post_seconds_after_b=self._cfg.clip_margin_s,
+            homography=self._homog,
+            grid_x_min=_GRID_X_MIN, grid_x_max=_GRID_X_MAX,
+            grid_y_min=_GRID_Y_MIN, grid_y_max=_GRID_Y_MAX,
+            grid_tolerance_m=_GRID_TOLERANCE_M,
+            min_running_samples=_MIN_RUNNING_SAMPLES,
         )
         self._recorder = recorder
         if self._homog is None:
@@ -614,19 +618,28 @@ class CaptureWorker(threading.Thread):
                     prof.record("on_road_filter", time.perf_counter() - t0)
 
                 # Per-track trajectory accumulation for homography-based speed
-                # AND for the per-pass JSONL trajectory log. Each entry stores
-                # ts (real PTS-anchored monotonic), the ground point, and the
-                # full bbox — the bbox isn't used for speed, but is captured
-                # so future visualization tools can render the box back over
-                # the clip frame. Bounded by deque(maxlen=200) per track;
-                # whole-track GC is piggybacked on the crossing detector's
-                # stale-track logic.
+                # AND for the per-pass JSONL trajectory log. Hysteresis-gated:
+                # don't accumulate until the bbox bottom-center has been
+                # strictly inside the calibrated rectangle at least once.
+                # After that, samples in the _GRID_TOLERANCE_M slack zone
+                # continue to accumulate so bbox jitter at the boundary
+                # doesn't drop samples from the speed fit. Bounded by
+                # deque(maxlen=200) per track; whole-track GC is piggybacked
+                # on the crossing detector's stale-track logic.
                 if self._homog is not None:
                     for tr in tracks:
-                        traj = self._trajectories.setdefault(
-                            int(tr.track_id), deque(maxlen=200),
-                        )
+                        tid = int(tr.track_id)
                         gx, gy = tr.ground_point
+                        X, Y = self._homog.project(float(gx), float(gy))
+                        strict_in = (
+                            _GRID_X_MIN <= X <= _GRID_X_MAX
+                            and _GRID_Y_MIN <= Y <= _GRID_Y_MAX
+                        )
+                        if not self._entered_strict.get(tid):
+                            if not strict_in:
+                                continue
+                            self._entered_strict[tid] = True
+                        traj = self._trajectories.setdefault(tid, deque(maxlen=200))
                         bb = tuple(float(x) for x in tr.bbox)
                         traj.append((fr.ts, float(gx), float(gy), bb))
 
@@ -645,6 +658,7 @@ class CaptureWorker(threading.Thread):
                     tid = int(tr.track_id)
                     if self._is_stationary(tid):
                         self._trajectories.pop(tid, None)
+                        self._entered_strict.pop(tid, None)
                         crossing.reset_in_grid_entry(tid)
 
                 t0 = time.perf_counter() if prof else 0.0
@@ -689,66 +703,24 @@ class CaptureWorker(threading.Thread):
                     stamp = captured_at.strftime("%Y%m%dT%H%M%S")
                     clip_name = f"cal_{stamp}_id{ev.track_id}_{ev.direction}.mp4"
 
-                    # Reported speed: linear regression of Y vs t over samples
-                    # whose projected Y is within ±15 ft of Y=0 (the camera's
-                    # perpendicular line, where reprojection error is smallest).
-                    # The slope of the fit IS the velocity component along the
-                    # road; we report its magnitude as the speed of the pass.
-                    # We also compute the legacy Method A (median of v_inst over
-                    # the full grid) for side-by-side comparison while the
-                    # methods are vetted; it's only logged, not stored.
-                    # Speed estimation: Y-vs-t regression with a tiered
-                    # window. The primary ±15 ft window gives the highest-
-                    # accuracy fit (homography error is smallest near Y=0).
-                    # When that window has fewer samples than _MIN_PRIMARY_-
-                    # SAMPLES — fast vehicles, frame drops, tracker splits,
-                    # or trajectories that start mid-grid — widen to ±25 ft
-                    # (the full grid) to gather more points. Same math, just
-                    # over a larger set. Both paths are "regression"; the
-                    # window size is recorded so the UI can flag widened
-                    # passes as lower confidence.
+                    # Reported speed: running average from grid entry —
+                    # `mph = cumulative_arc_length / (t_current - t_entry)`,
+                    # evaluated at grid exit. Robust to PTS-burst stutter:
+                    # bunched timestamps within the trajectory don't shift
+                    # the totals, only individual v_inst readings.
                     speed_mph: float | None = None
                     speed_method: str | None = None
                     n_speed_samples = 0
-                    speed_r2 = 0.0
-                    half_window_used_m = _CENTERED_HALF_WINDOW_M
-                    method_a_mph = float("nan")
-                    method_a_n = 0
                     if self._homog is not None:
                         traj_for_speed = list(self._trajectories.get(ev.track_id, ()))
                         speed_samples = [(t, u, v) for (t, u, v, _bb) in traj_for_speed]
-                        method_a_mph, method_a_n = self._homog.median_speed_in_grid(
-                            speed_samples,
-                            grid_x_min=_GRID_X_MIN, grid_x_max=_GRID_X_MAX,
-                            grid_y_min=_GRID_Y_MIN, grid_y_max=_GRID_Y_MAX,
-                            tolerance_m=_GRID_TOLERANCE_M,
+                        final_mph, _per_frame, n = self._homog.running_avg_speed(
+                            speed_samples, min_samples=_MIN_RUNNING_SAMPLES,
                         )
-
-                        # Tier 1: primary ±15 ft window
-                        primary_mph, primary_r2, primary_n = self._homog.centered_speed_y_regression(
-                            speed_samples,
-                            half_window_m=_CENTERED_HALF_WINDOW_M,
-                        )
-                        if (not (primary_mph != primary_mph)
-                                and primary_n >= _MIN_PRIMARY_SAMPLES):
-                            speed_mph = float(primary_mph)
-                            speed_method = "regression"
-                            speed_r2 = primary_r2
-                            n_speed_samples = primary_n
-                            half_window_used_m = _CENTERED_HALF_WINDOW_M
-                        else:
-                            # Tier 2: widen to ±25 ft (the full grid)
-                            wide_mph, wide_r2, wide_n = self._homog.centered_speed_y_regression(
-                                speed_samples,
-                                half_window_m=_WIDER_HALF_WINDOW_M,
-                            )
-                            if not (wide_mph != wide_mph) and wide_n >= 3:
-                                speed_mph = float(wide_mph)
-                                speed_method = "regression_wide"
-                                speed_r2 = wide_r2
-                                n_speed_samples = wide_n
-                                half_window_used_m = _WIDER_HALF_WINDOW_M
-                            # else: speed remains None (true insufficient data)
+                        if final_mph == final_mph:  # not NaN
+                            speed_mph = float(final_mph)
+                            speed_method = "running_avg"
+                            n_speed_samples = n
                     # Gate VIDEO recording on the configured capture-speed range.
                     # Thumbnails are always written so the list shows a preview
                     # for every pass. If speed is unknown (no calibration), we
@@ -793,15 +765,9 @@ class CaptureWorker(threading.Thread):
                         speed_method=speed_method,
                     )
                     if speed_mph is not None:
-                        method_a_str = (
-                            f"{method_a_mph:.2f}" if method_a_mph == method_a_mph else "—"
-                        )
-                        window_ft = int(round(half_window_used_m / _FT_TO_M))
-                        wide_tag = " WIDENED" if speed_method == "regression_wide" else ""
                         speed_str = (
                             f"{speed_mph:.2f} mph "
-                            f"(regression{wide_tag} on {n_speed_samples} samples, ±{window_ft} ft, "
-                            f"r²={speed_r2:.3f}; Method A median={method_a_str} mph over {method_a_n})"
+                            f"(running_avg over {n_speed_samples} samples)"
                         )
                     else:
                         speed_str = (
@@ -823,7 +789,6 @@ class CaptureWorker(threading.Thread):
                                 pid=pid, ev=ev, traj=traj,
                                 speed_mph=speed_mph,
                                 speed_method=speed_method,
-                                half_window_used_m=half_window_used_m,
                             )
                         except Exception as e:  # noqa: BLE001
                             log.warning(
@@ -834,6 +799,7 @@ class CaptureWorker(threading.Thread):
                         # so subsequent unrelated re-uses of this track_id (rare,
                         # but possible after BotSORT recycles IDs) start fresh.
                         self._trajectories.pop(ev.track_id, None)
+                        self._entered_strict.pop(ev.track_id, None)
         finally:
             recorder.flush()
             log.info("capture worker stopped")

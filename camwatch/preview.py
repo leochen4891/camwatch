@@ -52,39 +52,34 @@ class PreviewBuffer:
     ) -> None:
         """Pre-project the grid corners + inner lines into pixel space so the
         per-frame _render path can draw them with cheap polylines instead of
-        re-projecting every frame. Pass homography=None to disable the overlay
-        entirely (e.g., if calibration is missing)."""
+        re-projecting every frame. Each world-space segment is sampled into a
+        dense polyline so that lens distortion (if K+D are loaded on the
+        homography) is reflected in the rendered overlay. Pass homography=None
+        to disable the overlay entirely (e.g., if calibration is missing)."""
         if homography is None:
             self._grid_polylines = None
             return
-        inv = homography.inv_H
-
-        def to_px(X: float, Y: float) -> tuple[int, int]:
-            p = inv @ np.array([X, Y, 1.0])
-            return int(round(p[0] / p[2])), int(round(p[1] / p[2]))
 
         polylines: list[np.ndarray] = []
-        # Outer rectangle
-        outer = [
-            to_px(grid_x_min, grid_y_min),
-            to_px(grid_x_max, grid_y_min),
-            to_px(grid_x_max, grid_y_max),
-            to_px(grid_x_min, grid_y_max),
-            to_px(grid_x_min, grid_y_min),
+        # Outer rectangle — four edges, each as a dense polyline.
+        edges = [
+            (grid_x_min, grid_y_min, grid_x_max, grid_y_min),
+            (grid_x_max, grid_y_min, grid_x_max, grid_y_max),
+            (grid_x_max, grid_y_max, grid_x_min, grid_y_max),
+            (grid_x_min, grid_y_max, grid_x_min, grid_y_min),
         ]
-        polylines.append(np.array(outer, dtype=np.int32))
-        # Inner lines every 5 ft (1.524 m) — ladder of road-perpendicular lines
-        # along Y from grid_y_min..grid_y_max, plus road-parallel lines along
-        # X. Lets the user eyeball perspective and see when a vehicle's red
-        # ground-point lands in which cell.
+        outer = np.concatenate([homography.world_polyline(*e) for e in edges])
+        polylines.append(outer)
+        # Inner lines every 5 ft (1.524 m) — road-perpendicular along Y,
+        # road-parallel along X.
         step = 5.0 * 0.3048
         y = grid_y_min + step
         while y < grid_y_max - 1e-6:
-            polylines.append(np.array([to_px(grid_x_min, y), to_px(grid_x_max, y)], dtype=np.int32))
+            polylines.append(homography.world_polyline(grid_x_min, y, grid_x_max, y))
             y += step
         x = grid_x_min + step
         while x < grid_x_max - 1e-6:
-            polylines.append(np.array([to_px(x, grid_y_min), to_px(x, grid_y_max)], dtype=np.int32))
+            polylines.append(homography.world_polyline(x, grid_y_min, x, grid_y_max))
             x += step
         self._grid_polylines = polylines
 
@@ -130,16 +125,15 @@ class PreviewBuffer:
 
         ih, iw = img.shape[:2]
 
-        # Calibrated measurement grid (yellow outer rectangle, dim inner
-        # 5-ft cells). Drawn first so detection bboxes render on top.
+        # Calibrated measurement grid: every line drawn with the same color
+        # and width so the eye isn't tricked into reading a thicker outer
+        # rectangle as "smaller adjacent cells". Drawn first so detection
+        # bboxes render on top.
         if self._show_grid and self._grid_polylines:
-            outer_color = (0, 255, 255)   # yellow
-            inner_color = (60, 140, 140)  # dim yellow
-            for i, pl in enumerate(self._grid_polylines):
+            grid_color = (0, 255, 255)  # bright yellow, same for outer & inner
+            for pl in self._grid_polylines:
                 pts = (pl.astype(np.float64) * scale).astype(np.int32)
-                color = outer_color if i == 0 else inner_color
-                thickness = 2 if i == 0 else 1
-                cv2.polylines(img, [pts], False, color, thickness, cv2.LINE_AA)
+                cv2.polylines(img, [pts], False, grid_color, 1, cv2.LINE_AA)
 
         # Bboxes + ground points
         for t in tracks:

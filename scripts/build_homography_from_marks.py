@@ -1,13 +1,17 @@
-"""Build the homography matrix from 13 hand-clicked points on the asphalt.
+"""Build the homography matrix from 17 hand-clicked points on the asphalt.
 
-Layout (per the user's marking session):
-  Points 1..11   East curb, north→south, 5 ft apart.
-                 Point 6 is at the camera-perpendicular line.
-                 → world Y from +25 ft (point 1) to -25 ft (point 11), X = 0.
-  Point 12       West curb, NW corner — perpendicular across from point 1.
-                 → world (X = -road_width, Y = +25 ft).
-  Point 13       West curb, SW corner — perpendicular across from point 11.
+Layout (per the user's marking session, CX410W era):
+  Points 1..14   East curb, north→south, 5 ft apart.
+                 Point 6 is at the camera-perpendicular line (origin).
+                 → world Y from +25 ft (point 1) to -40 ft (point 14), X = 0.
+                 Points 12..14 are the south-extension dots added after the
+                 camera upgrade; points 1..11 are the original east-curb anchors.
+  Point 15       West curb, new SW corner — perpendicular across from point 14.
+                 → world (X = -road_width, Y = -40 ft).
+  Point 16       West curb, old SW corner — perpendicular across from point 11.
                  → world (X = -road_width, Y = -25 ft).
+  Point 17       West curb, old NW corner — perpendicular across from point 1.
+                 → world (X = -road_width, Y = +25 ft).
 
 Coordinate system:
   Origin = point 6 (east curb, camera's perpendicular).
@@ -18,9 +22,9 @@ Speed = |dY/dt| in this frame (the road runs along Y), independent of the
 assumed road width — the 5 ft east-curb spacing alone fixes the Y-axis
 scale.
 
-Pixel coords from the marking session are in main-stream space (2048x1536),
-which is also what the live capture worker now sees. H is fit directly
-against main-stream pixels → meters.
+Pixel coords from the marking session are in main-stream space (read from
+the marked_points.yaml the clicker wrote), which is also what the live
+capture worker sees. H is fit directly against main-stream pixels → meters.
 """
 
 from __future__ import annotations
@@ -40,78 +44,59 @@ BACKUP_HOMOG = REPO / "config" / "homography.gps_v1.yaml"
 
 FT_TO_M = 0.3048
 SPACING_FT = 5.0
-FRAME_W, FRAME_H = 2048, 1536  # main-stream resolution H is fit against
 ROAD_WIDTH_FT = 30.0  # ~matches GPS-derived 30.1 ft; only affects X-axis, not speed
 
 
 def world_for(idx: int) -> tuple[float, float]:
     """Return (X, Y) in meters for marked point `idx`."""
-    if 1 <= idx <= 11:
-        # idx 1 → +25 ft, idx 6 → 0, idx 11 → -25 ft
+    if 1 <= idx <= 14:
+        # idx 1 → +25 ft, idx 6 → 0, idx 11 → -25 ft, idx 14 → -40 ft
         y_ft = (6 - idx) * SPACING_FT
         return (0.0, y_ft * FT_TO_M)
-    if idx == 12:
-        return (-ROAD_WIDTH_FT * FT_TO_M, +5 * SPACING_FT * FT_TO_M)
-    if idx == 13:
-        return (-ROAD_WIDTH_FT * FT_TO_M, -5 * SPACING_FT * FT_TO_M)
+    if idx == 15:
+        return (-ROAD_WIDTH_FT * FT_TO_M, -8 * SPACING_FT * FT_TO_M)  # Y = -40 ft
+    if idx == 16:
+        return (-ROAD_WIDTH_FT * FT_TO_M, -5 * SPACING_FT * FT_TO_M)  # Y = -25 ft
+    if idx == 17:
+        return (-ROAD_WIDTH_FT * FT_TO_M, +5 * SPACING_FT * FT_TO_M)  # Y = +25 ft
     raise ValueError(f"unexpected idx {idx}")
 
 
 def main() -> None:
     data = yaml.safe_load(MARKED.read_text())["marked_points"]
     pts = data["points"]
-    if len(pts) != 13:
-        raise SystemExit(f"expected 13 marked points, got {len(pts)}")
+    if len(pts) != 17:
+        raise SystemExit(f"expected 17 marked points, got {len(pts)}")
+    frame_w, frame_h = [int(v) for v in data["frame_size"]]
+    print(f"Fitting against main-stream frame_size={frame_w}x{frame_h}")
     main_pixels: dict[int, tuple[float, float]] = {
         int(p["idx"]): (float(p["pixel"][0]), float(p["pixel"][1])) for p in pts
     }
-    if set(main_pixels.keys()) != set(range(1, 14)):
-        raise SystemExit(f"expected indices 1..13, got {sorted(main_pixels.keys())}")
+    if set(main_pixels.keys()) != set(range(1, 18)):
+        raise SystemExit(f"expected indices 1..17, got {sorted(main_pixels.keys())}")
 
-    # Build the 13-anchor calibration set against main-stream pixels:
-    #   - 4 corners (raw clicks): NE=1, SE=11, NW=12, SW=13
-    #   - 9 inner east-curb anchors at raw click positions.
-    NE = main_pixels[1]
-    SE = main_pixels[11]
-    NW = main_pixels[12]
-    SW = main_pixels[13]
-    inner_dots = [main_pixels[i] for i in range(2, 11)]  # points 2..10
-
-    def frac_along(p: tuple[float, float]) -> float:
-        vx = SE[0] - NE[0]
-        vy = SE[1] - NE[1]
-        L2 = vx * vx + vy * vy
-        if L2 == 0:
-            return 0.0
-        return ((p[0] - NE[0]) * vx + (p[1] - NE[1]) * vy) / L2
-
-    inner_y_ft = [+20, +15, +10, +5, 0, -5, -10, -15, -20]  # for points 2..10
-
+    # All 17 raw clicks → world coords. findHomography does least-squares,
+    # so we just feed every anchor in.
     src_anchors: list[tuple[float, float]] = []
     dst_anchors: list[tuple[float, float]] = []
     anchor_labels: list[str] = []
-
-    # 4 corners (raw clicks)
-    for label, idx, world_xy in [
-        ("NE (point 1)", 1, world_for(1)),
-        ("SE (point 11)", 11, world_for(11)),
-        ("NW (point 12)", 12, world_for(12)),
-        ("SW (point 13)", 13, world_for(13)),
-    ]:
+    for idx in range(1, 18):
         src_anchors.append(main_pixels[idx])
+        world_xy = world_for(idx)
         dst_anchors.append(world_xy)
-        anchor_labels.append(label)
-
-    # 9 inner east-curb anchors at the user's RAW click positions. No
-    # smoothing kernel — earlier we used a 0.25/0.5/0.25 kernel with NE/SE
-    # corners as boundary "neighbors", but that pulled the anchors away
-    # from the actual asphalt white marks the user painted, which made
-    # rendered grid lines miss the dots. Trusting raw clicks puts each
-    # grid line through the dot it represents.
-    for idx, y_ft in zip(range(2, 11), inner_y_ft):
-        src_anchors.append(main_pixels[idx])
-        dst_anchors.append((0.0, y_ft * FT_TO_M))
-        anchor_labels.append(f"east-curb @ Y={y_ft:+}ft (raw pt{idx})")
+        if idx == 1:
+            tag = "east-curb NE (pt1, Y=+25ft)"
+        elif idx == 14:
+            tag = "east-curb new-SE (pt14, Y=-40ft)"
+        elif idx == 15:
+            tag = "west-curb new-SW (pt15, Y=-40ft)"
+        elif idx == 16:
+            tag = "west-curb old-SW (pt16, Y=-25ft)"
+        elif idx == 17:
+            tag = "west-curb old-NW (pt17, Y=+25ft)"
+        else:
+            tag = f"east-curb @ Y={world_xy[1]/FT_TO_M:+.0f}ft (raw pt{idx})"
+        anchor_labels.append(tag)
 
     src = np.array(src_anchors, dtype=np.float32)
     dst = np.array(dst_anchors, dtype=np.float32)
@@ -147,21 +132,21 @@ def main() -> None:
     payload = {
         "homography": {
             "H": H.tolist(),
-            "frame_size": [FRAME_W, FRAME_H],
+            "frame_size": [frame_w, frame_h],
             "origin": "point 6 — east curb, camera's perpendicular",
             "axes": "+X = east (toward camera); +Y = along road toward point 1 (north-ish)",
             "road_width_ft": ROAD_WIDTH_FT,
             "spacing_ft": SPACING_FT,
-            "method": "13-anchor (4 corners + 9 raw east-curb clicks) least-squares fit, main-stream pixels",
+            "method": "17-anchor (14 east-curb + 3 west-curb raw clicks) least-squares fit, main-stream pixels",
             "max_reprojection_error_m": err_max,
             "mean_reprojection_error_m": err_mean,
             "pixel_pts": [
                 {"idx": i, "u": float(main_pixels[i][0]), "v": float(main_pixels[i][1])}
-                for i in range(1, 14)
+                for i in range(1, 18)
             ],
             "meter_pts": [
                 {"idx": i, "X": float(world_for(i)[0]), "Y": float(world_for(i)[1])}
-                for i in range(1, 14)
+                for i in range(1, 18)
             ],
         }
     }

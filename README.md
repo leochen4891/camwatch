@@ -12,11 +12,11 @@ Local traffic-speed monitor for a residential street. Pulls a live RTSP feed fro
 ## What it does
 
 ```
-RTSP frames (main stream, 2048×1536)
+RTSP frames (main stream, camera-dependent; 2560×1440 on the CX410W)
    ↓
 YOLO11(large) detect + BotSORT track
    ↓
-homography projection (pixels → road-plane meters)
+homography projection (pixels → road-plane meters; lens-undistorted first)
    ↓
 grid entry/exit trigger
    ↓
@@ -48,29 +48,66 @@ Prerequisites: a Reolink camera with RTSP enabled, Python 3.12, and an NVIDIA GP
 
 ## Calibration
 
-The runtime needs one artifact: `config/homography.yaml`, a 3×3 matrix mapping main-stream pixel coordinates (2048×1536) to road-plane meters. Producing it is a physical step plus a one-shot script run.
+The runtime needs one artifact: `config/homography.yaml`. It holds three matrices: `K` (camera intrinsics), `D` (5-coefficient lens distortion), and `H` (homography from *undistorted* pixels to road-plane meters). A wide-angle lens (the CX410W's ~89° HFOV) introduces enough barrel distortion that a homography alone can't absorb it — running with H-only gave mean reprojection error of 63 cm; the joint `K + D + H` fit drops that to ~6 cm.
 
-![13 painted asphalt anchors (1-11 along the east curb at 5-foot spacings, 12-13 at the west curb corners) with the homography grid projected over them.](docs/images/camwatch-calibration-dots.png)
+`K + D` come from **scene-constrained self-calibration**, not a chessboard. The same 17 painted anchors that constrain the homography also constrain the lens distortion (14 dots must be colinear in world; 3 west-curb dots must be colinear and parallel; spacing must be 5 ft). `scipy.optimize.least_squares` solves for `(fx, k1..k3, p1, p2, H)` jointly. See `scripts/fit_distortion_from_scene.py` for the math.
 
-1. **Paint 13 anchors on the road** with a tape measure: 4 corners (NE/SE/NW/SW curbs) of a 30 ft × 50 ft rectangle, plus 9 along the east curb at exact 5-foot intervals (`Y = +25, +20, ..., −20, −25 ft`, all at `X = 0`). The 9 along-the-curb anchors fix the Y scale absolutely, so reported speed doesn't depend on the road-width measurement.
+![Painted asphalt anchors (originally 13 in the E1 era — now 14 east-curb + 3 west-curb = 17 with the south extension) with the homography grid projected over them.](docs/images/camwatch-calibration-dots.png)
 
-2. **Capture a clean frame** with all 13 dots visible (any frame-grab tool works).
+### First-time setup
 
-3. **Click each dot in order**:
+1. **Paint 17 anchors on the road** with a tape measure:
+   - **14 along the east curb** at exact 5-foot intervals (`Y = +25, +20, ..., −25, −30, −35, −40 ft`, all at `X = 0`). The east-curb spacing fixes the Y scale absolutely, so reported speed doesn't depend on the road-width measurement.
+   - **3 along the west curb**: NW corner across from `Y = +25 ft`, SW corner across from `Y = −25 ft`, and the new south-extension SW across from `Y = −40 ft` (all at `X = −30 ft`).
+
+   Painted dots can't always go on the actual curb stone (it's recessed and unreadable). The dot line ends up a few feet inboard of the curb edge; that's fine — our coordinate system is anchored to the dot line, not the curb.
+
+2. **Capture a fresh frame and click each anchor**:
    ```sh
-   uv run python scripts/mark_points.py --frame path/to/frame.jpg --with-grid
+   uv run python scripts/mark_points.py
    ```
-   Writes `config/marked_points.yaml`. The `--with-grid` flag overlays the current homography's 5 ft lines so you can see drift before re-clicking; omit it on a fresh setup.
+   Grabs a keyframe from the RTSP main stream, opens it for clicking, writes `config/marked_points.yaml`. Click order: 1–14 along the east curb north → south, then the 3 west-curb dots (new SW first, then old SW and old NW).
 
-4. **Build the homography**:
+3. **Fit the homography**:
    ```sh
-   uv run python scripts/build_homography_from_marks.py
+   uv run python scripts/fit_distortion_from_scene.py
    ```
-   Reads `marked_points.yaml`, fits via `cv2.findHomography`, writes `config/homography.yaml`. Prints per-anchor reprojection error; a healthy fit is < 10 cm mean and < 20 cm max.
+   Reads `marked_points.yaml`, jointly fits `(fx, D, H)` via Levenberg-Marquardt, writes `config/homography.yaml`. Prints per-anchor reprojection error; a healthy fit is < 10 cm mean and < 20 cm max. The CX410W lens lands around 6 cm mean / 15 cm max.
 
-5. **Verify** in the web UI by toggling Settings → Live preview → Show measurement grid on the preview.
+### Recalibrating after a camera change or move
 
-If the camera moves, redo step 3 onward.
+Use `scripts/inspect_homography.py` — a single interactive tool that combines verification, anchor drag, refit, and save. Especially handy when the camera is bumped or swapped but the painted dots haven't moved.
+
+```sh
+uv run python scripts/inspect_homography.py
+```
+
+Opens an OpenCV window with the calibration frame and the current grid projected over it. Keys:
+
+| key | action |
+|---|---|
+| `1` | toggle red outer rectangle (corner anchors 1, 14, 15, 17 become draggable) |
+| `2` / `3` | toggle 5 ft / 1 ft grid |
+| `4` | toggle yellow X/Y axes |
+| `5` | toggle all anchor dots (all 17 become draggable) |
+| `r` | refresh: grab a fresh RTSP frame (anchor positions kept) |
+| drag | move any visible anchor; the grid stays stale until refit |
+| `c` | refit the homography from current anchor positions |
+| `s` | save: writes back to `marked_points.yaml` + `homography.yaml` |
+| `w` | save current view as a PNG |
+| `+` / `-` | grid line thickness |
+| `q` | quit |
+
+Typical recalibration loop:
+
+1. `r` → grab fresh frame
+2. `5` → show all 17 dots; the dots show where the *current* calibration thinks they are
+3. Drag each dot that's off, onto the actual painted spot in the frame
+4. `c` → refit; status bar shows new mean / max reprojection error
+5. Iterate steps 3 + 4 until error is small enough and visual alignment is good
+6. `s` → save
+
+Then bring the service back up (`sudo systemctl start camwatch`) and verify in the web UI: Settings → Live preview → Show measurement grid.
 
 ## Run
 
@@ -102,8 +139,10 @@ camwatch/
 │                       to monotonic time at first frame of each session.
 ├── detect.py           YOLO11 + BotSORT wrapper. Weights and device are
 │                       read from config; default is yolo11l.pt on CUDA.
-├── homography.py       Loads H from config/homography.yaml. Exposes project()
-│                       and centered_speed_y_regression().
+├── homography.py       Loads K + D + H from config/homography.yaml. project()
+│                       runs cv2.undistortPoints first, then the 3×3 matmul.
+│                       Also exposes centered_speed_y_regression() and
+│                       world_to_pixel() (for distortion-aware overlay rendering).
 ├── grid_crossing.py    "Pass" = track enters the grid then exits (or ages
 │                       out while inside). Replaces the old 2-line trigger.
 ├── capture_worker.py   Detect → on-road filter (in-grid check) → trajectory
@@ -154,9 +193,12 @@ Most are also editable in-app. Camera credentials in `.env` (`REOLINK_USER`, `RE
 camwatch/                 # runtime source (modules above)
 config/                   # config.yaml, calibration.yaml (gitignored);
                           # marked_points.yaml + homography.yaml (tracked)
-scripts/                  # mark_points.py, build_homography_from_marks.py,
-                          # render_homography_overlay.py, test_stream.py,
-                          # timing diagnostics
+scripts/                  # mark_points.py             initial 17-dot click
+                          # fit_distortion_from_scene.py  K+D+H joint fit
+                          # inspect_homography.py      interactive drag + refit
+                          # build_homography_from_marks.py  legacy H-only fit
+                          # render_homography_overlay.py    static PNG render
+                          # test_stream.py, timing diagnostics
 docs/images/              # README screenshots
 ```
 
@@ -165,8 +207,8 @@ Gitignored at runtime: `camwatch.db`, `events/`, `recordings/`, and `*.pt` (ultr
 ## Scope and limitations
 
 - **One camera, one road segment.** Multi-camera or multi-road setups need separate homographies and trigger logic.
-- **Camera must not move.** Calibration is tied to the painted-anchor pixel positions. If the camera is bumped, redo the click step.
+- **Camera must not move (much).** Calibration is tied to the painted-anchor pixel positions. Small bumps can be repaired in a few minutes with `scripts/inspect_homography.py`'s drag-refit-save loop; larger moves (significantly different angle) may need a full re-paint of the anchors.
 - **Auto-paused at night.** When the camera switches to IR illumination (frames go monochrome), detection pauses. Toggle off in settings if you want to capture night data, with the understanding that headlight-only readings have much higher error.
 - **Tracker splits lower confidence.** When BotSORT briefly loses a car (occlusion, YOLO confidence dip) the same physical vehicle gets two track IDs. The tiered regression handles this and flags the pass with a `?` chip; a larger YOLO model would reduce the rate.
-- **Single main stream.** Detection, tracking, clips, and thumbnails all come from the camera's main stream (2048×1536). The pre-migration dual-stream pipeline is gone; see [the camwatch-3 post](https://leidevs.com/blog/camwatch-3/) for the architectural rationale.
+- **Single main stream.** Detection, tracking, clips, and thumbnails all come from the camera's main stream (resolution is camera-dependent: 2048×1536 on the original E1, 2560×1440 on the current CX410W). The pre-migration dual-stream pipeline is gone; see [the camwatch-3 post](https://leidevs.com/blog/camwatch-3/) for the architectural rationale.
 - **Vehicle enrichment is opt-in.** The DB columns and UI filter exist in the runtime, but populating them is a separate job (see the section above). Without it, the filter UI simply has nothing to match against.

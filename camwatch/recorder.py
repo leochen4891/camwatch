@@ -62,7 +62,12 @@ _BLUE_BRIGHT = (220, 120, 0)
 _DIM = (90, 90, 90)
 _WHITE = (255, 255, 255)
 _BLACK = (0, 0, 0)
+_GRID_YELLOW = (0, 255, 255)   # bright yellow grid lines (BGR); matches preview
+_TRAIL_RED = (0, 0, 255)       # focus track's bottom-center trail (same as bbox)
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+_FT_TO_M = 0.3048
+_MPH_PER_MPS = 2.2369362920544
 
 
 class ClipRecorder:
@@ -75,6 +80,17 @@ class ClipRecorder:
         max_clip_seconds: float = 5.0,
         ring_seconds: float = 12.0,
         max_width: int = 2560,
+        # Burn-in overlay: pass the homography + grid bounds and each clip
+        # frame will get the measurement grid (thin yellow), the focus
+        # track's ground-point trail, and a running-stats label above the
+        # focus bbox. Leave homography=None to disable the burn-in.
+        homography: Any | None = None,
+        grid_x_min: float = 0.0,
+        grid_x_max: float = 0.0,
+        grid_y_min: float = 0.0,
+        grid_y_max: float = 0.0,
+        grid_tolerance_m: float = 0.5,
+        min_running_samples: int = 5,
     ) -> None:
         self._dir = Path(recordings_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +101,17 @@ class ClipRecorder:
         self._max_width = max_width
         self._size: tuple[int, int] | None = None
         self._scale: float = 1.0
+        self._homog = homography
+        self._grid_x_min = float(grid_x_min)
+        self._grid_x_max = float(grid_x_max)
+        self._grid_y_min = float(grid_y_min)
+        self._grid_y_max = float(grid_y_max)
+        self._grid_tol = float(grid_tolerance_m)
+        self._min_running = int(min_running_samples)
+        # Precomputed yellow grid polylines, in scaled clip pixel coords.
+        # Built lazily on the first push() (we need to know _scale first).
+        self._grid_polylines: list[np.ndarray] = []
+        self._grid_built: bool = False
         # Ring buffer is sized in REAL TIME (PTS seconds), not in frame count.
         # The previous frame-count sizing (int(ring_seconds * fps)) used the
         # playback fps, not the actual capture fps, so a 7 s × 10 fps = 70-frame
@@ -101,6 +128,9 @@ class ClipRecorder:
 
     def push(self, frame: np.ndarray, ts: float, detections: list[Any]) -> None:
         small = self._scale_frame(frame)
+        if not self._grid_built and self._homog is not None and self._size is not None:
+            self._build_grid_polylines()
+            self._grid_built = True
         rec = _FrameRec(image=small, ts=ts, detections=list(detections))
         self._ring.append(rec)
         # Time-based eviction: drop frames older than ring_seconds before the
@@ -179,6 +209,108 @@ class ClipRecorder:
             self._finalize(clip)
         self._active.clear()
 
+    def _build_grid_polylines(self) -> None:
+        """Sample the homography's world rectangle into pixel-space polylines
+        (5 ft grid + outer bound), scaled to the clip frame size. Calls into
+        Homography.world_polyline() so the grid follows lens distortion."""
+        homog = self._homog
+        if homog is None:
+            return
+        s = self._scale
+        x_min_ft = int(round(self._grid_x_min / _FT_TO_M))
+        x_max_ft = int(round(self._grid_x_max / _FT_TO_M))
+        y_min_ft = int(round(self._grid_y_min / _FT_TO_M))
+        y_max_ft = int(round(self._grid_y_max / _FT_TO_M))
+        polylines: list[np.ndarray] = []
+
+        def scaled_polyline(X1: float, Y1: float, X2: float, Y2: float) -> np.ndarray:
+            pl = homog.world_polyline(X1, Y1, X2, Y2)
+            if len(pl) == 0:
+                return pl
+            return (pl.astype(np.float64) * s).astype(np.int32)
+
+        # 5 ft sub-grid (along X and Y)
+        for x_ft in range(x_min_ft, x_max_ft + 1, 5):
+            X = x_ft * _FT_TO_M
+            polylines.append(scaled_polyline(X, self._grid_y_min, X, self._grid_y_max))
+        for y_ft in range(y_min_ft, y_max_ft + 1, 5):
+            Y = y_ft * _FT_TO_M
+            polylines.append(scaled_polyline(self._grid_x_min, Y, self._grid_x_max, Y))
+        self._grid_polylines = [pl for pl in polylines if len(pl) >= 2]
+
+    def _compute_focus_state(self, clip: _ActiveClip) -> list[dict]:
+        """Walk clip.frames in order, accumulating distance + time for the
+        focus track. Hysteresis on grid membership: a sample only starts
+        counting once the focus track's bbox bottom-center has been
+        strictly inside the grid at least once; after that, samples in
+        the _grid_tol slack zone past the strict bounds continue to
+        accumulate. The same in_grid flag drives the rendered trail.
+        Returns one dict per frame; empty dict if the focus track isn't
+        visible / projectable in that frame.
+        """
+        n = len(clip.frames)
+        states: list[dict] = [{} for _ in range(n)]
+        if self._homog is None:
+            return states
+        xmin = self._grid_x_min - self._grid_tol
+        xmax = self._grid_x_max + self._grid_tol
+        ymin = self._grid_y_min - self._grid_tol
+        ymax = self._grid_y_max + self._grid_tol
+        cum_dist = 0.0
+        first_in_grid_ts: float | None = None
+        prev_xy: tuple[float, float] | None = None
+        in_grid_count = 0
+        entered_strict = False
+        s = self._scale
+        for i, rec in enumerate(clip.frames):
+            focus = None
+            for d in rec.detections:
+                if getattr(d, "track_id", None) == clip.focus_track_id:
+                    focus = d
+                    break
+            if focus is None or getattr(focus, "ground_point", None) is None:
+                continue
+            gx_full, gy_full = float(focus.ground_point[0]), float(focus.ground_point[1])
+            X, Y = self._homog.project(gx_full, gy_full)
+            strict_in = (
+                self._grid_x_min <= X <= self._grid_x_max
+                and self._grid_y_min <= Y <= self._grid_y_max
+            )
+            tol_in = (xmin <= X <= xmax and ymin <= Y <= ymax)
+            # Hysteresis: strict for entry, tolerance for exit.
+            if not entered_strict:
+                in_grid = strict_in
+                if strict_in:
+                    entered_strict = True
+            else:
+                in_grid = tol_in
+            ground_px = (int(round(gx_full * s)), int(round(gy_full * s)))
+            cum_dt = (rec.ts - first_in_grid_ts) if first_in_grid_ts is not None else 0.0
+            running_mph: float | None = None
+            if in_grid:
+                if first_in_grid_ts is None:
+                    first_in_grid_ts = rec.ts
+                    cum_dt = 0.0
+                elif prev_xy is not None:
+                    dx = X - prev_xy[0]
+                    dy = Y - prev_xy[1]
+                    cum_dist += (dx * dx + dy * dy) ** 0.5
+                prev_xy = (X, Y)
+                in_grid_count += 1
+                cum_dt = rec.ts - first_in_grid_ts
+                if in_grid_count >= self._min_running and cum_dt > 0:
+                    running_mph = (cum_dist / cum_dt) * _MPH_PER_MPS
+            states[i] = {
+                "ground_px": ground_px,
+                "X": X,
+                "Y": Y,
+                "in_grid": in_grid,
+                "cum_dist_m": cum_dist,
+                "cum_dt_s": cum_dt,
+                "running_mph": running_mph,
+            }
+        return states
+
     def _scale_frame(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
         if w <= self._max_width:
@@ -198,14 +330,9 @@ class ClipRecorder:
         # Always write the thumbnail; skip the .mp4 when the caller said so
         # (e.g., a pass outside the configured speed-capture range).
         if clip.record_video:
-            # H.264 via PyAV's libx264. We bypass cv2.VideoWriter because on
-            # Ubuntu the avc1 fourcc resolves to h264_v4l2m2m (a hardware
-            # encoder that isn't available on most boxes) and silently fails,
-            # leaving an unplayable mp4v fallback that browsers won't decode.
-            # PyAV is already a hard dep for RTSP decode; libx264 is shipped
-            # with the same FFmpeg build.
+            states = self._compute_focus_state(clip)
             try:
-                self._write_clip_h264(clip)
+                self._write_clip_h264(clip, states)
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "H.264 encode failed for %s (%s); falling back to mp4v",
@@ -216,8 +343,8 @@ class ClipRecorder:
                 if not writer.isOpened():
                     log.warning("clip writer failed to open at %s", clip.path)
                 else:
-                    for rec in clip.frames:
-                        writer.write(self._render(rec, clip))
+                    for i, rec in enumerate(clip.frames):
+                        writer.write(self._render(rec, clip, states, i))
                     writer.release()
         self._write_thumbnail(clip)
         log.debug(
@@ -230,7 +357,7 @@ class ClipRecorder:
             except Exception as e:  # noqa: BLE001
                 log.warning("clip on_finalize callback raised: %s", e)
 
-    def _write_clip_h264(self, clip: _ActiveClip) -> None:
+    def _write_clip_h264(self, clip: _ActiveClip, states: list[dict]) -> None:
         """Encode the clip's frames as H.264/AVC in an MP4 container.
 
         Uses libx264 (CPU) at preset=veryfast, crf=23 — fast enough that
@@ -276,7 +403,7 @@ class ClipRecorder:
                 "bf": "0",
             }
             for i, rec in enumerate(clip.frames):
-                img = self._render(rec, clip)
+                img = self._render(rec, clip, states, i)
                 frame = av.VideoFrame.from_ndarray(img, format="bgr24")
                 frame.pts = i
                 frame.time_base = tb
@@ -347,18 +474,32 @@ class ClipRecorder:
         scale = target_w / w
         return cv2.resize(frame, (target_w, max(1, int(round(h * scale)))))
 
-    def _render(self, rec: _FrameRec, clip: _ActiveClip) -> np.ndarray:
+    def _render(self, rec: _FrameRec, clip: _ActiveClip,
+                states: list[dict], i: int) -> np.ndarray:
         img = rec.image.copy()
         h, w = img.shape[:2]
         s = self._scale
 
-        # Line A / Line B vertical markers were drawn here historically for
-        # the 2-line speed-measurement debug view. The grid overlay rendered
-        # by the web player now provides equivalent (and more informative)
-        # spatial reference, so the burned-in lines are no longer drawn on
-        # the clip itself.
+        # Thin yellow measurement grid (precomputed in scaled coords).
+        for pl in self._grid_polylines:
+            cv2.polylines(img, [pl], False, _GRID_YELLOW, 1, cv2.LINE_AA)
+
+        # Trail of the focus track's past in-grid ground points up to this
+        # frame. Uses the same hysteresis-aware in_grid flag as the running
+        # average, so the trail and the speed accumulator stay in sync.
+        trail_pts: list[tuple[int, int]] = []
+        for j in range(i + 1):
+            st = states[j]
+            if st.get("in_grid") and "ground_px" in st:
+                trail_pts.append(st["ground_px"])
+        if len(trail_pts) >= 2:
+            arr = np.array(trail_pts, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [arr], False, _TRAIL_RED, 2, cv2.LINE_AA)
+            for p in trail_pts:
+                cv2.circle(img, p, 3, _TRAIL_RED, -1, cv2.LINE_AA)
 
         # Bboxes + ground points
+        focus_bbox_top: tuple[int, int] | None = None
         for d in rec.detections:
             tid = getattr(d, "track_id", None)
             bbox = getattr(d, "bbox", None)
@@ -372,9 +513,43 @@ class ClipRecorder:
                 cv2.rectangle(img, (x1, y1), (x2, y2), _RED, 2)
                 cv2.circle(img, (gx, gy), 6, _RED, -1)
                 cv2.circle(img, (gx, gy), 6, _WHITE, 1)
+                focus_bbox_top = (x1, y1)
             else:
                 cv2.rectangle(img, (x1, y1), (x2, y2), _GRAY, 1)
                 cv2.circle(img, (gx, gy), 3, _GRAY, -1)
+
+        # Running stats label above the focus bbox. d/t go on one line and
+        # V wraps to a second line below so the label fits within the frame
+        # even on the right edge.
+        st = states[i]
+        if focus_bbox_top is not None and st.get("ground_px") is not None:
+            cum_d = st.get("cum_dist_m", 0.0)
+            cum_t = st.get("cum_dt_s", 0.0)
+            mph = st.get("running_mph")
+            scale, thickness = 1.2, 4
+            (_, th_ref), _ = cv2.getTextSize("Hg", _FONT, scale, thickness)
+            line_dy = 3 * th_ref  # vertical gap between stacked baselines
+            if mph is not None:
+                line1 = f"d={cum_d:.2f} m  t={cum_t:.2f} s"
+                line2 = f"V={mph:.1f} mph"
+            elif st.get("in_grid"):
+                line1 = f"d={cum_d:.2f} m  t={cum_t:.2f} s"
+                line2 = "V=…"
+            else:
+                line1 = "(outside grid)"
+                line2 = None
+            lx = max(30, focus_bbox_top[0])
+            # Bottom-line baseline: leave a one-font-height gap between the
+            # bg rect and the bbox top (rect extends th_ref below baseline,
+            # so subtract 2*th_ref to get a clean th_ref gap above the box).
+            # Floor keeps the top of the stack on-frame.
+            ly_floor = 2 * th_ref + (line_dy if line2 is not None else 0) + 4
+            ly = max(ly_floor, focus_bbox_top[1] - 2 * th_ref)
+            if line2 is not None:
+                _stamp(img, line1, (lx, ly - line_dy), _WHITE, scale=scale, thickness=thickness, bg=True)
+                _stamp(img, line2, (lx, ly), _WHITE, scale=scale, thickness=thickness, bg=True)
+            else:
+                _stamp(img, line1, (lx, ly), _WHITE, scale=scale, thickness=thickness, bg=True)
 
         # Single header line: per-frame PTS timestamp. The camera's burned-
         # in wallclock OSD already lives at the bottom of the frame; the PTS
@@ -383,10 +558,10 @@ class ClipRecorder:
         _stamp(
             img,
             f"PTS time = {rec.ts:.3f}s",
-            (10, 22),
+            (30, 60),
             _WHITE,
-            scale=0.6,
-            thickness=2,
+            scale=1.2,
+            thickness=4,
             bg=True,
         )
         return img
@@ -404,5 +579,6 @@ def _stamp(
     if bg:
         (tw, th), _ = cv2.getTextSize(text, _FONT, scale, thickness)
         x, y = org
-        cv2.rectangle(img, (x - 4, y - th - 4), (x + tw + 4, y + 4), _BLACK, -1)
+        m = th  # background padding equals the rendered font height
+        cv2.rectangle(img, (x - m, y - th - m), (x + tw + m, y + m), _BLACK, -1)
     cv2.putText(img, text, org, _FONT, scale, color, thickness, cv2.LINE_AA)
