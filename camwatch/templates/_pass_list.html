@@ -27,23 +27,16 @@
     <button type="button" class="chip-clear" onclick="clearVehicleFilter()" title="Clear vehicle filter">×</button>
   </div>
 {% endif %}
-{% if pass_ids_active %}
-  <div class="vehicle-filter-chip">
-    Pass IDs: <strong>{{ pass_ids_active }}</strong>
-    {% if pass_ids_missing %}
-      <span class="muted">({{ pass_ids_missing | length }} not found: {{ pass_ids_missing | join(', ') }})</span>
-    {% endif %}
-    <button type="button" class="chip-clear" onclick="clearPassIdsFilter()" title="Clear pass-IDs filter">×</button>
-  </div>
-{% endif %}
 {% if not rows %}
   <p class="empty">No passes match these filters.</p>
 {% else %}
   {% macro list_controls() %}
-    {# Top/bottom bar with paginator on the left and per-page selector on
-       the right. The select uses form="filter-form" so HTMX includes it
-       in the next request even though it lives outside the form. #}
+    {# Top/bottom bar: refresh on the left, paginator centered, per-page on
+       the right. The select uses form="filter-form" so HTMX includes it in
+       the next request even though it lives outside the form. #}
     <nav class="list-controls">
+      <button type="button" class="muted-btn refresh-btn refresh-list-btn"
+              title="Refresh list" aria-label="Refresh list">↻</button>
       <div class="paginator">
         {% if total_pages and total_pages > 1 %}
           <button type="button" onclick="goToPage({{ page - 1 }})"

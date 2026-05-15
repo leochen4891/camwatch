@@ -422,32 +422,73 @@ class ClipRecorder:
         UI. The crop is taken from the raw frame, not the overlay-rendered
         frame written into the .mp4, so the thumb has no bbox/label/line
         overlays.
+
+        Candidate scoring: each frame containing the focus track gets a
+        score combining proximity to the clip midpoint and the maximum
+        overlap of any other detected vehicle with the focus car's padded
+        crop region. The lowest-scoring frame wins. This avoids picking
+        a midpoint frame where an opposite-direction car has driven
+        through the crop region (the street is two-lane so the only way
+        the focus can be "blocked" is by oncoming traffic).
         """
         if not clip.frames:
             return
         midpoint = (clip.t_a + clip.t_b) / 2.0
+        # Trade-off weight: a 50% occluder pushes the picker ~250 ms away
+        # from the midpoint, enough to skip a single overlapping frame
+        # without abandoning midpoint preference on clean passes.
+        occlusion_weight = 0.5
 
-        # Find the rec closest to midpoint where the focus track is detected.
-        best_with_focus: tuple[float, int, tuple[float, float, float, float]] | None = None
+        s = self._scale
+        best: tuple[float, int, tuple[float, float, float, float]] | None = None
         best_any: tuple[float, int] = (float("inf"), 0)
         for i, rec in enumerate(clip.frames):
             diff = abs(rec.ts - midpoint)
             if diff < best_any[0]:
                 best_any = (diff, i)
+            focus_bbox = None
+            other_bboxes: list[tuple[float, float, float, float]] = []
             for d in rec.detections:
+                bbox = getattr(d, "bbox", None)
+                if bbox is None:
+                    continue
                 if getattr(d, "track_id", None) == clip.focus_track_id:
-                    bbox = getattr(d, "bbox", None)
-                    if bbox is not None:
-                        if best_with_focus is None or diff < best_with_focus[0]:
-                            best_with_focus = (diff, i, bbox)
-                    break
+                    focus_bbox = bbox
+                else:
+                    other_bboxes.append(bbox)
+            if focus_bbox is None:
+                continue
+            # Padded crop region (matches the crop applied below).
+            bx1, by1, bx2, by2 = (v * s for v in focus_bbox)
+            bw = bx2 - bx1
+            bh = by2 - by1
+            pad_x = max(bw * 0.6, 40)
+            pad_y = max(bh * 0.7, 40)
+            cx1, cy1, cx2, cy2 = bx1 - pad_x, by1 - pad_y, bx2 + pad_x, by2 + pad_y
+            crop_area = max(1.0, (cx2 - cx1) * (cy2 - cy1))
+            max_overlap = 0.0
+            for ob in other_bboxes:
+                ox1, oy1, ox2, oy2 = (v * s for v in ob)
+                ix1 = max(cx1, ox1)
+                iy1 = max(cy1, oy1)
+                ix2 = min(cx2, ox2)
+                iy2 = min(cy2, oy2)
+                iw = max(0.0, ix2 - ix1)
+                ih = max(0.0, iy2 - iy1)
+                if iw == 0 or ih == 0:
+                    continue
+                overlap = (iw * ih) / crop_area
+                if overlap > max_overlap:
+                    max_overlap = overlap
+            score = diff + occlusion_weight * max_overlap
+            if best is None or score < best[0]:
+                best = (score, i, focus_bbox)
 
         crop: np.ndarray | None = None
-        if best_with_focus is not None:
-            _, idx, bbox = best_with_focus
+        if best is not None:
+            _, idx, bbox = best
             raw = clip.frames[idx].image
             fh, fw = raw.shape[:2]
-            s = self._scale
             bx1, by1, bx2, by2 = (v * s for v in bbox)
             bw = bx2 - bx1
             bh = by2 - by1

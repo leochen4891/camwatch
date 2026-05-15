@@ -160,7 +160,6 @@
           <input type="hidden" name="vehicle_make" id="vehicle-make" value="">
           <input type="hidden" name="vehicle_model" id="vehicle-model" value="">
           <input type="hidden" name="vehicle_color" id="vehicle-color" value="">
-          <input type="hidden" name="pass_ids" id="pass-ids-hidden" value="">
         </form>
       </section>
 
@@ -184,15 +183,6 @@
     </aside>
 
     <main class="app-shell-right">
-      <div class="list-toolbar">
-        <div class="pass-ids-filter">
-          <input type="text" id="pass-ids-input" placeholder="filter by pass IDs: 1626, 1647, …"
-                 autocomplete="off" spellcheck="false">
-          <button type="button" class="muted-btn" id="pass-ids-apply">Filter</button>
-        </div>
-        <button type="button" class="muted-btn refresh-btn" id="refresh-list-btn"
-                title="Refresh list" aria-label="Refresh list">↻</button>
-      </div>
       <div id="pass-list">
         {% include "_pass_list.html" %}
       </div>
@@ -525,7 +515,7 @@
 
     // Refresh button: re-trigger the filter-form to refetch /passes immediately.
     document.body.addEventListener("click", (e) => {
-      if (!e.target.closest("#refresh-list-btn")) return;
+      if (!e.target.closest(".refresh-list-btn")) return;
       htmx.trigger("#filter-form", "change");
     });
 
@@ -539,37 +529,6 @@
       saveFilterState();
       htmx.trigger("#filter-form", "change");
     }
-
-    // pass_ids filter: paste a comma/space-separated list of pass IDs and
-    // jump straight to those rows (bypasses every other filter on the server
-    // side). Not persisted across reloads — it's a spot-check tool.
-    function applyPassIdsFilter() {
-      const inp = document.getElementById("pass-ids-input");
-      const hidden = document.getElementById("pass-ids-hidden");
-      if (!inp || !hidden) return;
-      hidden.value = inp.value.trim();
-      const pageInput = document.getElementById("page-input");
-      if (pageInput) pageInput.value = "1";
-      htmx.trigger("#filter-form", "change");
-    }
-    function clearPassIdsFilter() {
-      const inp = document.getElementById("pass-ids-input");
-      const hidden = document.getElementById("pass-ids-hidden");
-      if (!inp || !hidden) return;
-      inp.value = "";
-      if (hidden.value === "") return;  // already clear
-      hidden.value = "";
-      htmx.trigger("#filter-form", "change");
-    }
-    document.body.addEventListener("click", (e) => {
-      if (e.target.closest("#pass-ids-apply")) applyPassIdsFilter();
-    });
-    document.body.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && e.target.id === "pass-ids-input") {
-        e.preventDefault();
-        applyPassIdsFilter();
-      }
-    });
 
     function toggleMenu(btn) {
       const menu = btn.nextElementSibling;

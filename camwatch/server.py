@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import time
 from contextlib import asynccontextmanager
@@ -300,7 +299,6 @@ def make_app(
         vehicle_make: str | None = None,
         vehicle_model: str | None = None,
         vehicle_color: str | None = None,
-        pass_ids: str | None = None,
     ):
         return _render_pass_list(
             request, cfg, db, direction, alerts_only,
@@ -308,7 +306,6 @@ def make_app(
             selected_buckets=buckets, page=page, page_size=page_size,
             vehicle_make=vehicle_make, vehicle_model=vehicle_model,
             vehicle_color=vehicle_color,
-            pass_ids=pass_ids,
         )
 
     @app.post("/passes/delete")
@@ -665,11 +662,13 @@ BUCKET_OVERFLOW_IDX = BUCKET_CAP_MPH // 5  # = 10, the ">50" bucket
 
 
 def _bucket_for(mph: float) -> int:
-    """5-mph buckets: 1..5 -> 0, 6..10 -> 1, …, 46..50 -> 9, >50 -> 10.
-    Pre-1 mph clamps to 0."""
-    if mph < 1:
+    """5-mph buckets keyed on the rounded mph (matches the row display, which
+    formats with %.0f). 1..5 -> 0, 6..10 -> 1, …, 46..50 -> 9, >50 -> 10.
+    Pre-1 mph (rounds to 0) clamps to bucket 0."""
+    r = round(mph)
+    if r < 1:
         return 0
-    return min(BUCKET_OVERFLOW_IDX, int((mph - 1) // 5))
+    return min(BUCKET_OVERFLOW_IDX, int((r - 1) // 5))
 
 
 def _bucket_label(idx: int) -> str:
@@ -1115,58 +1114,11 @@ def _render_pass_list(
     vehicle_make: str | None = None,
     vehicle_model: str | None = None,
     vehicle_color: str | None = None,
-    pass_ids: str | None = None,
 ):
     cal = cfg.load_calibration()
     dist_n = cal.line_distance_m_north if cal else 0
     dist_s = cal.line_distance_m_south if cal else 0
     threshold = cfg.alert_threshold_mph
-
-    # Explicit pass-ID lookup: bypass every other filter and the time window.
-    # Used for spot-checks (e.g. enrichment QA). Order matches the input list,
-    # and the histogram/heatmap are left alone so the user can return to their
-    # normal filter view by clearing this input.
-    if pass_ids and pass_ids.strip():
-        ids: list[int] = []
-        seen: set[int] = set()
-        for tok in re.split(r"[,\s]+", pass_ids.strip()):
-            if not tok:
-                continue
-            try:
-                pid = int(tok)
-            except ValueError:
-                continue
-            if pid not in seen:
-                seen.add(pid)
-                ids.append(pid)
-        rendered: list[dict] = []
-        for pid in ids:
-            p = db.get_pass(pid)
-            if p is None:
-                continue
-            rendered.append(render_pass(p, dist_n, dist_s, threshold))
-        return TEMPLATES.TemplateResponse(
-            request,
-            "_pass_list.html",
-            {
-                "rows": rendered,
-                "histogram": [],
-                "histogram_total": 0,
-                "histogram_all_default": True,
-                "include_oob_histogram": False,
-                "include_oob_heatmap": False,
-                "page": 1,
-                "page_size": max(len(rendered), 1),
-                "page_size_options": ALLOWED_PAGE_SIZES,
-                "total_pages": 1,
-                "total_filtered": len(rendered),
-                "vehicle_make": None,
-                "vehicle_model": None,
-                "vehicle_color": None,
-                "pass_ids_active": pass_ids.strip(),
-                "pass_ids_missing": [pid for pid in ids if not any(r["id"] == pid for r in rendered)],
-            },
-        )
 
     direction = direction if direction in ("N", "S") else None
     selected_buckets_set: set[int] = set(selected_buckets or [])

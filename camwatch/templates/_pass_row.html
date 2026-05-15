@@ -71,6 +71,10 @@
                   data-veh-color="{{ p.vehicle_color or '' }}"
                   onclick="filterByVehicleFromBtn(this)">🚗 Filter by this vehicle</button>
           {% endif %}
+          {% if p.has_clip %}
+          <a href="/passes/{{ p.id }}/clip"
+             download="pass_{{ p.id }}.mp4">⬇ Download video</a>
+          {% endif %}
           <button type="button"
                   hx-post="/passes/{{ p.id }}/delete"
                   hx-target="#pass-{{ p.id }}"

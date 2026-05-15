@@ -401,7 +401,7 @@ header {
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  min-height: 170px;
+  min-height: 255px;
 }
 .bar-wrap {
   display: flex;
@@ -428,7 +428,7 @@ header {
   display: flex;
   align-items: flex-end;
   width: 100%;
-  height: 100px;
+  height: 150px;
   background: transparent;
   border-bottom: 1px solid var(--border);
   border-radius: 2px;
@@ -495,29 +495,6 @@ header {
 
 main { padding: 16px 20px 80px; }
 .app-shell-right > #pass-list { max-width: 900px; margin: 0 auto; }
-.list-toolbar {
-  max-width: 900px;
-  margin: 0 auto 8px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.pass-ids-filter {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.pass-ids-filter input[type="text"] {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding: 8px 10px;
-  font-size: 14px;
-  min-height: 40px;
-}
 .refresh-btn {
   font-size: 22px;
   line-height: 1;
@@ -525,17 +502,20 @@ main { padding: 16px 20px 80px; }
   min-width: 48px;
   min-height: 40px;
 }
-/* Top/bottom bar of the pass list. Paginator + match count on the left;
+/* Top/bottom bar of the pass list: refresh on the left, paginator centered,
    "show N per page" selector on the right. Always visible (even with one
    page) so the user can change page size before there are enough passes
    to need pagination. */
 .list-controls {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
   gap: 14px;
   padding: 12px 0;
 }
+.list-controls > .refresh-list-btn { justify-self: start; }
+.list-controls > .paginator { justify-self: center; }
+.list-controls > .per-page { justify-self: end; }
 .paginator {
   display: flex;
   align-items: center;
@@ -784,7 +764,8 @@ main { padding: 16px 20px 80px; }
   box-shadow: 0 8px 16px rgba(0,0,0,0.4);
 }
 .kebab-menu.open { display: flex; flex-direction: column; }
-.kebab-menu button {
+.kebab-menu button,
+.kebab-menu a {
   background: transparent;
   color: var(--text);
   border: 0;
@@ -792,8 +773,10 @@ main { padding: 16px 20px 80px; }
   padding: 10px 14px;
   cursor: pointer;
   font-size: 14px;
+  text-decoration: none;
 }
-.kebab-menu button:hover { background: var(--bg); }
+.kebab-menu button:hover,
+.kebab-menu a:hover { background: var(--bg); }
 .kebab-menu button.danger { color: var(--alert); }
 
 .video-wrap { grid-area: video; }
