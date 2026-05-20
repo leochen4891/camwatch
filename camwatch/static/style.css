@@ -899,14 +899,34 @@ main { padding: 16px 20px 80px; }
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .thumb { display: none; }
 .pass-row:not(.deleted):has(.video-wrap:not(.hidden)) .video-wrap > video { max-width: none; }
 
-/* Expanded view, image only (no clip): big image on top, meta below. */
+/* Expanded view, image only (no clip): big image on top, meta below, then
+   the speed chart (when a trajectory JSONL exists for this pass). */
 .pass-row:not(.deleted):has(.big-image-wrap:not(.hidden)):not(:has(.video-wrap:not(.hidden))) {
   grid-template-columns: 1fr auto;
   grid-template-areas:
     "bigimg bigimg"
-    "meta   actions";
+    "meta   actions"
+    "chart  chart";
 }
 .pass-row:not(.deleted):has(.big-image-wrap:not(.hidden)):not(:has(.video-wrap:not(.hidden))) .thumb { display: none; }
+
+.chart-only-wrap { grid-area: chart; }
+.chart-only-wrap .speed-chart-wrap {
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 4px;
+  max-width: 720px;
+  margin: 0 auto;
+}
+.chart-only-wrap .speed-chart {
+  display: block;
+  width: 100%;
+}
+.chart-only-wrap .speed-chart-legend {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 4px 0;
+}
 
 .hidden { display: none !important; }
 

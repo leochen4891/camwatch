@@ -89,5 +89,8 @@
     {% if p.has_thumb %}
     <div class="big-image-wrap hidden"></div>
     {% endif %}
+    {% if p.has_thumb and not p.has_clip %}
+    <div class="chart-only-wrap hidden"></div>
+    {% endif %}
   </article>
 {% endif %}

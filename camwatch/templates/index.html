@@ -551,6 +551,7 @@
       if (!row) return;
       const videoWrap = row.querySelector(".video-wrap");
       const imageWrap = row.querySelector(".big-image-wrap");
+      const chartWrap = row.querySelector(".chart-only-wrap");
       if (!videoWrap && !imageWrap) return;
 
       // Capture this row's viewport-Y at click time, before any layout
@@ -563,6 +564,7 @@
         if (other === row) return;
         const ov = other.querySelector(".video-wrap");
         const oi = other.querySelector(".big-image-wrap");
+        const oc = other.querySelector(".chart-only-wrap");
         if (ov && !ov.classList.contains("hidden")) {
           ov.querySelector("video")?.pause();
           ov.innerHTML = "";
@@ -571,6 +573,10 @@
         if (oi && !oi.classList.contains("hidden")) {
           oi.innerHTML = "";
           oi.classList.add("hidden");
+        }
+        if (oc && !oc.classList.contains("hidden")) {
+          oc.innerHTML = "";
+          oc.classList.add("hidden");
         }
       });
 
@@ -591,6 +597,10 @@
         if (imageWrap) {
           imageWrap.innerHTML = "";
           imageWrap.classList.add("hidden");
+        }
+        if (chartWrap) {
+          chartWrap.innerHTML = "";
+          chartWrap.classList.add("hidden");
         }
         delete row.dataset.preOpenTop;
         // After collapse, re-measure and shift the viewport so the row
@@ -618,6 +628,17 @@
           videoWrap.innerHTML = playerPackageHTML(passId);
           videoWrap.classList.remove("hidden");
           setupPlayerPackage(videoWrap, passId);
+        } else if (chartWrap) {
+          // Thumb-only pass: still show the per-frame speed chart, without
+          // a video marker. Trajectory JSONL is written for every pass.
+          chartWrap.innerHTML = `
+            <div class="speed-chart-wrap">
+              <canvas class="speed-chart"></canvas>
+              <div class="speed-chart-legend"></div>
+            </div>
+          `;
+          chartWrap.classList.remove("hidden");
+          setupChartOnly(chartWrap, passId);
         }
         // Scroll so the car image lands just below the sticky page header.
         // scrollIntoView({block:"start"}) aligns to viewport top 0, which
@@ -1015,6 +1036,164 @@
       // explicit window resize. NO ResizeObserver — canvas resizing inside
       // observed element can loop.
       window.addEventListener("resize", () => { sizeChart(); drawChart(); });
+      sizeChart();
+      drawChart();
+    }
+
+    // Chart-only setup for thumb-only passes (no .mp4). Same chart code as
+    // setupPlayerPackage but without the video / marker overlay.
+    async function setupChartOnly(rootEl, passId) {
+      const chart = rootEl.querySelector(".speed-chart");
+      const legend = rootEl.querySelector(".speed-chart-legend");
+      if (!chart || !legend) return;
+      let trajectory = null;
+      try {
+        const r = await fetch(`/passes/${passId}/trajectory.jsonl`);
+        if (r.ok) {
+          const text = await r.text();
+          const lines = text.trim().split("\n").map(l => JSON.parse(l));
+          trajectory = { manifest: lines[0], samples: lines.slice(1) };
+        }
+      } catch (e) { /* no trajectory available */ }
+      let chartSized = false;
+      function sizeChart() {
+        const r = chart.parentElement.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        chart.width = Math.round(r.width * dpr);
+        chart.height = Math.round(160 * dpr);
+        chart.style.width = r.width + "px";
+        chart.style.height = "160px";
+        chartSized = true;
+      }
+      function drawChart() {
+        if (!trajectory) {
+          legend.textContent = "(no trajectory data)";
+          return;
+        }
+        if (!chartSized) sizeChart();
+        const ctx = chart.getContext("2d");
+        const dpr = window.devicePixelRatio || 1;
+        const r = { width: chart.width / dpr, height: chart.height / dpr };
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, r.width, 160);
+        const padL = 36, padR = 8, padT = 12, padB = 28;
+        const chW = r.width - padL - padR;
+        const chH = 160 - padT - padB;
+        const m = trajectory.manifest;
+        const fallbackPre = m.clip_pre_roll_s ?? 0.5;
+        const fallbackPost = m.clip_post_roll_s ?? 0.5;
+        const clipStart = (m.clip_start_ts != null)
+          ? m.clip_start_ts
+          : Math.min(m.t_a_pts, m.t_b_pts) - fallbackPre;
+        const clipEnd = (m.clip_end_ts != null)
+          ? m.clip_end_ts
+          : Math.max(m.t_a_pts, m.t_b_pts) + fallbackPost;
+        const samples = trajectory.samples.map(s => ({
+          ...s,
+          ct: s.ts - clipStart,
+        }));
+        // Backfill v_running for older JSONLs that pre-date the field —
+        // identical formula to setupPlayerPackage so the displayed value
+        // matches across the two render paths.
+        const MPH_PER_MPS = 2.2369362920544;
+        const MIN_RUNNING_SAMPLES = 5;
+        if (samples.length > 0) {
+          let cumDist = 0;
+          const t0 = samples[0].ts;
+          for (let i = 1; i < samples.length; i++) {
+            if (samples[i].X == null || samples[i - 1].X == null) continue;
+            const dx = samples[i].X - samples[i - 1].X;
+            const dy = samples[i].Y - samples[i - 1].Y;
+            cumDist += Math.hypot(dx, dy);
+            const cumDt = samples[i].ts - t0;
+            if (samples[i].v_running_mph == null
+                && (i + 1) >= MIN_RUNNING_SAMPLES && cumDt > 0) {
+              samples[i].v_running_mph = (cumDist / cumDt) * MPH_PER_MPS;
+            }
+          }
+        }
+        const haveAny = samples.some(s => s.v_running_mph != null || s.v_inst_mph != null);
+        if (!haveAny || samples.length < 2) {
+          legend.textContent = "(not enough samples)";
+          return;
+        }
+        const vRunningVals = samples.map(s => s.v_running_mph).filter(v => v != null);
+        const vInstClipped = samples.map(s => s.v_inst_mph).filter(v => v != null && v < 100);
+        const allVals = vRunningVals.concat(vInstClipped);
+        const uMin = 0;
+        const uMax = (m.frame_size && m.frame_size[0]) || 2048;
+        const vMin = 0;
+        const vMax = Math.max(40, Math.ceil(Math.max(...allVals, 0) / 10) * 10 + 5);
+        ctx.strokeStyle = "#444"; ctx.fillStyle = "#888";
+        ctx.font = "10px system-ui";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + chH); ctx.lineTo(padL + chW, padT + chH);
+        ctx.stroke();
+        ctx.save();
+        ctx.setLineDash([2, 3]);
+        ctx.strokeStyle = "#3a4150";
+        for (let v = 10; v < vMax; v += 10) {
+          const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
+          ctx.beginPath();
+          ctx.moveTo(padL, y); ctx.lineTo(padL + chW, y);
+          ctx.stroke();
+        }
+        ctx.restore();
+        ctx.fillStyle = "#888";
+        for (let v = 0; v <= vMax; v += 10) {
+          const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
+          ctx.beginPath(); ctx.moveTo(padL - 3, y); ctx.lineTo(padL, y); ctx.stroke();
+          ctx.fillText(v.toString(), 4, y + 3);
+        }
+        ctx.fillStyle = "#888";
+        ctx.fillText("← S", padL + 4, padT + chH + 14);
+        ctx.fillText("N →", padL + chW - 28, padT + chH + 14);
+        ctx.fillText("car position in frame", padL + chW/2 - 60, padT + chH + 24);
+        ctx.fillText("mph", 2, 10);
+        samples.forEach(s => {
+          if (s.v_inst_mph == null) return;
+          const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
+          const yRaw = padT + chH - (s.v_inst_mph - vMin) / (vMax - vMin) * chH;
+          const y = Math.max(padT, Math.min(padT + chH, yRaw));
+          const clipped = (y !== yRaw);
+          ctx.fillStyle = clipped ? "rgba(180, 90, 90, 0.55)" : "rgba(74, 144, 226, 0.45)";
+          ctx.beginPath();
+          ctx.arc(x, y, 2, 0, Math.PI * 2);
+          ctx.fill();
+        });
+        const runningSeq = samples.filter(s => s.v_running_mph != null);
+        if (runningSeq.length >= 2) {
+          ctx.strokeStyle = "#4a90e2";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          runningSeq.forEach((s, i) => {
+            const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
+            const y = padT + chH - (s.v_running_mph - vMin) / (vMax - vMin) * chH;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+          const last = runningSeq[runningSeq.length - 1];
+          const lx = padL + (last.u - uMin) / (uMax - uMin) * chW;
+          const ly = padT + chH - (last.v_running_mph - vMin) / (vMax - vMin) * chH;
+          ctx.fillStyle = "#4a90e2";
+          ctx.beginPath();
+          ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        const canonicalSpeed = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
+        const speedStr = (canonicalSpeed != null && isFinite(canonicalSpeed))
+          ? `${canonicalSpeed.toFixed(2)} mph` : "—";
+        const speedMethod = m.speed_method;
+        const methodStr = (speedMethod === 'running_avg')
+          ? ` · running_avg over <b>${runningSeq.length}</b> samples`
+          : (speedMethod ? ` · ${speedMethod}` : "");
+        legend.innerHTML = `pass <b>${m.pass_id}</b> ${m.direction}-bound · `
+          + `speed=<b>${speedStr}</b>${methodStr} · `
+          + `${m.n_frames} frames`;
+      }
+      window.addEventListener("resize", () => { chartSized = false; sizeChart(); drawChart(); });
       sizeChart();
       drawChart();
     }
