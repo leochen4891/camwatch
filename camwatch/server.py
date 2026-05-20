@@ -125,6 +125,10 @@ def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict
         "vehicle_color": p.vehicle_color,
         "vehicle_confidence": p.vehicle_confidence,
         "vehicle_enriched_by": p.vehicle_enriched_by,
+        "local_make": p.local_make,
+        "local_model": p.local_model,
+        "local_color": p.local_color,
+        "local_confidence": p.local_confidence,
         "deleted_at": p.deleted_at,
     }
 

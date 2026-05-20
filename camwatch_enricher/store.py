@@ -70,10 +70,10 @@ def upsert_embedding(
 def apply_decision(db_path: Path, pass_id: int, d: Decision) -> None:
     """Persist a decision back to the passes row.
 
-    High confidence: stamp vehicle_make/model/color/confidence/enriched_at +
-    enriched_by='local'. Low / no_match: leave the vehicle_* fields alone so
-    the existing Opus workflow still drains the row, but record the local
-    status + top-K for debugging.
+    Local label is written to the parallel `local_*` columns so it can
+    coexist with Opus's answer in `vehicle_*`. enrich_local_status +
+    enrich_local_topk record the per-call diagnostics whether the label
+    fired or not.
     """
     topk_json = json.dumps([
         {"pass_id": n.pass_id, "make": n.make, "model": n.model, "sim": round(n.sim, 4)}
@@ -84,12 +84,11 @@ def apply_decision(db_path: Path, pass_id: int, d: Decision) -> None:
             conn.execute(
                 """
                 UPDATE passes SET
-                    vehicle_make        = ?,
-                    vehicle_model       = ?,
-                    vehicle_color       = COALESCE(vehicle_color, ?),
-                    vehicle_confidence  = 'high',
-                    vehicle_enriched_at = ?,
-                    vehicle_enriched_by = 'local',
+                    local_make          = ?,
+                    local_model         = ?,
+                    local_color         = ?,
+                    local_confidence    = 'high',
+                    local_enriched_at   = ?,
                     enrich_local_status = ?,
                     enrich_local_topk   = ?
                 WHERE id = ?

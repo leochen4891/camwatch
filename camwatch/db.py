@@ -39,9 +39,17 @@ CREATE TABLE IF NOT EXISTS passes (
     vehicle_color        TEXT,  -- categorical bucket: light/grey/dark/red/blue/green/brown/yellow
     vehicle_confidence   TEXT,  -- 'high' | 'medium' | 'low'
     vehicle_enriched_at  TEXT,
-    vehicle_enriched_by  TEXT,  -- 'local' | 'opus' | NULL
-    enrich_local_status  TEXT,  -- 'high' | 'low' | 'no_match' | 'error' | NULL (NULL = not yet attempted)
-    enrich_local_topk    TEXT   -- JSON [{pass_id, make, model, sim}, ...] for debugging the threshold
+    vehicle_enriched_by  TEXT,  -- 'local' | 'opus' | NULL (historical; new rows always 'opus' for vehicle_*)
+    -- Local enricher writes its own label to a parallel set of columns so
+    -- it can coexist with Opus's answer in vehicle_*. Enables backtest /
+    -- agreement analysis without overwriting either side.
+    local_make           TEXT,
+    local_model          TEXT,
+    local_color          TEXT,
+    local_confidence     TEXT,  -- 'high' | 'medium' (only set when label fires)
+    local_enriched_at    TEXT,
+    enrich_local_status  TEXT,  -- 'high' | 'medium' | 'low' | 'no_match' | 'error' | NULL — local enricher's per-call status (always recorded once attempted)
+    enrich_local_topk    TEXT   -- JSON [{pass_id, make, model, sim}, ...] from the thumbnail view, for debugging
 );
 CREATE INDEX IF NOT EXISTS passes_captured_at_idx ON passes(captured_at);
 CREATE INDEX IF NOT EXISTS passes_deleted_idx ON passes(deleted);
@@ -86,8 +94,13 @@ class Pass:
     vehicle_color: str | None
     vehicle_confidence: str | None
     vehicle_enriched_at: str | None
-    vehicle_enriched_by: str | None = None  # 'local' | 'opus' | None
-    enrich_local_status: str | None = None  # 'high' | 'low' | 'no_match' | 'error' | None
+    vehicle_enriched_by: str | None = None  # 'opus' | (historical 'local') | None
+    local_make: str | None = None
+    local_model: str | None = None
+    local_color: str | None = None
+    local_confidence: str | None = None     # 'high' | 'medium' | None
+    local_enriched_at: str | None = None
+    enrich_local_status: str | None = None  # 'high' | 'medium' | 'low' | 'no_match' | None
     enrich_local_topk: str | None = None    # JSON debug payload
     deleted_at: str | None = None
 
@@ -120,6 +133,11 @@ class Pass:
             vehicle_confidence=row["vehicle_confidence"] if "vehicle_confidence" in keys else None,
             vehicle_enriched_at=row["vehicle_enriched_at"] if "vehicle_enriched_at" in keys else None,
             vehicle_enriched_by=row["vehicle_enriched_by"] if "vehicle_enriched_by" in keys else None,
+            local_make=row["local_make"] if "local_make" in keys else None,
+            local_model=row["local_model"] if "local_model" in keys else None,
+            local_color=row["local_color"] if "local_color" in keys else None,
+            local_confidence=row["local_confidence"] if "local_confidence" in keys else None,
+            local_enriched_at=row["local_enriched_at"] if "local_enriched_at" in keys else None,
             enrich_local_status=row["enrich_local_status"] if "enrich_local_status" in keys else None,
             enrich_local_topk=row["enrich_local_topk"] if "enrich_local_topk" in keys else None,
             deleted_at=row["deleted_at"] if "deleted_at" in keys else None,
@@ -155,6 +173,11 @@ class Database:
                     ("vehicle_confidence", "TEXT"),
                     ("vehicle_enriched_at", "TEXT"),
                     ("vehicle_enriched_by", "TEXT"),
+                    ("local_make", "TEXT"),
+                    ("local_model", "TEXT"),
+                    ("local_color", "TEXT"),
+                    ("local_confidence", "TEXT"),
+                    ("local_enriched_at", "TEXT"),
                     ("enrich_local_status", "TEXT"),
                     ("enrich_local_topk", "TEXT"),
                     ("deleted_at", "TEXT"),

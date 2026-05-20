@@ -37,9 +37,14 @@
     <div class="meta">
       <div class="time-block">
         <div class="time">{{ p.captured_at[11:19] }} <span class="muted">{{ p.captured_at[:10] }}</span> <span class="pass-id muted">#{{ p.id }}</span></div>
+        {% if p.local_make or p.local_model %}
+        <div class="vehicle" title="local enricher{% if p.local_confidence %} ({{ p.local_confidence }} confidence){% endif %}">
+          {{ p.local_make or '' }}{% if p.local_make and p.local_model %} {% endif %}{{ p.local_model or '' }}{% if p.local_color %} <span class="vehicle-color">{{ p.local_color }}</span>{% endif %} <span class="enrich-src enrich-src-local">(local)</span>
+        </div>
+        {% endif %}
         {% if p.vehicle_make or p.vehicle_model %}
         <div class="vehicle" title="{{ p.vehicle_year_range or '' }}{% if p.vehicle_confidence %} ({{ p.vehicle_confidence }} confidence){% endif %}{% if p.vehicle_enriched_by %} · source: {{ p.vehicle_enriched_by }}{% endif %}">
-          {{ p.vehicle_make or '' }}{% if p.vehicle_make and p.vehicle_model %} {% endif %}{{ p.vehicle_model or '' }}{% if p.vehicle_color %} <span class="vehicle-color">{{ p.vehicle_color }}</span>{% endif %}{% if p.vehicle_enriched_by == 'local' %} <span class="enrich-src enrich-src-local">(local)</span>{% elif p.vehicle_enriched_by == 'opus' %} <span class="enrich-src enrich-src-opus">(Opus)</span>{% endif %}
+          {{ p.vehicle_make or '' }}{% if p.vehicle_make and p.vehicle_model %} {% endif %}{{ p.vehicle_model or '' }}{% if p.vehicle_color %} <span class="vehicle-color">{{ p.vehicle_color }}</span>{% endif %} <span class="enrich-src enrich-src-opus">(Opus)</span>
         </div>
         {% endif %}
       </div>
@@ -64,11 +69,14 @@
       <div class="kebab-wrap" onclick="event.stopPropagation()">
         <button class="kebab" type="button" onclick="toggleMenu(this)" aria-label="actions">⋯</button>
         <div class="kebab-menu">
-          {% if p.vehicle_make or p.vehicle_model %}
+          {% set filter_make = p.vehicle_make or p.local_make %}
+          {% set filter_model = p.vehicle_model or p.local_model %}
+          {% set filter_color = p.vehicle_color or p.local_color %}
+          {% if filter_make or filter_model %}
           <button type="button"
-                  data-veh-make="{{ p.vehicle_make or '' }}"
-                  data-veh-model="{{ p.vehicle_model or '' }}"
-                  data-veh-color="{{ p.vehicle_color or '' }}"
+                  data-veh-make="{{ filter_make or '' }}"
+                  data-veh-model="{{ filter_model or '' }}"
+                  data-veh-color="{{ filter_color or '' }}"
                   onclick="filterByVehicleFromBtn(this)">🚗 Filter by this vehicle</button>
           {% endif %}
           {% if p.has_clip %}
