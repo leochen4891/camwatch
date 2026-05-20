@@ -45,17 +45,22 @@ def _passes_needing_embedding(db_path: Path, model_name: str) -> list[tuple[int,
         return [(r["id"], r["clip_path"]) for r in cur]
 
 
-def _unlabeled_passes(db_path: Path) -> list[int]:
+def _passes_needing_local_label(db_path: Path, relabel_all: bool) -> list[int]:
+    """Return ids of passes that need a local_* label attempt.
+
+    By default: passes that have a clip_path but no local_make yet. This
+    covers both fresh passes and historical Opus-labeled passes whose
+    local_* is empty (useful for backtest: every Opus-labeled pass becomes
+    a ground-truth comparison point once local has weighed in).
+
+    With relabel_all=True, re-run on every pass with a clip_path, even
+    those already locally labeled. Useful after threshold changes.
+    """
+    where = "deleted = 0 AND clip_path IS NOT NULL"
+    if not relabel_all:
+        where += " AND local_make IS NULL"
     with sqlite3.connect(db_path, timeout=10) as conn:
-        cur = conn.execute(
-            """
-            SELECT id FROM passes
-            WHERE deleted = 0
-              AND clip_path IS NOT NULL
-              AND vehicle_enriched_at IS NULL
-            ORDER BY id
-            """,
-        )
+        cur = conn.execute(f"SELECT id FROM passes WHERE {where} ORDER BY id")
         return [int(r[0]) for r in cur]
 
 
@@ -78,6 +83,9 @@ def main() -> int:
                     help="encode + decide but don't write to DB")
     ap.add_argument("--encode-only", action="store_true",
                     help="just compute missing embeddings, skip the relabel pass")
+    ap.add_argument("--relabel-all", action="store_true",
+                    help="re-run local labeling for every pass, including those that "
+                         "already have a local_* label (useful after threshold tuning)")
     ap.add_argument("--limit", type=int, default=0,
                     help="cap how many passes to encode this run (0 = no cap)")
     args = ap.parse_args()
@@ -123,11 +131,12 @@ def main() -> int:
     index = KnnIndex(db_path=db_path, model_name=cfg.model.name)
     print(f"index size: {index.size()} labeled embeddings")
 
-    unlabeled = _unlabeled_passes(db_path)
-    print(f"relabeling {len(unlabeled)} unlabeled passes")
+    pending = _passes_needing_local_label(db_path, relabel_all=args.relabel_all)
+    mode = "all passes" if args.relabel_all else "passes without local_make"
+    print(f"local-labeling {len(pending)} {mode}")
 
     high = low = no_emb = 0
-    for pid in unlabeled:
+    for pid in pending:
         vec = _load_embedding(db_path, pid, cfg.model.name)
         if vec is None:
             no_emb += 1
