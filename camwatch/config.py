@@ -88,6 +88,12 @@ class Config:
     clip_capture_max_mph: float = 999.0  # passes above this speed are logged but skip clip
     preview_show_grid: bool = True  # draw the calibrated measurement grid on the live preview
     pause_at_night: bool = True  # skip YOLO/triggering when the camera is in IR/night mode
+    # Inset (in feet) for the entry/exit anchor images relative to the grid
+    # edges. The speed-measurement grid is unchanged; only the anchor image
+    # picker shifts. Positive values move the anchor inward from the grid
+    # boundary. Set both to 0 for the original "anchor at grid edge" behavior.
+    recorder_south_anchor_inset_ft: float = 0.0  # north of Y_MIN
+    recorder_north_anchor_inset_ft: float = 0.0  # south of Y_MAX
 
     def load_calibration(self) -> CalibrationConfig | None:
         if not self.calibration_path.exists():
@@ -193,4 +199,10 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         clip_capture_max_mph=float((raw.get("clip") or {}).get("capture_max_mph", 999.0) or 999.0),
         preview_show_grid=bool((raw.get("preview") or {}).get("show_grid", True)),
         pause_at_night=bool((raw.get("capture") or {}).get("pause_at_night", True)),
+        recorder_south_anchor_inset_ft=float(
+            ((raw.get("recorder") or {}).get("anchor_inset_ft") or {}).get("south", 0.0) or 0.0
+        ),
+        recorder_north_anchor_inset_ft=float(
+            ((raw.get("recorder") or {}).get("anchor_inset_ft") or {}).get("north", 0.0) or 0.0
+        ),
     )

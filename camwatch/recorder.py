@@ -50,6 +50,12 @@ class _ActiveClip:
     speed_mph: float | None = None
     record_video: bool = True  # if False, only the thumbnail JPEG is written
     on_finalize: Callable[[], None] | None = None  # invoked after _write_thumbnail
+    # Optional overrides for the entry/exit anchor image timestamps. When set,
+    # the anchor picker targets these instead of t_a/t_b. Used to inset the
+    # anchor capture point away from grid edges (e.g., to avoid a tree right
+    # at the south crossing). t_a/t_b are still the speed/midpoint references.
+    entry_anchor_ts: float | None = None
+    exit_anchor_ts: float | None = None
 
 
 _GRAY = (180, 180, 180)
@@ -157,6 +163,8 @@ class ClipRecorder:
         speed_mph: float | None = None,
         record_video: bool = True,
         on_finalize: Callable[[], None] | None = None,
+        entry_anchor_ts: float | None = None,
+        exit_anchor_ts: float | None = None,
     ) -> str:
         if self._size is None:
             raise RuntimeError("trigger() called before any frames were pushed")
@@ -190,6 +198,8 @@ class ClipRecorder:
             speed_mph=speed_mph,
             record_video=record_video,
             on_finalize=on_finalize,
+            entry_anchor_ts=entry_anchor_ts,
+            exit_anchor_ts=exit_anchor_ts,
         )
         self._active.append(clip)
         return path
@@ -500,14 +510,19 @@ class ClipRecorder:
         # Entry + exit anchor images: closest focus-visible frame at-or-after
         # t_a and at-or-before t_b respectively. Useful for spot-checking that
         # the trigger fired at the right scene moment without playing the clip.
-        entry_crop = self._pick_anchor_crop(clip, clip.t_a, prefer="after")
+        # entry/exit_anchor_ts overrides shift the anchor capture point inward
+        # from the grid edge (e.g., to dodge a tree right at the south crossing);
+        # when unset, fall back to the crossing timestamps as before.
+        entry_ts = clip.entry_anchor_ts if clip.entry_anchor_ts is not None else clip.t_a
+        exit_ts = clip.exit_anchor_ts if clip.exit_anchor_ts is not None else clip.t_b
+        entry_crop = self._pick_anchor_crop(clip, entry_ts, prefer="after")
         if entry_crop is not None:
             cv2.imwrite(
                 base + ".entry.jpg",
                 self._resize_to_width(entry_crop, 800),
                 [cv2.IMWRITE_JPEG_QUALITY, 85],
             )
-        exit_crop = self._pick_anchor_crop(clip, clip.t_b, prefer="before")
+        exit_crop = self._pick_anchor_crop(clip, exit_ts, prefer="before")
         if exit_crop is not None:
             cv2.imwrite(
                 base + ".exit.jpg",

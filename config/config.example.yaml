@@ -49,3 +49,12 @@ clip:
   margin_s: 0.5            # seconds of pre-roll before the first crossing and post-roll after the last
   capture_min_mph: 0       # passes below this speed are logged with a thumbnail but no .mp4
   capture_max_mph: 999     # passes above this speed are logged with a thumbnail but no .mp4
+
+recorder:
+  # Optional inset for the entry/exit anchor JPEGs, in feet, inward from the
+  # grid boundary. Speed measurement still uses the full grid trajectory;
+  # only the still-image capture point shifts. Useful when a fixed obstruction
+  # (e.g. a tree at one curb) lands near a grid edge.
+  anchor_inset_ft:
+    south: 0               # north of Y_MIN; 0 keeps anchor at the grid south edge
+    north: 0               # south of Y_MAX; 0 keeps anchor at the grid north edge

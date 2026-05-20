@@ -789,6 +789,44 @@ class CaptureWorker(threading.Thread):
                             self._cfg.clip_capture_min_mph,
                             self._cfg.clip_capture_max_mph,
                         )
+                    # Optional inset for anchor image capture points: shift the
+                    # south anchor inward from Y_MIN and the north anchor inward
+                    # from Y_MAX, leaving the speed-measurement grid untouched.
+                    # Picks the trajectory timestamp whose projected Y is closest
+                    # to the target; falls back to the crossing ts when the
+                    # trajectory doesn't reach the target or homography is off.
+                    entry_anchor_ts: float | None = None
+                    exit_anchor_ts: float | None = None
+                    south_inset_ft = self._cfg.recorder_south_anchor_inset_ft
+                    north_inset_ft = self._cfg.recorder_north_anchor_inset_ft
+                    if (south_inset_ft or north_inset_ft) and self._homog is not None:
+                        traj = self._trajectories.get(ev.track_id)
+                        if traj:
+                            samples_xy = [
+                                (ts, self._homog.project(u, v)[1])
+                                for ts, u, v, _bb in traj
+                            ]
+                            y_min = min(y for _, y in samples_xy)
+                            y_max = max(y for _, y in samples_xy)
+                            south_ts: float | None = None
+                            north_ts: float | None = None
+                            if south_inset_ft > 0:
+                                south_target = _GRID_Y_MIN + south_inset_ft * _FT_TO_M
+                                if y_min <= south_target:
+                                    south_ts = min(samples_xy, key=lambda s: abs(s[1] - south_target))[0]
+                            if north_inset_ft > 0:
+                                north_target = _GRID_Y_MAX - north_inset_ft * _FT_TO_M
+                                if y_max >= north_target:
+                                    north_ts = min(samples_xy, key=lambda s: abs(s[1] - north_target))[0]
+                            if ev.direction == "N":
+                                # N-bound: t_a is south, t_b is north
+                                entry_anchor_ts = south_ts
+                                exit_anchor_ts = north_ts
+                            elif ev.direction == "S":
+                                # S-bound: t_a is north, t_b is south
+                                entry_anchor_ts = north_ts
+                                exit_anchor_ts = south_ts
+
                     clip_path = recorder.trigger(
                         name=clip_name,
                         focus_track_id=ev.track_id,
@@ -796,6 +834,8 @@ class CaptureWorker(threading.Thread):
                         t_b=ev.t_b,
                         speed_mph=speed_mph,
                         record_video=in_range,
+                        entry_anchor_ts=entry_anchor_ts,
+                        exit_anchor_ts=exit_anchor_ts,
                     )
                     # We always set clip_path (the .mp4 base name) so the
                     # thumbnail can be located by stripping ".mp4" → ".jpg".
