@@ -54,12 +54,10 @@ CREATE TABLE IF NOT EXISTS passes (
 CREATE INDEX IF NOT EXISTS passes_captured_at_idx ON passes(captured_at);
 CREATE INDEX IF NOT EXISTS passes_deleted_idx ON passes(deleted);
 
-CREATE TABLE IF NOT EXISTS pass_embeddings (
-    pass_id     INTEGER PRIMARY KEY REFERENCES passes(id) ON DELETE CASCADE,
-    embedding   BLOB    NOT NULL,    -- float32 little-endian
-    model_name  TEXT    NOT NULL,    -- e.g. 'dinov2_vits14'
-    created_at  TEXT    NOT NULL
-);
+-- pass_embeddings used to live here. It now belongs to the
+-- camwatch-enricher service (separate repo, separate SQLite at
+-- enricher.db). camwatch does not read or write embeddings directly —
+-- the enricher pulls labeled passes from /api/labeled-passes.
 
 CREATE TABLE IF NOT EXISTS metrics (
     ts    TEXT NOT NULL,        -- 5s bucket start, local-aware ISO seconds
@@ -234,6 +232,64 @@ class Database:
                  speed_method),
             )
             return int(cur.lastrowid)
+
+    def apply_local_enrichment(self, pass_id: int, response: dict) -> None:
+        """Persist a camwatch-enricher /enrich response into the local_* columns.
+
+        High-confidence responses set the label fields; everything records
+        the per-call status + top-K debug payload so we can audit why local
+        declined to label a pass.
+        """
+        import json
+        from datetime import datetime, timezone
+
+        status = str(response.get("status") or "low")
+        topk_payload = {
+            "status": status,
+            "top_sim": response.get("top_sim"),
+            "top_matches": response.get("top_matches") or [],
+            "views": response.get("views") or [],
+        }
+        topk_json = json.dumps(topk_payload)
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            if status == "high":
+                conn.execute(
+                    """
+                    UPDATE passes SET
+                        local_make          = ?,
+                        local_model         = ?,
+                        local_color         = ?,
+                        local_confidence    = 'high',
+                        local_enriched_at   = ?,
+                        enrich_local_status = ?,
+                        enrich_local_topk   = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        response.get("make"), response.get("model"),
+                        response.get("color"),
+                        now_iso, status, topk_json, int(pass_id),
+                    ),
+                )
+            else:
+                # Non-high: clear any prior local label so the row reflects
+                # the latest call. Useful for re-runs against a new index /
+                # model where a previously-high label is no longer supported.
+                conn.execute(
+                    """
+                    UPDATE passes SET
+                        local_make          = NULL,
+                        local_model         = NULL,
+                        local_color         = NULL,
+                        local_confidence    = NULL,
+                        local_enriched_at   = NULL,
+                        enrich_local_status = ?,
+                        enrich_local_topk   = ?
+                    WHERE id = ?
+                    """,
+                    (status, topk_json, int(pass_id)),
+                )
 
     def backfill_legacy_speed(
         self,

@@ -37,7 +37,11 @@ from .preview import PreviewBuffer
 from .recorder import ClipRecorder
 
 _ENRICHER_DEFAULT_URL = "http://127.0.0.1:8765"
-_ENRICHER_TIMEOUT_S = 10.0
+_ENRICHER_TIMEOUT_S = 30.0
+# The camwatch HTTP base the enricher uses to fetch this pass's images.
+# Loopback by design — same host as camwatch:8000, so we bypass Cloudflare
+# Access entirely.
+_CAMWATCH_LOOPBACK_BASE = "http://127.0.0.1:8000"
 
 if TYPE_CHECKING:
     from .capture import RtspStream, StaticFrameStream
@@ -324,34 +328,50 @@ class CaptureWorker(threading.Thread):
         except Exception:
             pass
 
-    def _fire_enrich(self, pass_id: int) -> None:
-        """POST to the local enrichment service. Best-effort: any failure
-        is logged and swallowed so the capture loop is never disturbed by
-        the enricher being down.
+    def _fire_enrich(self, pass_id: int, direction: str | None) -> None:
+        """POST to the local enrichment service with this pass's image URLs.
 
-        The recorder writes the .jpg only at clip finalization, which
-        happens a few seconds after insert_pass; if we fire immediately we
-        get 404 (thumbnail missing). Retry on 404 with a short backoff so
-        the call lands after the recorder has finalized.
+        After the camwatch-enricher repo split the enricher no longer touches
+        camwatch.db — it returns the decision over HTTP, and we persist it
+        here into the `local_*` columns.
+
+        The recorder writes the .jpg only at clip finalization (a few
+        seconds after insert_pass), so the first POST sometimes lands
+        before the thumbnail exists. The enricher returns 404 in that
+        case; we retry on a short backoff until the recorder catches up.
         """
         if not self._enricher_enabled:
             return
         url = f"{self._enricher_url.rstrip('/')}/enrich"
+        image_urls = {
+            "thumb": f"{_CAMWATCH_LOOPBACK_BASE}/passes/{int(pass_id)}/thumb",
+            "entry": f"{_CAMWATCH_LOOPBACK_BASE}/passes/{int(pass_id)}/thumb?anchor=entry",
+            "exit":  f"{_CAMWATCH_LOOPBACK_BASE}/passes/{int(pass_id)}/thumb?anchor=exit",
+        }
+        body = {
+            "pass_id": int(pass_id),
+            "image_urls": image_urls,
+            "direction": direction,
+        }
         # Retry budget covers the worst-case clip duration (max_clip_s ≈
         # pre+post-roll + crossing window, typically <5s).
         retry_delays_s = (1.0, 1.5, 2.0, 2.5, 3.0)
         try:
-            import httpx  # local import keeps the capture worker import-light
+            import httpx
             with httpx.Client(timeout=_ENRICHER_TIMEOUT_S) as client:
                 attempt = 0
                 while True:
-                    resp = client.post(url, json={"pass_id": int(pass_id)})
+                    resp = client.post(url, json=body)
                     if resp.status_code == 404 and attempt < len(retry_delays_s):
                         time.sleep(retry_delays_s[attempt])
                         attempt += 1
                         continue
                     resp.raise_for_status()
                     data = resp.json()
+                    try:
+                        self._db.apply_local_enrichment(pass_id, data)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to persist enrich response for pass=%d", pass_id)
                     log.info(
                         "enrich pass=%d status=%s make=%s model=%s sim=%.3f",
                         pass_id, data.get("status"),
@@ -873,7 +893,7 @@ class CaptureWorker(threading.Thread):
                     # vehicle_* fields NULL so the existing Opus workflow drains
                     # them in the next batch.
                     if clip_path:
-                        self._enrich_pool.submit(self._fire_enrich, pid)
+                        self._enrich_pool.submit(self._fire_enrich, pid, ev.direction)
                     if speed_mph is not None:
                         speed_str = (
                             f"{speed_mph:.2f} mph "

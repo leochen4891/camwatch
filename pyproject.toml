@@ -16,10 +16,11 @@ dependencies = [
     "python-multipart>=0.0.20",
     "pytesseract>=0.3.13",
     "av>=17.0.1",
-    "torch>=2.2",
-    "torchvision>=0.17",
+    # httpx for the capture_worker's POST to camwatch-enricher. Other DL
+    # deps (torch, torchvision, pillow) used to live here when the
+    # enricher was in-process; they now live in the camwatch-enricher
+    # repo. Ultralytics still pulls torch transitively for YOLO.
     "httpx>=0.27",
-    "pillow>=10.0",
 ]
 
 [build-system]
@@ -27,7 +28,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["camwatch", "camwatch_enricher"]
+packages = ["camwatch"]
 
 [tool.uv]
 package = true

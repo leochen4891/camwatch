@@ -385,6 +385,55 @@ def make_app(
             "meter_pts": data.get("meter_pts", []),
         })
 
+    @app.get("/api/labeled-passes")
+    async def get_labeled_passes(since: str | None = None, limit: int = 5000):
+        """Feed of Opus-labeled passes for the local enrichment service.
+
+        Returns one entry per pass that has an Opus-supplied (make, model)
+        and a clip_path on disk. Image URLs are relative so the consumer
+        can resolve them against whichever camwatch base it's calling.
+        """
+        n = max(1, min(int(limit), 10000))
+        params: list[object] = []
+        sql = (
+            "SELECT id, captured_at, direction, vehicle_make, vehicle_model, "
+            "       vehicle_color, vehicle_confidence, clip_path "
+            "FROM passes "
+            "WHERE deleted = 0 "
+            "  AND vehicle_enriched_at IS NOT NULL "
+            "  AND vehicle_make IS NOT NULL "
+            "  AND vehicle_model IS NOT NULL "
+            "  AND clip_path IS NOT NULL"
+        )
+        if since:
+            sql += " AND captured_at >= ?"
+            params.append(since)
+        sql += " ORDER BY captured_at ASC LIMIT ?"
+        params.append(n)
+        with db.connect() as conn:
+            rows = list(conn.execute(sql, params))
+
+        out: list[dict] = []
+        for r in rows:
+            pid = int(r["id"])
+            clip = r["clip_path"]
+            base = clip[:-4] if clip.endswith(".mp4") else clip
+            entry_jpg = Path(f"{base}.entry.jpg")
+            exit_jpg = Path(f"{base}.exit.jpg")
+            out.append({
+                "pass_id": pid,
+                "captured_at": r["captured_at"],
+                "direction": r["direction"],
+                "vehicle_make": r["vehicle_make"],
+                "vehicle_model": r["vehicle_model"],
+                "vehicle_color": r["vehicle_color"],
+                "vehicle_confidence": r["vehicle_confidence"],
+                "thumb_url": f"/passes/{pid}/thumb",
+                "entry_url": f"/passes/{pid}/thumb?anchor=entry" if entry_jpg.exists() else None,
+                "exit_url":  f"/passes/{pid}/thumb?anchor=exit"  if exit_jpg.exists()  else None,
+            })
+        return JSONResponse(out)
+
     @app.get("/passes/{pass_id}/thumb")
     async def get_thumb(pass_id: int, big: bool = False, anchor: str | None = None):
         p = db.get_pass(pass_id)
