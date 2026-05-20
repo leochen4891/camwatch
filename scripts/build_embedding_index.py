@@ -133,7 +133,12 @@ def main() -> int:
             no_emb += 1
             continue
         neighbors = index.topk(vec, k=cfg.decision.k, exclude_pass_id=pid)
-        d = decide(neighbors, k_agree=cfg.decision.k_agree, tau_high=cfg.decision.tau_high)
+        # Backfill only uses the high tier (single-view, no per-pass anchor
+        # combining) since labeled embeddings in the index are thumb-only.
+        d = decide(
+            neighbors,
+            k_agree_high=cfg.decision.k_agree, tau_high=cfg.decision.tau_high,
+        )
         if d.status == "high":
             high += 1
         else:

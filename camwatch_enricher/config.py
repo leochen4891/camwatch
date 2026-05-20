@@ -32,8 +32,15 @@ class PathsCfg:
 @dataclass
 class DecisionCfg:
     k: int = 5
-    k_agree: int = 3
+    # High tier: single-view confidence threshold. A view meeting these
+    # bounds on its own can label the pass.
+    k_agree: int = 5
     tau_high: float = 0.85
+    # Medium tier: looser rule used only by the multi-view combiner — a
+    # pass is labeled when every available view lands at >= medium and
+    # all views agree on (make, model).
+    k_agree_medium: int = 3
+    tau_medium: float = 0.80
 
 
 @dataclass

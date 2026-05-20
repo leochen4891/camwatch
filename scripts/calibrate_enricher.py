@@ -81,7 +81,7 @@ def main() -> int:
             correct = 0
             for pid, true_make, true_model, vec in rows:
                 neighbors = index.topk(vec, k=cfg.decision.k, exclude_pass_id=pid)
-                d = decide(neighbors, k_agree=k_agree, tau_high=tau)
+                d = decide(neighbors, k_agree_high=k_agree, tau_high=tau)
                 if d.status == "high":
                     preds += 1
                     if d.make == true_make and d.model == true_model:

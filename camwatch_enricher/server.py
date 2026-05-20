@@ -56,13 +56,15 @@ class HealthResponse(BaseModel):
 def _combine_views(per_view: dict[str, Decision]) -> tuple[Decision, list[ViewResult]]:
     """Combine per-view decisions into a single decision.
 
-    Hybrid rule (requested behaviour): label only when every available view
-    fires `high` AND they all agree on (make, model). Any view going `low` —
-    or any disagreement — drops the combined status to `low`, deferring the
-    pass to the Opus workflow.
+    Rules (in order):
+      1. If ANY view fires `high`, take that view's label — one confident
+         view is enough on its own.
+      2. Otherwise, if EVERY available view lands at >= medium AND they
+         all agree on (make, model), take that agreed label.
+      3. Otherwise, `low` — defer to the Opus workflow.
 
-    The thumb view drives top_sim / topk / color of the combined decision so
-    downstream UI keeps a single canonical preview.
+    The thumb view drives top_sim / topk / color of the combined decision
+    so downstream UI keeps a single canonical preview.
     """
     view_results = [
         ViewResult(
@@ -70,22 +72,33 @@ def _combine_views(per_view: dict[str, Decision]) -> tuple[Decision, list[ViewRe
         )
         for v, d in per_view.items()
     ]
-    thumb_d = per_view.get("thumb") or next(iter(per_view.values()))
     if not per_view:
         return Decision("no_match", None, None, None, 0.0, 0, []), view_results
 
-    all_high = all(d.status == "high" for d in per_view.values())
-    if not all_high:
-        return Decision("low", None, None, None, thumb_d.top_sim, 0, thumb_d.topk), view_results
+    thumb_d = per_view.get("thumb") or next(iter(per_view.values()))
 
+    # Rule 1: any view at high → accept that view.
+    for d in per_view.values():
+        if d.status == "high":
+            return Decision(
+                "high", d.make, d.model, d.color,
+                thumb_d.top_sim, d.agree_count, thumb_d.topk,
+            ), view_results
+
+    # Rule 2: every available view at >= medium AND unanimous label.
+    all_at_least_medium = all(d.status in ("high", "medium") for d in per_view.values())
     labels = {(d.make, d.model) for d in per_view.values()}
-    if len(labels) != 1:
-        return Decision("low", None, None, None, thumb_d.top_sim, 0, thumb_d.topk), view_results
+    if all_at_least_medium and len(labels) == 1:
+        mk, md = labels.pop()
+        return Decision(
+            "high", mk, md, thumb_d.color,
+            thumb_d.top_sim, thumb_d.agree_count, thumb_d.topk,
+        ), view_results
 
-    make, model = labels.pop()
+    # Rule 3: not confident — let Opus handle it.
     return Decision(
-        "high", make, model, thumb_d.color,
-        thumb_d.top_sim, thumb_d.agree_count, thumb_d.topk,
+        "low", None, None, None,
+        thumb_d.top_sim, 0, thumb_d.topk,
     ), view_results
 
 
@@ -134,7 +147,11 @@ def create_app(cfg: EnricherConfig | None = None) -> FastAPI:
             if view == "thumb":
                 thumb_vec = vec
             neighbors = index.topk(vec, k=cfg.decision.k, exclude_pass_id=req.pass_id)
-            per_view[view] = decide(neighbors, k_agree=cfg.decision.k_agree, tau_high=cfg.decision.tau_high)
+            per_view[view] = decide(
+                neighbors,
+                k_agree_high=cfg.decision.k_agree, tau_high=cfg.decision.tau_high,
+                k_agree_medium=cfg.decision.k_agree_medium, tau_medium=cfg.decision.tau_medium,
+            )
 
         if thumb_vec is None:
             raise HTTPException(status_code=500, detail="thumb encode failed")
