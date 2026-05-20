@@ -426,16 +426,17 @@ class CaptureWorker(threading.Thread):
             self._cfg.alert_threshold_mph,
         )
 
-        # YOLO sees the full frame. Tracks are filtered by an in-grid check
-        # (homography-projected ground point) before reaching the detector
-        # and recorder; the grid covers the whole road by construction.
+        # YOLO sees only the ROI crop (Detector translates bboxes back to
+        # full-frame coords). A subsequent in-grid check via the homography
+        # filters out anything that's inside the ROI but off-road (e.g.,
+        # driveway). At 4K this is a ~5x compute reduction vs. full-frame.
         det = Detector(
             weights=self._cfg.model.weights,
             device=self._cfg.model.device,
             classes=self._cfg.model.classes,
             conf=self._cfg.model.conf,
             iou=self._cfg.model.iou,
-            roi=None,
+            roi=cal.roi,
         )
         recorder = ClipRecorder(
             self._recordings_dir,
