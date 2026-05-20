@@ -137,7 +137,8 @@ def main() -> int:
         # combining) since labeled embeddings in the index are thumb-only.
         d = decide(
             neighbors,
-            k_agree_high=cfg.decision.k_agree, tau_high=cfg.decision.tau_high,
+            k=cfg.decision.k,
+            min_votes_high=cfg.decision.min_votes_high, tau_high=cfg.decision.tau_high,
         )
         if d.status == "high":
             high += 1

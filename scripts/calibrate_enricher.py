@@ -52,7 +52,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/enricher.yaml")
     ap.add_argument("--taus", default="0.75,0.80,0.85,0.90")
-    ap.add_argument("--ks", default="2,3,4")
+    ap.add_argument("--min-votes", default="3,4,5",
+                    help="min_votes_high to sweep (over top-k from config)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -70,35 +71,39 @@ def main() -> int:
     print(f"index size: {index.size()}")
 
     taus = [float(x) for x in args.taus.split(",")]
-    ks = [int(x) for x in args.ks.split(",")]
+    votes_list = [int(x) for x in args.min_votes.split(",")]
 
     print()
-    print(f"{'tau':>5}  {'k':>2}  {'preds':>5}  {'correct':>7}  {'precision':>9}  {'recall':>6}")
+    print(f"k={cfg.decision.k} (vote window over top-k of the labeled index)")
+    print(f"{'tau':>5}  {'min':>4}  {'preds':>5}  {'correct':>7}  {'precision':>9}  {'recall':>6}")
     best_at_precision: dict[float, tuple[float, int, float, float]] = {}
     for tau in taus:
-        for k_agree in ks:
+        for min_votes in votes_list:
             preds = 0
             correct = 0
             for pid, true_make, true_model, vec in rows:
                 neighbors = index.topk(vec, k=cfg.decision.k, exclude_pass_id=pid)
-                d = decide(neighbors, k_agree_high=k_agree, tau_high=tau)
+                d = decide(
+                    neighbors,
+                    k=cfg.decision.k,
+                    min_votes_high=min_votes, tau_high=tau,
+                )
                 if d.status == "high":
                     preds += 1
                     if d.make == true_make and d.model == true_model:
                         correct += 1
             precision = (correct / preds) if preds > 0 else 0.0
             recall = preds / len(rows)
-            print(f"{tau:5.2f}  {k_agree:2d}  {preds:5d}  {correct:7d}  {precision:9.3f}  {recall:6.3f}")
-            # Track the highest-recall config that hits each precision floor.
+            print(f"{tau:5.2f}  {min_votes:4d}  {preds:5d}  {correct:7d}  {precision:9.3f}  {recall:6.3f}")
             for floor in (0.90, 0.95, 0.98, 1.00):
                 if precision >= floor and recall >= best_at_precision.get(floor, (None, None, None, -1.0))[3]:
-                    best_at_precision[floor] = (tau, k_agree, precision, recall)
+                    best_at_precision[floor] = (tau, min_votes, precision, recall)
 
     print()
     print("best operating point per precision floor:")
     for floor in sorted(best_at_precision):
-        tau, k_agree, p, r = best_at_precision[floor]
-        print(f"  precision>={floor:.2f}: tau={tau} k_agree={k_agree} precision={p:.3f} recall={r:.3f}")
+        tau, min_votes, p, r = best_at_precision[floor]
+        print(f"  precision>={floor:.2f}: tau={tau} min_votes_high={min_votes} precision={p:.3f} recall={r:.3f}")
 
     return 0
 

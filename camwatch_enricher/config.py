@@ -34,12 +34,12 @@ class DecisionCfg:
     k: int = 5
     # High tier: single-view confidence threshold. A view meeting these
     # bounds on its own can label the pass.
-    k_agree: int = 5
+    min_votes_high: int = 4
     tau_high: float = 0.85
     # Medium tier: looser rule used only by the multi-view combiner — a
     # pass is labeled when every available view lands at >= medium and
     # all views agree on (make, model).
-    k_agree_medium: int = 3
+    min_votes_medium: int = 3
     tau_medium: float = 0.80
 
 
@@ -80,7 +80,16 @@ def load_config(path: Path | str = DEFAULT_PATH) -> EnricherConfig:
         d = data["decision"]
         cfg.decision = DecisionCfg(
             k=int(d.get("k", cfg.decision.k)),
-            k_agree=int(d.get("k_agree", cfg.decision.k_agree)),
+            # Back-compat: older configs used `k_agree` to mean "unanimous
+            # in top-k_agree". Map that to min_votes_high when min_votes_high
+            # isn't explicitly set.
+            min_votes_high=int(
+                d.get("min_votes_high", d.get("k_agree", cfg.decision.min_votes_high))
+            ),
             tau_high=float(d.get("tau_high", cfg.decision.tau_high)),
+            min_votes_medium=int(
+                d.get("min_votes_medium", d.get("k_agree_medium", cfg.decision.min_votes_medium))
+            ),
+            tau_medium=float(d.get("tau_medium", cfg.decision.tau_medium)),
         )
     return cfg

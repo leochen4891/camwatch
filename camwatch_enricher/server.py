@@ -149,8 +149,9 @@ def create_app(cfg: EnricherConfig | None = None) -> FastAPI:
             neighbors = index.topk(vec, k=cfg.decision.k, exclude_pass_id=req.pass_id)
             per_view[view] = decide(
                 neighbors,
-                k_agree_high=cfg.decision.k_agree, tau_high=cfg.decision.tau_high,
-                k_agree_medium=cfg.decision.k_agree_medium, tau_medium=cfg.decision.tau_medium,
+                k=cfg.decision.k,
+                min_votes_high=cfg.decision.min_votes_high, tau_high=cfg.decision.tau_high,
+                min_votes_medium=cfg.decision.min_votes_medium, tau_medium=cfg.decision.tau_medium,
             )
 
         if thumb_vec is None:
