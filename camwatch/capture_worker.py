@@ -327,22 +327,38 @@ class CaptureWorker(threading.Thread):
     def _fire_enrich(self, pass_id: int) -> None:
         """POST to the local enrichment service. Best-effort: any failure
         is logged and swallowed so the capture loop is never disturbed by
-        the enricher being down."""
+        the enricher being down.
+
+        The recorder writes the .jpg only at clip finalization, which
+        happens a few seconds after insert_pass; if we fire immediately we
+        get 404 (thumbnail missing). Retry on 404 with a short backoff so
+        the call lands after the recorder has finalized.
+        """
         if not self._enricher_enabled:
             return
         url = f"{self._enricher_url.rstrip('/')}/enrich"
+        # Retry budget covers the worst-case clip duration (max_clip_s ≈
+        # pre+post-roll + crossing window, typically <5s).
+        retry_delays_s = (1.0, 1.5, 2.0, 2.5, 3.0)
         try:
             import httpx  # local import keeps the capture worker import-light
             with httpx.Client(timeout=_ENRICHER_TIMEOUT_S) as client:
-                resp = client.post(url, json={"pass_id": int(pass_id)})
-                resp.raise_for_status()
-                data = resp.json()
-                log.info(
-                    "enrich pass=%d status=%s make=%s model=%s sim=%.3f",
-                    pass_id, data.get("status"),
-                    data.get("make"), data.get("model"),
-                    float(data.get("top_sim") or 0.0),
-                )
+                attempt = 0
+                while True:
+                    resp = client.post(url, json={"pass_id": int(pass_id)})
+                    if resp.status_code == 404 and attempt < len(retry_delays_s):
+                        time.sleep(retry_delays_s[attempt])
+                        attempt += 1
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    log.info(
+                        "enrich pass=%d status=%s make=%s model=%s sim=%.3f",
+                        pass_id, data.get("status"),
+                        data.get("make"), data.get("model"),
+                        float(data.get("top_sim") or 0.0),
+                    )
+                    return
         except Exception as e:  # noqa: BLE001
             log.warning("enrich pass=%d failed: %s", pass_id, e)
 

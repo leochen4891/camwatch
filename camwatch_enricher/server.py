@@ -8,10 +8,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .config import EnricherConfig, load_config
-from .decision import decide
+from .decision import Decision, decide
 from .embedder import Embedder
-from .index import KnnIndex
-from .store import apply_decision, get_clip_path, thumb_path_from_clip, upsert_embedding
+from .index import KnnIndex, Neighbor
+from .store import anchor_paths_from_clip, apply_decision, get_clip_path, upsert_embedding
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +27,14 @@ class TopMatch(BaseModel):
     sim: float
 
 
+class ViewResult(BaseModel):
+    view: str               # 'thumb' | 'entry' | 'exit'
+    status: str
+    make: str | None
+    model: str | None
+    top_sim: float
+
+
 class EnrichResponse(BaseModel):
     pass_id: int
     status: str
@@ -35,6 +43,7 @@ class EnrichResponse(BaseModel):
     color: str | None = None
     top_sim: float
     top_matches: list[TopMatch]
+    views: list[ViewResult]
 
 
 class HealthResponse(BaseModel):
@@ -42,6 +51,42 @@ class HealthResponse(BaseModel):
     indexed_n: int
     device: str
     model: str
+
+
+def _combine_views(per_view: dict[str, Decision]) -> tuple[Decision, list[ViewResult]]:
+    """Combine per-view decisions into a single decision.
+
+    Hybrid rule (requested behaviour): label only when every available view
+    fires `high` AND they all agree on (make, model). Any view going `low` —
+    or any disagreement — drops the combined status to `low`, deferring the
+    pass to the Opus workflow.
+
+    The thumb view drives top_sim / topk / color of the combined decision so
+    downstream UI keeps a single canonical preview.
+    """
+    view_results = [
+        ViewResult(
+            view=v, status=d.status, make=d.make, model=d.model, top_sim=d.top_sim
+        )
+        for v, d in per_view.items()
+    ]
+    thumb_d = per_view.get("thumb") or next(iter(per_view.values()))
+    if not per_view:
+        return Decision("no_match", None, None, None, 0.0, 0, []), view_results
+
+    all_high = all(d.status == "high" for d in per_view.values())
+    if not all_high:
+        return Decision("low", None, None, None, thumb_d.top_sim, 0, thumb_d.topk), view_results
+
+    labels = {(d.make, d.model) for d in per_view.values()}
+    if len(labels) != 1:
+        return Decision("low", None, None, None, thumb_d.top_sim, 0, thumb_d.topk), view_results
+
+    make, model = labels.pop()
+    return Decision(
+        "high", make, model, thumb_d.color,
+        thumb_d.top_sim, thumb_d.agree_count, thumb_d.topk,
+    ), view_results
 
 
 def create_app(cfg: EnricherConfig | None = None) -> FastAPI:
@@ -72,33 +117,47 @@ def create_app(cfg: EnricherConfig | None = None) -> FastAPI:
         clip_path = get_clip_path(db_path, req.pass_id)
         if not clip_path:
             raise HTTPException(status_code=404, detail="pass not found or has no clip_path")
-        thumb = thumb_path_from_clip(clip_path)
-        if not thumb.exists():
-            raise HTTPException(status_code=404, detail=f"thumbnail missing: {thumb}")
+        paths = anchor_paths_from_clip(clip_path)
+        if not paths["thumb"].exists():
+            raise HTTPException(status_code=404, detail=f"thumbnail missing: {paths['thumb']}")
 
-        try:
-            vec = embedder.encode_path(thumb)
-        except Exception as e:
-            log.exception("encode failed for pass %s", req.pass_id)
-            raise HTTPException(status_code=500, detail=f"encode failed: {e}") from e
+        per_view: dict[str, Decision] = {}
+        thumb_vec = None
+        for view, p in paths.items():
+            if not p.exists():
+                continue
+            try:
+                vec = embedder.encode_path(p)
+            except Exception as e:
+                log.warning("encode failed for pass %s view %s: %s", req.pass_id, view, e)
+                continue
+            if view == "thumb":
+                thumb_vec = vec
+            neighbors = index.topk(vec, k=cfg.decision.k, exclude_pass_id=req.pass_id)
+            per_view[view] = decide(neighbors, k_agree=cfg.decision.k_agree, tau_high=cfg.decision.tau_high)
 
-        upsert_embedding(db_path, req.pass_id, vec, embedder.model_name)
+        if thumb_vec is None:
+            raise HTTPException(status_code=500, detail="thumb encode failed")
+        # Only the thumb embedding goes in the index (so labeled-set growth
+        # mirrors what Opus-labeled rows store today). Entry/exit are used
+        # for confirmation only.
+        upsert_embedding(db_path, req.pass_id, thumb_vec, embedder.model_name)
 
-        neighbors = index.topk(vec, k=cfg.decision.k, exclude_pass_id=req.pass_id)
-        d = decide(neighbors, k_agree=cfg.decision.k_agree, tau_high=cfg.decision.tau_high)
-        apply_decision(db_path, req.pass_id, d)
+        combined, view_results = _combine_views(per_view)
+        apply_decision(db_path, req.pass_id, combined)
 
         return EnrichResponse(
             pass_id=req.pass_id,
-            status=d.status,
-            make=d.make,
-            model=d.model,
-            color=d.color,
-            top_sim=d.top_sim,
+            status=combined.status,
+            make=combined.make,
+            model=combined.model,
+            color=combined.color,
+            top_sim=combined.top_sim,
             top_matches=[
                 TopMatch(pass_id=n.pass_id, make=n.make, model=n.model, sim=n.sim)
-                for n in d.topk
+                for n in combined.topk
             ],
+            views=view_results,
         )
 
     return app

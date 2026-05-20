@@ -29,6 +29,22 @@ def thumb_path_from_clip(clip_path: str) -> Path:
     return Path(base + ".jpg")
 
 
+def anchor_paths_from_clip(clip_path: str) -> dict[str, Path]:
+    """Return {view_name: Path} for the three views camwatch writes per pass.
+
+    Anchor JPEGs only exist for passes captured after the recorder
+    anchor-image change shipped; callers should check `.exists()` before
+    using each path. The 'thumb' view is the midpoint thumbnail (always
+    present for any pass with a clip_path).
+    """
+    base = clip_path[:-4] if clip_path.endswith(".mp4") else clip_path
+    return {
+        "thumb": Path(base + ".jpg"),
+        "entry": Path(base + ".entry.jpg"),
+        "exit": Path(base + ".exit.jpg"),
+    }
+
+
 def upsert_embedding(
     db_path: Path,
     pass_id: int,
