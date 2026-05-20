@@ -533,7 +533,8 @@ def make_app(
             archived = 0
             deleted = 0
             for _pid, cp, speed in thumb_items:
-                thumb = cp[:-4] + ".jpg" if cp.endswith(".mp4") else cp + ".jpg"
+                base = cp[:-4] if cp.endswith(".mp4") else cp
+                thumb = base + ".jpg"
                 # Also remove the .mp4 if it somehow outlived clips_days.
                 try:
                     Path(cp).unlink(missing_ok=True)
@@ -550,6 +551,12 @@ def make_app(
                     try:
                         Path(thumb).unlink(missing_ok=True)
                         deleted += 1
+                    except Exception:
+                        pass
+                # Entry/exit spot-check images: always delete, never archive.
+                for side in (".entry.jpg", ".exit.jpg"):
+                    try:
+                        Path(base + side).unlink(missing_ok=True)
                     except Exception:
                         pass
             if archived or deleted:
@@ -569,8 +576,11 @@ def make_app(
             for pid, cp in items:
                 paths_to_unlink: list[str] = []
                 if cp:
+                    base = cp[:-4] if cp.endswith(".mp4") else cp
                     paths_to_unlink.append(cp)
-                    paths_to_unlink.append(cp[:-4] + ".jpg")
+                    paths_to_unlink.append(base + ".jpg")
+                    paths_to_unlink.append(base + ".entry.jpg")
+                    paths_to_unlink.append(base + ".exit.jpg")
                 paths_to_unlink.append(str(cfg.events_dir / f"pass_{pid}.jsonl"))
                 for path in paths_to_unlink:
                     try:

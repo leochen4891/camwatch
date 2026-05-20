@@ -520,7 +520,8 @@ class CaptureWorker(threading.Thread):
                         archived = 0
                         deleted = 0
                         for _pid, cp, speed in thumb_items:
-                            thumb = cp[:-4] + ".jpg" if cp.endswith(".mp4") else cp + ".jpg"
+                            base = cp[:-4] if cp.endswith(".mp4") else cp
+                            thumb = base + ".jpg"
                             # Belt-and-braces: nuke the .mp4 if it survived phase 1.
                             try:
                                 Path(cp).unlink(missing_ok=True)
@@ -539,6 +540,12 @@ class CaptureWorker(threading.Thread):
                                     deleted += 1
                                 except Exception as e:  # noqa: BLE001
                                     log.debug("thumb cleanup: %s: %s", thumb, e)
+                            # Entry/exit spot-check images: always delete, never archive.
+                            for side in (".entry.jpg", ".exit.jpg"):
+                                try:
+                                    Path(base + side).unlink(missing_ok=True)
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("anchor cleanup: %s%s: %s", base, side, e)
                         if archived or deleted:
                             log.info(
                                 "retention: %d alarm thumbs archived, %d non-alarm deleted "
@@ -558,8 +565,11 @@ class CaptureWorker(threading.Thread):
                         for pid, cp in items:
                             paths_to_unlink: list[str] = []
                             if cp:
+                                base = cp[:-4] if cp.endswith(".mp4") else cp
                                 paths_to_unlink.append(cp)
-                                paths_to_unlink.append(cp[:-4] + ".jpg")
+                                paths_to_unlink.append(base + ".jpg")
+                                paths_to_unlink.append(base + ".entry.jpg")
+                                paths_to_unlink.append(base + ".exit.jpg")
                             paths_to_unlink.append(str(events_dir / f"pass_{pid}.jsonl"))
                             for path in paths_to_unlink:
                                 try:

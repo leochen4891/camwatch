@@ -497,6 +497,73 @@ class ClipRecorder:
         thumb = self._resize_to_width(crop, 800)
         cv2.imwrite(base + ".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
+        # Entry + exit anchor images: closest focus-visible frame at-or-after
+        # t_a and at-or-before t_b respectively. Useful for spot-checking that
+        # the trigger fired at the right scene moment without playing the clip.
+        entry_crop = self._pick_anchor_crop(clip, clip.t_a, prefer="after")
+        if entry_crop is not None:
+            cv2.imwrite(
+                base + ".entry.jpg",
+                self._resize_to_width(entry_crop, 800),
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            )
+        exit_crop = self._pick_anchor_crop(clip, clip.t_b, prefer="before")
+        if exit_crop is not None:
+            cv2.imwrite(
+                base + ".exit.jpg",
+                self._resize_to_width(exit_crop, 800),
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            )
+
+    def _pick_anchor_crop(
+        self,
+        clip: _ActiveClip,
+        target_ts: float,
+        prefer: str,        # "after" = first focus-visible frame at-or-after target_ts;
+                            # "before" = last focus-visible frame at-or-before target_ts
+    ) -> np.ndarray | None:
+        """Return a tight focus-bbox crop from the frame nearest target_ts
+        in the requested direction. None if the focus track is not visible
+        in any clip frame, or if the resulting crop is degenerately small."""
+        s = self._scale
+        best: tuple[float, int, tuple[float, float, float, float]] | None = None
+        # Frames before target_ts get a 10x score penalty when prefer=="after"
+        # (and vice versa) — they still win if nothing on the preferred side
+        # contains the focus track, but lose to any same-side candidate.
+        side_penalty = 10.0
+        for i, rec in enumerate(clip.frames):
+            focus_bbox = None
+            for d in rec.detections:
+                if getattr(d, "track_id", None) == clip.focus_track_id:
+                    focus_bbox = getattr(d, "bbox", None)
+                    break
+            if focus_bbox is None:
+                continue
+            dt = rec.ts - target_ts
+            if prefer == "after":
+                score = dt if dt >= 0 else -dt * side_penalty
+            else:  # "before"
+                score = -dt if dt <= 0 else dt * side_penalty
+            if best is None or score < best[0]:
+                best = (score, i, focus_bbox)
+        if best is None:
+            return None
+        _, idx, bbox = best
+        raw = clip.frames[idx].image
+        fh, fw = raw.shape[:2]
+        bx1, by1, bx2, by2 = (v * s for v in bbox)
+        bw = bx2 - bx1
+        bh = by2 - by1
+        pad_x = max(bw * 0.6, 40)
+        pad_y = max(bh * 0.7, 40)
+        cx1 = max(0, int(round(bx1 - pad_x)))
+        cy1 = max(0, int(round(by1 - pad_y)))
+        cx2 = min(fw, int(round(bx2 + pad_x)))
+        cy2 = min(fh, int(round(by2 + pad_y)))
+        if cx2 - cx1 < 80 or cy2 - cy1 < 60:
+            return None
+        return raw[cy1:cy2, cx1:cx2]
+
     @staticmethod
     def _resize_to_width(frame: np.ndarray, target_w: int) -> np.ndarray:
         h, w = frame.shape[:2]
