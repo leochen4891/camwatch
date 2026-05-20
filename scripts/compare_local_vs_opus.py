@@ -22,6 +22,10 @@ def main() -> int:
     ap.add_argument("--db", default="camwatch.db")
     ap.add_argument("--top", type=int, default=20,
                     help="how many top confusions / per-make rows to print")
+    ap.add_argument("--hour-min", type=int, default=None,
+                    help="only include passes captured at-or-after this local hour (0-23)")
+    ap.add_argument("--hour-max", type=int, default=None,
+                    help="only include passes captured strictly-before this local hour (0-24)")
     args = ap.parse_args()
 
     db_path = Path(args.db)
@@ -29,8 +33,15 @@ def main() -> int:
         print(f"db not found: {db_path}")
         return 1
 
+    # captured_at format: '2026-05-20T15:56:52-04:00'. Hour is chars 11-13.
+    hour_clause = ""
+    if args.hour_min is not None:
+        hour_clause += f" AND CAST(substr(captured_at, 12, 2) AS INTEGER) >= {int(args.hour_min)}"
+    if args.hour_max is not None:
+        hour_clause += f" AND CAST(substr(captured_at, 12, 2) AS INTEGER) < {int(args.hour_max)}"
+
     with sqlite3.connect(db_path) as conn:
-        rows = list(conn.execute("""
+        rows = list(conn.execute(f"""
             SELECT vehicle_make, vehicle_model, vehicle_color,
                    local_make,   local_model,   local_color,
                    local_confidence
@@ -38,6 +49,7 @@ def main() -> int:
             WHERE deleted = 0
               AND vehicle_make IS NOT NULL
               AND local_make IS NOT NULL
+              {hour_clause}
         """))
 
     if not rows:
