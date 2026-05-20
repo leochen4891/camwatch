@@ -38,10 +38,20 @@ CREATE TABLE IF NOT EXISTS passes (
     vehicle_year_range   TEXT,
     vehicle_color        TEXT,  -- categorical bucket: light/grey/dark/red/blue/green/brown/yellow
     vehicle_confidence   TEXT,  -- 'high' | 'medium' | 'low'
-    vehicle_enriched_at  TEXT
+    vehicle_enriched_at  TEXT,
+    vehicle_enriched_by  TEXT,  -- 'local' | 'opus' | NULL
+    enrich_local_status  TEXT,  -- 'high' | 'low' | 'no_match' | 'error' | NULL (NULL = not yet attempted)
+    enrich_local_topk    TEXT   -- JSON [{pass_id, make, model, sim}, ...] for debugging the threshold
 );
 CREATE INDEX IF NOT EXISTS passes_captured_at_idx ON passes(captured_at);
 CREATE INDEX IF NOT EXISTS passes_deleted_idx ON passes(deleted);
+
+CREATE TABLE IF NOT EXISTS pass_embeddings (
+    pass_id     INTEGER PRIMARY KEY REFERENCES passes(id) ON DELETE CASCADE,
+    embedding   BLOB    NOT NULL,    -- float32 little-endian
+    model_name  TEXT    NOT NULL,    -- e.g. 'dinov2_vits14'
+    created_at  TEXT    NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS metrics (
     ts    TEXT NOT NULL,        -- 5s bucket start, local-aware ISO seconds
@@ -76,6 +86,9 @@ class Pass:
     vehicle_color: str | None
     vehicle_confidence: str | None
     vehicle_enriched_at: str | None
+    vehicle_enriched_by: str | None = None  # 'local' | 'opus' | None
+    enrich_local_status: str | None = None  # 'high' | 'low' | 'no_match' | 'error' | None
+    enrich_local_topk: str | None = None    # JSON debug payload
     deleted_at: str | None = None
 
     @classmethod
@@ -106,6 +119,9 @@ class Pass:
             vehicle_color=row["vehicle_color"] if "vehicle_color" in keys else None,
             vehicle_confidence=row["vehicle_confidence"] if "vehicle_confidence" in keys else None,
             vehicle_enriched_at=row["vehicle_enriched_at"] if "vehicle_enriched_at" in keys else None,
+            vehicle_enriched_by=row["vehicle_enriched_by"] if "vehicle_enriched_by" in keys else None,
+            enrich_local_status=row["enrich_local_status"] if "enrich_local_status" in keys else None,
+            enrich_local_topk=row["enrich_local_topk"] if "enrich_local_topk" in keys else None,
             deleted_at=row["deleted_at"] if "deleted_at" in keys else None,
         )
 
@@ -138,6 +154,9 @@ class Database:
                     ("vehicle_color", "TEXT"),
                     ("vehicle_confidence", "TEXT"),
                     ("vehicle_enriched_at", "TEXT"),
+                    ("vehicle_enriched_by", "TEXT"),
+                    ("enrich_local_status", "TEXT"),
+                    ("enrich_local_topk", "TEXT"),
                     ("deleted_at", "TEXT"),
                 ]:
                     try:

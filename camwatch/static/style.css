@@ -691,6 +691,10 @@ main { padding: 16px 20px 80px; }
 .time { font-variant-numeric: tabular-nums; font-weight: 500; }
 .time .muted { font-weight: normal; font-size: 12px; }
 .vehicle { font-size: 12px; color: var(--muted); line-height: 1.2; }
+.vehicle .vehicle-color { font-style: italic; }
+.vehicle .enrich-src { font-size: 11px; opacity: 0.75; }
+.vehicle .enrich-src-local { color: #4a8; }
+.vehicle .enrich-src-opus  { color: #a86; }
 
 .vehicle-filter-chip {
   display: inline-flex;

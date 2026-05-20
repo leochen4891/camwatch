@@ -1,0 +1,17 @@
+service:
+  host: 127.0.0.1
+  port: 8765
+
+model:
+  name: dinov2_vits14
+  device: auto   # cuda | mps | cpu | auto
+  embed_dim: 384
+
+paths:
+  db: camwatch.db
+  recordings: recordings
+
+decision:
+  k: 5
+  k_agree: 3
+  tau_high: 0.85

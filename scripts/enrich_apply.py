@@ -68,7 +68,8 @@ def main() -> int:
                       vehicle_year_range = ?,
                       vehicle_color = ?,
                       vehicle_confidence = ?,
-                      vehicle_enriched_at = ?
+                      vehicle_enriched_at = ?,
+                      vehicle_enriched_by = 'opus'
                 WHERE id = ?""",
             (item["make"], item["model"], item["year_range"],
              item["color"], item["confidence"], now, item["pass_id"]),

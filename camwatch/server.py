@@ -124,6 +124,7 @@ def render_pass(p: Pass, dist_n: float, dist_s: float, threshold: float) -> dict
         "vehicle_year_range": p.vehicle_year_range,
         "vehicle_color": p.vehicle_color,
         "vehicle_confidence": p.vehicle_confidence,
+        "vehicle_enriched_by": p.vehicle_enriched_by,
         "deleted_at": p.deleted_at,
     }
 

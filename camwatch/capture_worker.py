@@ -20,6 +20,7 @@ import shutil
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,6 +35,9 @@ from .grid_crossing import GridCrossingDetector
 from .homography import Homography
 from .preview import PreviewBuffer
 from .recorder import ClipRecorder
+
+_ENRICHER_DEFAULT_URL = "http://127.0.0.1:8765"
+_ENRICHER_TIMEOUT_S = 10.0
 
 if TYPE_CHECKING:
     from .capture import RtspStream, StaticFrameStream
@@ -260,6 +264,15 @@ class CaptureWorker(threading.Thread):
         # band (avoids logging a trajectory for a car that only ever rides
         # the slack zone at the curb).
         self._entered_strict: dict[int, bool] = {}
+        # Fire-and-forget pool for the local enrichment service. A tiny
+        # bounded pool — if the enricher is slow or down, we drop the call
+        # for this pass and let the periodic backfill script catch it.
+        self._enrich_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="enrich")
+        enricher_cfg = getattr(cfg, "enricher", None) or {}
+        self._enricher_url = enricher_cfg.get("url", _ENRICHER_DEFAULT_URL) if isinstance(enricher_cfg, dict) else _ENRICHER_DEFAULT_URL
+        self._enricher_enabled = bool(
+            enricher_cfg.get("enabled", True) if isinstance(enricher_cfg, dict) else True
+        )
 
     def is_night_mode(self) -> bool:
         """Latest night-mode state computed by the capture loop. Read by
@@ -303,6 +316,35 @@ class CaptureWorker(threading.Thread):
         self._stop_evt.set()
         if self._stream is not None:
             self._stream.stop()
+        # Drain in-flight enrich calls before exit; any pass already in the
+        # queue still gets a chance to label. cancel_futures=True drops
+        # not-yet-started ones (they'll be picked up by the backfill script).
+        try:
+            self._enrich_pool.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
+
+    def _fire_enrich(self, pass_id: int) -> None:
+        """POST to the local enrichment service. Best-effort: any failure
+        is logged and swallowed so the capture loop is never disturbed by
+        the enricher being down."""
+        if not self._enricher_enabled:
+            return
+        url = f"{self._enricher_url.rstrip('/')}/enrich"
+        try:
+            import httpx  # local import keeps the capture worker import-light
+            with httpx.Client(timeout=_ENRICHER_TIMEOUT_S) as client:
+                resp = client.post(url, json={"pass_id": int(pass_id)})
+                resp.raise_for_status()
+                data = resp.json()
+                log.info(
+                    "enrich pass=%d status=%s make=%s model=%s sim=%.3f",
+                    pass_id, data.get("status"),
+                    data.get("make"), data.get("model"),
+                    float(data.get("top_sim") or 0.0),
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("enrich pass=%d failed: %s", pass_id, e)
 
     def _save_pass_trajectory_jsonl(
         self,
@@ -769,6 +811,13 @@ class CaptureWorker(threading.Thread):
                         speed_mph=speed_mph,
                         speed_method=speed_method,
                     )
+                    # Hand off to the local enrichment service (non-blocking).
+                    # High-confidence local matches will UPDATE the row before
+                    # the user ever sees it; low-confidence ones leave the
+                    # vehicle_* fields NULL so the existing Opus workflow drains
+                    # them in the next batch.
+                    if clip_path:
+                        self._enrich_pool.submit(self._fire_enrich, pid)
                     if speed_mph is not None:
                         speed_str = (
                             f"{speed_mph:.2f} mph "
