@@ -866,6 +866,16 @@ main { padding: 16px 20px 80px; }
   border-radius: 4px;
   background: var(--surface-2);
 }
+/* Entry/exit anchor images stacked below the main thumbnail. Sized a bit
+   smaller than the center frame since they're spot-checks, not the
+   identification image. Hidden via onerror for passes that pre-date the
+   recorder anchor-image change. */
+.big-image-wrap img + img {
+  margin-top: 6px;
+}
+.big-image-wrap img.anchor {
+  max-height: 360px;
+}
 
 /* Expanded view, with a clip: high-res image on top, then meta (with the
    speed prominent), then the video player. The image is what reads first

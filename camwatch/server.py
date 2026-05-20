@@ -381,11 +381,18 @@ def make_app(
         })
 
     @app.get("/passes/{pass_id}/thumb")
-    async def get_thumb(pass_id: int, big: bool = False):
+    async def get_thumb(pass_id: int, big: bool = False, anchor: str | None = None):
         p = db.get_pass(pass_id)
         if p is None or not p.clip_path:
             raise HTTPException(status_code=404)
         base = p.clip_path[:-4] if p.clip_path.endswith(".mp4") else p.clip_path
+        # Entry / exit spot-check images (only present for passes captured
+        # after the recorder anchor-image change shipped).
+        if anchor in ("entry", "exit"):
+            anchor_path = Path(f"{base}.{anchor}.jpg")
+            if not anchor_path.exists():
+                raise HTTPException(status_code=404)
+            return FileResponse(anchor_path, media_type="image/jpeg")
         if big:
             big_path = Path(base + "_big.jpg")
             if big_path.exists():

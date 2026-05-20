@@ -605,7 +605,13 @@
       } else {
         row.dataset.preOpenTop = String(preOpenTop);
         if (imageWrap) {
-          imageWrap.innerHTML = `<img src="/passes/${passId}/thumb?big=1" alt="">`;
+          imageWrap.innerHTML = `
+            <img src="/passes/${passId}/thumb?big=1" alt="">
+            <img src="/passes/${passId}/thumb?anchor=entry" alt="grid entry" class="anchor"
+                 onerror="this.style.display='none'">
+            <img src="/passes/${passId}/thumb?anchor=exit" alt="grid exit" class="anchor"
+                 onerror="this.style.display='none'">
+          `;
           imageWrap.classList.remove("hidden");
         }
         if (videoWrap) {
