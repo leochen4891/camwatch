@@ -1,15 +1,14 @@
 """Interactive calibration tool.
 
 Subcommands:
-  pick-lines        Click two vertical lines on a still frame from the camera.
-  capture --secs N  Watch the live stream for N seconds and record every full
-                    A-then-B (or B-then-A) crossing into calibration.yaml as
-                    an unannotated pass.
+  pick-roi          Drag-adjust the YOLO region-of-interest rectangle.
   annotate          Walk through unannotated passes, ask for known GPS speed.
   compute           Average implied distances per direction; write
-                    line_distance_m_north / line_distance_m_south.
-  report            Re-run each annotated pass through the speed math; print
-                    predicted vs. known speed.
+                    line_distance_m_north / line_distance_m_south (legacy
+                    speed conversion for pre-homography DB rows).
+  report            Re-run each annotated pass through the legacy speed
+                    math; print predicted vs. known speed.
+  freeze / restore  Snapshot/recreate calibration_points across DB wipes.
 """
 
 from __future__ import annotations
@@ -18,22 +17,17 @@ import argparse
 import logging
 import subprocess
 import sys
-import time
-from datetime import datetime
 from pathlib import Path
 
 import cv2
 import yaml
 
-from .capture import RtspStream
 from .config import load_config
-from .crossing import CrossingDetector
 from .db import Database
-from .detect import Detector
-from .recorder import ClipRecorder
-from .speed import MPS_TO_MPH
 
 log = logging.getLogger("camwatch.calibrate")
+
+MPS_TO_MPH = 2.2369362920544
 
 
 # ---------- shared helpers ----------
@@ -72,225 +66,178 @@ def _scale_to_fit(frame, max_w: int = 1280):
     return cv2.resize(frame, (max_w, int(h * scale))), scale
 
 
-# ---------- pick-lines ----------
-
-def cmd_pick_lines(cfg) -> None:
-    frame = _grab_one_frame(cfg.camera.rtsp_url)
-    full_h, full_w = frame.shape[:2]
-    disp, scale = _scale_to_fit(frame)
-
-    clicks_disp: list[int] = []  # x in display coords
-
-    def on_mouse(event, x, _y, _flags, _userdata):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            clicks_disp.append(x)
-
-    win = "pick lines (click line A, then line B; r=reset, s=save, q=quit)"
-    cv2.namedWindow(win)
-    cv2.setMouseCallback(win, on_mouse)
-
-    while True:
-        view = disp.copy()
-        for i, x in enumerate(clicks_disp[:2]):
-            color = (0, 255, 0) if i == 0 else (0, 200, 255)
-            cv2.line(view, (x, 0), (x, view.shape[0]), color, 2)
-            cv2.putText(view, f"{'A' if i == 0 else 'B'} (x={int(x / scale)})",
-                        (x + 6, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        cv2.imshow(win, view)
-        key = cv2.waitKey(20) & 0xFF
-        if key == ord("q"):
-            cv2.destroyAllWindows()
-            return
-        if key == ord("r"):
-            clicks_disp.clear()
-        if key == ord("s") and len(clicks_disp) >= 2:
-            cv2.destroyAllWindows()
-            break
-        if len(clicks_disp) > 2:
-            del clicks_disp[2:]
-
-    line_a_x = int(round(min(clicks_disp[0], clicks_disp[1]) / scale))
-    line_b_x = int(round(max(clicks_disp[0], clicks_disp[1]) / scale))
-
-    data = _load_yaml(cfg.calibration_path)
-    data.update({
-        "line_a_x": line_a_x,
-        "line_b_x": line_b_x,
-        "frame_width": full_w,
-        "frame_height": full_h,
-        "line_distance_m_north": data.get("line_distance_m_north", 0.0),
-        "line_distance_m_south": data.get("line_distance_m_south", 0.0),
-    })
-    _save_yaml(cfg.calibration_path, data)
-    print(f"saved line_a_x={line_a_x} line_b_x={line_b_x} to {cfg.calibration_path}")
-
-
 # ---------- pick-roi ----------
 
 def cmd_pick_roi(cfg) -> None:
-    """Pick a region of interest rectangle. YOLO will only see pixels inside.
+    """Drag-adjust the YOLO region-of-interest rectangle.
 
-    Click top-left, then bottom-right of the road belt. The two crossing lines
-    must lie within the chosen rectangle for detection to work end-to-end.
+    Loads any existing ROI from calibration.yaml as the starting rectangle
+    (or a sensible default if none). Click-drag a corner to resize from that
+    corner; click-drag an edge to resize axis-locked; click-drag inside to
+    move the whole rectangle. `n` draws a fresh rectangle from two clicks,
+    `r` reverts to the loaded ROI, `s` saves, `q` quits.
     """
     frame = _grab_one_frame(cfg.camera.rtsp_url)
     full_h, full_w = frame.shape[:2]
     disp, scale = _scale_to_fit(frame)
+    disp_h, disp_w = disp.shape[:2]
 
     data = _load_yaml(cfg.calibration_path)
-    line_a_disp = int(round(int(data.get("line_a_x", 0) or 0) * scale))
-    line_b_disp = int(round(int(data.get("line_b_x", 0) or 0) * scale))
 
-    clicks_disp: list[tuple[int, int]] = []
+    def _initial_roi_disp() -> list[int]:
+        # Existing ROI takes priority. Otherwise center a half-frame rectangle.
+        rx1 = int(data.get("roi_x1") or 0)
+        ry1 = int(data.get("roi_y1") or 0)
+        rx2 = int(data.get("roi_x2") or 0)
+        ry2 = int(data.get("roi_y2") or 0)
+        if rx2 > rx1 and ry2 > ry1:
+            return [
+                int(round(rx1 * scale)), int(round(ry1 * scale)),
+                int(round(rx2 * scale)), int(round(ry2 * scale)),
+            ]
+        return [disp_w // 4, disp_h // 4, 3 * disp_w // 4, 3 * disp_h // 4]
+
+    initial_disp = _initial_roi_disp()
+    roi = list(initial_disp)            # [x1, y1, x2, y2] in display coords
+    drag = {"mode": None, "anchor": None, "orig": None}
+    # Two-click "draw new" mode toggled by `n`
+    draw_mode = {"on": False, "first": None}
+    EDGE_TOL = 18                       # px tolerance for hit-test (display coords)
+
+    def _hit_test(mx: int, my: int) -> str | None:
+        x1, y1, x2, y2 = roi
+        near_l = abs(mx - x1) <= EDGE_TOL
+        near_r = abs(mx - x2) <= EDGE_TOL
+        near_t = abs(my - y1) <= EDGE_TOL
+        near_b = abs(my - y2) <= EDGE_TOL
+        if near_l and near_t: return "tl"
+        if near_r and near_t: return "tr"
+        if near_l and near_b: return "bl"
+        if near_r and near_b: return "br"
+        if near_l and y1 <= my <= y2: return "left"
+        if near_r and y1 <= my <= y2: return "right"
+        if near_t and x1 <= mx <= x2: return "top"
+        if near_b and x1 <= mx <= x2: return "bottom"
+        if x1 < mx < x2 and y1 < my < y2: return "move"
+        return None
 
     def on_mouse(event, x, y, _flags, _userdata):
+        if draw_mode["on"]:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if draw_mode["first"] is None:
+                    draw_mode["first"] = (x, y)
+                else:
+                    x0, y0 = draw_mode["first"]
+                    roi[0], roi[1] = min(x0, x), min(y0, y)
+                    roi[2], roi[3] = max(x0, x), max(y0, y)
+                    draw_mode["on"] = False
+                    draw_mode["first"] = None
+            return
         if event == cv2.EVENT_LBUTTONDOWN:
-            clicks_disp.append((x, y))
+            mode = _hit_test(x, y)
+            if mode is not None:
+                drag["mode"] = mode
+                drag["anchor"] = (x, y)
+                drag["orig"] = list(roi)
+        elif event == cv2.EVENT_MOUSEMOVE and drag["mode"]:
+            ax, ay = drag["anchor"]
+            ox1, oy1, ox2, oy2 = drag["orig"]
+            dx, dy = x - ax, y - ay
+            m = drag["mode"]
+            if m == "move":
+                roi[:] = [ox1 + dx, oy1 + dy, ox2 + dx, oy2 + dy]
+            elif m == "tl":   roi[:] = [ox1 + dx, oy1 + dy, ox2, oy2]
+            elif m == "tr":   roi[:] = [ox1, oy1 + dy, ox2 + dx, oy2]
+            elif m == "bl":   roi[:] = [ox1 + dx, oy1, ox2, oy2 + dy]
+            elif m == "br":   roi[:] = [ox1, oy1, ox2 + dx, oy2 + dy]
+            elif m == "left":   roi[0] = ox1 + dx
+            elif m == "right":  roi[2] = ox2 + dx
+            elif m == "top":    roi[1] = oy1 + dy
+            elif m == "bottom": roi[3] = oy2 + dy
+            # Keep a minimum 20 px box; let the user release before fixing.
+            if roi[2] - roi[0] < 20: roi[2] = roi[0] + 20
+            if roi[3] - roi[1] < 20: roi[3] = roi[1] + 20
+        elif event == cv2.EVENT_LBUTTONUP:
+            drag["mode"] = None
 
-    win = "pick ROI (click top-left, then bottom-right; r=reset, s=save, q=quit)"
+    win = "pick ROI (drag corners/edges/inside; n=new  r=revert  s=save  q=quit)"
     cv2.namedWindow(win)
     cv2.setMouseCallback(win, on_mouse)
 
+    HANDLE = 8
+    EDGE_COLOR = (0, 0, 255)
+    HANDLE_COLOR = (0, 200, 255)
     while True:
         view = disp.copy()
-        # Show the existing crossing lines so the user knows where the ROI must cover.
-        if line_a_disp:
-            cv2.line(view, (line_a_disp, 0), (line_a_disp, view.shape[0]), (0, 220, 0), 1)
-        if line_b_disp:
-            cv2.line(view, (line_b_disp, 0), (line_b_disp, view.shape[0]), (220, 120, 0), 1)
-        if len(clicks_disp) >= 1:
-            cv2.circle(view, clicks_disp[0], 5, (0, 0, 255), -1)
-        if len(clicks_disp) >= 2:
-            p1 = (min(clicks_disp[0][0], clicks_disp[1][0]), min(clicks_disp[0][1], clicks_disp[1][1]))
-            p2 = (max(clicks_disp[0][0], clicks_disp[1][0]), max(clicks_disp[0][1], clicks_disp[1][1]))
-            # Dim everything outside the rectangle.
-            mask = view.copy()
-            cv2.rectangle(mask, (0, 0), (view.shape[1], view.shape[0]), (0, 0, 0), -1)
-            cv2.rectangle(mask, p1, p2, (0, 0, 0), -1)
-            view = cv2.addWeighted(view, 0.5, mask, 0.5, 0)
-            cv2.rectangle(view, p1, p2, (0, 0, 255), 2)
-            label = f"ROI {int(p1[0]/scale)},{int(p1[1]/scale)} -> {int(p2[0]/scale)},{int(p2[1]/scale)}"
-            cv2.putText(view, label, (p1[0] + 6, max(20, p1[1] - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        # Clamp to display before drawing.
+        roi[0] = max(0, min(roi[0], disp_w - 1))
+        roi[1] = max(0, min(roi[1], disp_h - 1))
+        roi[2] = max(roi[0] + 20, min(roi[2], disp_w))
+        roi[3] = max(roi[1] + 20, min(roi[3], disp_h))
+        x1, y1, x2, y2 = roi
+        # Dim outside the rectangle.
+        mask = view.copy()
+        cv2.rectangle(mask, (0, 0), (disp_w, disp_h), (0, 0, 0), -1)
+        cv2.rectangle(mask, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        view = cv2.addWeighted(view, 0.55, mask, 0.45, 0)
+        cv2.rectangle(view, (x1, y1), (x2, y2), EDGE_COLOR, 2)
+        # Corner + edge midpoint handles.
+        for (hx, hy) in ((x1, y1), (x2, y1), (x1, y2), (x2, y2)):
+            cv2.rectangle(view, (hx - HANDLE, hy - HANDLE), (hx + HANDLE, hy + HANDLE),
+                          HANDLE_COLOR, -1)
+            cv2.rectangle(view, (hx - HANDLE, hy - HANDLE), (hx + HANDLE, hy + HANDLE),
+                          (0, 0, 0), 1)
+        mx_x, my_y = (x1 + x2) // 2, (y1 + y2) // 2
+        for (hx, hy) in ((mx_x, y1), (mx_x, y2), (x1, my_y), (x2, my_y)):
+            cv2.circle(view, (hx, hy), HANDLE - 1, HANDLE_COLOR, -1)
+            cv2.circle(view, (hx, hy), HANDLE - 1, (0, 0, 0), 1)
+        # Status label (full-res coords so the user knows what'll be saved).
+        full_x1 = int(round(x1 / scale))
+        full_y1 = int(round(y1 / scale))
+        full_x2 = int(round(x2 / scale))
+        full_y2 = int(round(y2 / scale))
+        label = (
+            f"ROI ({full_x1},{full_y1}) -> ({full_x2},{full_y2})  "
+            f"= {full_x2 - full_x1} x {full_y2 - full_y1} px"
+        )
+        if draw_mode["on"]:
+            label = ("NEW: " + ("click 2nd corner" if draw_mode["first"] is not None
+                                else "click 1st corner")) + "    " + label
+        cv2.rectangle(view, (0, 0), (disp_w, 36), (0, 0, 0), -1)
+        cv2.putText(view, label, (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.imshow(win, view)
         key = cv2.waitKey(20) & 0xFF
         if key == ord("q"):
             cv2.destroyAllWindows()
             return
+        if key == ord("n"):
+            draw_mode["on"] = True
+            draw_mode["first"] = None
         if key == ord("r"):
-            clicks_disp.clear()
-        if key == ord("s") and len(clicks_disp) >= 2:
+            roi[:] = list(initial_disp)
+            draw_mode["on"] = False
+            draw_mode["first"] = None
+        if key == ord("s"):
             cv2.destroyAllWindows()
             break
-        if len(clicks_disp) > 2:
-            del clicks_disp[2:]
 
-    p1 = clicks_disp[0]
-    p2 = clicks_disp[1]
-    roi_x1 = int(round(min(p1[0], p2[0]) / scale))
-    roi_y1 = int(round(min(p1[1], p2[1]) / scale))
-    roi_x2 = int(round(max(p1[0], p2[0]) / scale))
-    roi_y2 = int(round(max(p1[1], p2[1]) / scale))
-    # Clamp to frame
-    roi_x1 = max(0, min(roi_x1, full_w))
-    roi_x2 = max(0, min(roi_x2, full_w))
-    roi_y1 = max(0, min(roi_y1, full_h))
-    roi_y2 = max(0, min(roi_y2, full_h))
-
-    line_a = int(data.get("line_a_x") or 0)
-    line_b = int(data.get("line_b_x") or 0)
-    if line_a and not (roi_x1 <= line_a <= roi_x2):
-        print(f"WARNING: line_a_x={line_a} is outside roi x range [{roi_x1}, {roi_x2}]")
-    if line_b and not (roi_x1 <= line_b <= roi_x2):
-        print(f"WARNING: line_b_x={line_b} is outside roi x range [{roi_x1}, {roi_x2}]")
+    roi_x1 = max(0, min(int(round(roi[0] / scale)), full_w))
+    roi_y1 = max(0, min(int(round(roi[1] / scale)), full_h))
+    roi_x2 = max(0, min(int(round(roi[2] / scale)), full_w))
+    roi_y2 = max(0, min(int(round(roi[3] / scale)), full_h))
 
     data["roi_x1"] = roi_x1
     data["roi_y1"] = roi_y1
     data["roi_x2"] = roi_x2
     data["roi_y2"] = roi_y2
+    data["frame_width"] = full_w
+    data["frame_height"] = full_h
     _save_yaml(cfg.calibration_path, data)
     print(
         f"saved ROI ({roi_x1}, {roi_y1}) -> ({roi_x2}, {roi_y2}) "
         f"= {roi_x2 - roi_x1} x {roi_y2 - roi_y1} px to {cfg.calibration_path}"
     )
-
-
-# ---------- capture ----------
-
-def cmd_capture(cfg, secs: int, recordings_dir: Path) -> None:
-    cal = _load_yaml(cfg.calibration_path)
-    if "line_a_x" not in cal or "line_b_x" not in cal:
-        raise SystemExit("run `pick-lines` first")
-    line_a = int(cal["line_a_x"])
-    line_b = int(cal["line_b_x"])
-    rx1, ry1 = int(cal.get("roi_x1") or 0), int(cal.get("roi_y1") or 0)
-    rx2, ry2 = int(cal.get("roi_x2") or 0), int(cal.get("roi_y2") or 0)
-    roi = (rx1, ry1, rx2, ry2) if (rx2 > rx1 and ry2 > ry1) else None
-
-    cap = RtspStream(cfg.camera.rtsp_url)
-    det = Detector(
-        weights=cfg.model.weights,
-        device=cfg.model.device,
-        classes=cfg.model.classes,
-        conf=cfg.model.conf,
-        iou=cfg.model.iou,
-        roi=roi,
-    )
-    recorder = ClipRecorder(recordings_dir)
-    crossing = CrossingDetector(line_a, line_b, cfg.max_track_age_s)
-    db = Database()
-
-    n_inserted = 0
-    t0 = time.monotonic()
-    deadline = t0 + secs
-    print(f"capture: watching for {secs}s. Drive at GPS-known speeds in each direction now.")
-    print(f"clips will be written to {recordings_dir}/")
-    print("ctrl+c to stop early; everything captured so far will be saved.\n")
-
-    interrupted = False
-    try:
-        for fr in cap.frames():
-            if time.monotonic() >= deadline:
-                cap.stop()
-                break
-            tracks = det.track(fr.image)
-            recorder.push(fr.image, fr.ts, tracks)
-            for ev in crossing.update(tracks, fr.ts):
-                captured_at = datetime.now().astimezone()
-                stamp = captured_at.strftime("%Y%m%dT%H%M%S")
-                clip_name = f"cal_{stamp}_id{ev.track_id}_{ev.direction}.mp4"
-                clip_path = recorder.trigger(
-                    name=clip_name,
-                    focus_track_id=ev.track_id,
-                    line_a_x=line_a,
-                    line_b_x=line_b,
-                    t_a=ev.t_a,
-                    t_b=ev.t_b,
-                )
-                db.insert_pass(
-                    captured_at=captured_at.isoformat(timespec="seconds"),
-                    track_id=ev.track_id,
-                    cls_name=ev.cls_name,
-                    direction=ev.direction,
-                    elapsed_s=round(ev.elapsed_s, 4),
-                    clip_path=clip_path or None,
-                )
-                n_inserted += 1
-                wallclock = captured_at.strftime("%H:%M:%S")
-                print(
-                    f"  [{wallclock}] pass: id={ev.track_id} {ev.cls_name} {ev.direction} "
-                    f"elapsed={ev.elapsed_s:.3f}s -> {clip_name}"
-                )
-    except KeyboardInterrupt:
-        interrupted = True
-        cap.stop()
-        print("\ninterrupted; flushing pending clips...")
-    finally:
-        recorder.flush()
-        verb = "interrupted" if interrupted else "done"
-        print(f"\ncapture {verb}. {n_inserted} new passes inserted into camwatch.db")
-        if n_inserted:
-            print("Next: run `python -m camwatch.calibrate annotate` to label your own drives.")
 
 
 # ---------- annotate ----------
@@ -481,11 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(prog="camwatch.calibrate")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("pick-lines")
     sub.add_parser("pick-roi")
-    p_cap = sub.add_parser("capture")
-    p_cap.add_argument("--secs", type=int, default=300)
-    p_cap.add_argument("--recordings-dir", type=Path, default=Path("recordings"))
     sub.add_parser("annotate")
     sub.add_parser("compute")
     sub.add_parser("report")
@@ -494,12 +437,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = load_config()
-    if args.cmd == "pick-lines":
-        cmd_pick_lines(cfg)
-    elif args.cmd == "pick-roi":
+    if args.cmd == "pick-roi":
         cmd_pick_roi(cfg)
-    elif args.cmd == "capture":
-        cmd_capture(cfg, args.secs, args.recordings_dir)
     elif args.cmd == "annotate":
         cmd_annotate(cfg)
     elif args.cmd == "compute":

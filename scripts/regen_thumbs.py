@@ -6,14 +6,14 @@ Usage:
   uv run python scripts/regen_thumbs.py --dry-run
 
 For each pass with a clip on disk, this script seeks to the middle of the
-clip, extracts one frame, crops to the line span + ROI band, and writes
-the result over the existing thumbnail JPEG.
+clip, extracts one frame, crops to the ROI band, and writes the result
+over the existing thumbnail JPEG.
 
 CAVEAT: clips recorded before the "clean thumbnails" change have the
-debug overlay (bbox, labels, lines) baked into the video, so regenerated
-thumbs will still show those overlays. The crop is centered on the road
-area between the lines, so identifying the car still works, just not as
-cleanly as a freshly-captured pass.
+debug overlay (bbox, labels) baked into the video, so regenerated thumbs
+will still show those overlays. The crop is centered on the configured
+ROI, so identifying the car still works, just not as cleanly as a
+freshly-captured pass.
 """
 
 from __future__ import annotations
@@ -33,8 +33,6 @@ from camwatch.db import Database
 
 def regen_one(
     clip_path: Path,
-    line_a_x: int,
-    line_b_x: int,
     roi: tuple[int, int, int, int] | None,
     target_w: int = 320,
 ) -> bool:
@@ -52,15 +50,19 @@ def regen_one(
         return False
 
     h, w = frame.shape[:2]
-    # Crop to line span + ROI Y range with some padding.
-    span = line_b_x - line_a_x
-    pad_x = int(span * 0.25)
-    cx1 = max(0, line_a_x - pad_x)
-    cx2 = min(w, line_b_x + pad_x)
+    # Crop to the ROI. Clips are downscaled before recording, so the saved
+    # ROI (full-resolution coords) is rescaled to the clip's frame size.
     if roi is not None:
-        cy1, cy2 = max(0, roi[1]), min(h, roi[3])
+        # Clip frames are already the recorder's downscaled size; if the
+        # saved ROI (full-res coords) exceeds the clip dimensions, clamp.
+        cx1 = max(0, min(int(roi[0]), w))
+        cy1 = max(0, min(int(roi[1]), h))
+        cx2 = max(0, min(int(roi[2]), w))
+        cy2 = max(0, min(int(roi[3]), h))
+        if cx2 <= cx1 or cy2 <= cy1:
+            cx1, cy1, cx2, cy2 = 0, 0, w, h
     else:
-        cy1, cy2 = 0, h
+        cx1, cy1, cx2, cy2 = 0, 0, w, h
     cropped = frame[cy1:cy2, cx1:cx2]
     th, tw = cropped.shape[:2]
     if tw > target_w:
@@ -81,8 +83,7 @@ def main() -> int:
     cfg = load_config()
     cal = cfg.load_calibration()
     if cal is None:
-        print("ERROR: calibration.yaml missing; can't determine line span")
-        return 1
+        print("WARNING: calibration.yaml missing; thumbnails will use the full frame")
 
     db = Database()
     passes = db.list_passes(limit=10000)
@@ -104,7 +105,7 @@ def main() -> int:
             print(f"id={p.id}: would regen {clip.with_suffix('.jpg')}")
             n_ok += 1
             continue
-        if regen_one(clip, cal.line_a_x, cal.line_b_x, cal.roi):
+        if regen_one(clip, cal.roi if cal else None):
             print(f"id={p.id}: ok ({clip.name})")
             n_ok += 1
         else:

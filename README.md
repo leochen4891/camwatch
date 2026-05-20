@@ -142,7 +142,7 @@ uv run python -m camwatch serve --profile             # log per-stage timings
 
 For remote access: Tailscale for personal use, Cloudflare Tunnel + Access for shareable URLs. The UI has no built-in auth.
 
-There's also a legacy headless mode (`uv run python -m camwatch`, uses the original 2-line speed math) that writes events.jsonl + alert JPGs. Useful for diagnostics; the web UI is the canonical runtime.
+`uv run python -m camwatch.calibrate pick-roi` opens an interactive window to drag-adjust the YOLO region-of-interest rectangle whenever the camera is re-aimed.
 
 ## Vehicle enrichment (optional)
 

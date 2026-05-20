@@ -42,12 +42,14 @@ class ModelConfig:
 
 @dataclass
 class CalibrationConfig:
-    line_a_x: int
-    line_b_x: int
     frame_width: int
     frame_height: int
-    line_distance_m_north: float
-    line_distance_m_south: float
+    # Legacy per-direction "meters between the deprecated screen lines".
+    # Speed for new passes comes from the homography running-avg; these are
+    # retained only as a fallback conversion factor for pre-grid_crossing rows
+    # in the DB that recorded `elapsed_s` but no `speed_mph`.
+    line_distance_m_north: float = 0.0
+    line_distance_m_south: float = 0.0
     # Region of interest fed to YOLO. Anything outside is invisible to detection
     # but still saved in clips and visible to any future security view. Set all
     # four to 0 (or omit) to feed the full frame to YOLO.
@@ -93,8 +95,6 @@ class Config:
         with self.calibration_path.open() as f:
             data = yaml.safe_load(f) or {}
         return CalibrationConfig(
-            line_a_x=int(data["line_a_x"]),
-            line_b_x=int(data["line_b_x"]),
             frame_width=int(data["frame_width"]),
             frame_height=int(data["frame_height"]),
             line_distance_m_north=float(data.get("line_distance_m_north", 0.0)),

@@ -1,4 +1,4 @@
-"""Rolling video clip recorder with detection/line overlay.
+"""Rolling video clip recorder with detection overlay.
 
 For each pushed frame we keep the raw image + the detection list. When a
 crossing fires `trigger()`, we snapshot the ring buffer (pre-roll) and
@@ -6,11 +6,10 @@ keep accumulating frames for `post_seconds` more. Once the post-roll
 quota is met, the clip is rendered with overlays and written to mp4.
 
 Overlay draws:
-  - both vertical lines, dim before crossed and bright once the trigger
-    track's `ground_point` has passed them (timestamp shown next to each)
   - every detection's bbox in gray, plus the trigger track's bbox in red
   - a small dot at each car's `ground_point` (the bbox bottom-center the
     speed math anchors to), large red for the trigger track
+  - the 5 ft homography grid (yellow) burned into the frame
   - a header strip with t (relative to t_a) and the total span (t_b - t_a)
 
 Frames are downscaled before storage to keep memory + file size sane.
@@ -46,8 +45,6 @@ class _ActiveClip:
     frames: list[_FrameRec]
     target_end_ts: float  # finalize once a pushed frame has ts >= this
     focus_track_id: int
-    line_a_x: int  # in scaled coords
-    line_b_x: int  # in scaled coords
     t_a: float
     t_b: float
     speed_mph: float | None = None
@@ -57,9 +54,6 @@ class _ActiveClip:
 
 _GRAY = (180, 180, 180)
 _RED = (0, 0, 255)
-_GREEN_BRIGHT = (0, 220, 0)
-_BLUE_BRIGHT = (220, 120, 0)
-_DIM = (90, 90, 90)
 _WHITE = (255, 255, 255)
 _BLACK = (0, 0, 0)
 _GRID_YELLOW = (0, 255, 255)   # bright yellow grid lines (BGR); matches preview
@@ -158,8 +152,6 @@ class ClipRecorder:
         self,
         name: str,
         focus_track_id: int,
-        line_a_x: int,
-        line_b_x: int,
         t_a: float,
         t_b: float,
         speed_mph: float | None = None,
@@ -193,8 +185,6 @@ class ClipRecorder:
             frames=pre_frames,
             target_end_ts=desired_end,
             focus_track_id=focus_track_id,
-            line_a_x=int(round(line_a_x * self._scale)),
-            line_b_x=int(round(line_b_x * self._scale)),
             t_a=t_a,
             t_b=t_b,
             speed_mph=speed_mph,

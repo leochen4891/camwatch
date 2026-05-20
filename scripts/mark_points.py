@@ -13,6 +13,7 @@ Controls:
   u             undo last point (decrement counter)
   r             reset everything
   s             save in-place and keep clicking
+  f             refresh image from main stream (preserves existing clicks)
   Enter         save and exit
   q / Esc       abort without saving
 
@@ -139,8 +140,14 @@ def build_main_url() -> str:
     return f"rtsp://{user}:{pw}@{cam['host']}:{cam['port']}{cam['path']}"
 
 
-def click_loop(img: np.ndarray) -> list[tuple[int, int]]:
-    """Open img, collect numbered points. Returns the click list."""
+def click_loop(img: np.ndarray, refresh=None) -> list[tuple[int, int]]:
+    """Open img, collect numbered points. Returns the click list.
+
+    If `refresh` is callable, the `f` key swaps the displayed image for the
+    one returned by `refresh()` (preserving existing clicks). Used when a
+    transient occlusion (e.g. a parked car) covered a click target.
+    """
+    img_box = [img]
     H, W = img.shape[:2]
     points: list[tuple[int, int]] = []
 
@@ -151,7 +158,7 @@ def click_loop(img: np.ndarray) -> list[tuple[int, int]]:
     win_h = int(H * scale)
 
     def render() -> np.ndarray:
-        out = img.copy()
+        out = img_box[0].copy()
         for i, (x, y) in enumerate(points, 1):
             cv2.circle(out, (x, y), 8, (0, 255, 0), -1)
             cv2.circle(out, (x, y), 9, (0, 0, 0), 1)
@@ -164,10 +171,11 @@ def click_loop(img: np.ndarray) -> list[tuple[int, int]]:
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 1, cv2.LINE_AA,
             )
         cv2.rectangle(out, (0, 0), (W, 36), (0, 0, 0), -1)
-        status = (
-            f"Points: {len(points)}    Next index: {len(points)+1}    "
-            f"u=undo  r=reset  s=save  Enter=save+exit  q=abort"
-        )
+        keys = "u=undo  r=reset  s=save"
+        if refresh is not None:
+            keys += "  f=refresh"
+        keys += "  Enter=save+exit  q=abort"
+        status = f"Points: {len(points)}    Next index: {len(points)+1}    {keys}"
         cv2.putText(
             out, status, (8, 24),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA,
@@ -206,8 +214,23 @@ def click_loop(img: np.ndarray) -> list[tuple[int, int]]:
                 p = points.pop()
                 print(f"  (undo: removed point {len(points)+1}: {p})")
         if k == ord("s"):
-            save(img, points)
+            save(img_box[0], points)
             print(f"  (saved {len(points)} points; keep clicking or press Enter to exit)")
+        if k == ord("f") and refresh is not None:
+            print("  (refreshing from main stream — waiting for keyframe …)")
+            try:
+                new_img = refresh()
+            except Exception as e:  # noqa: BLE001
+                print(f"  (refresh failed: {e}; keeping current frame)")
+            else:
+                if new_img.shape[:2] != (H, W):
+                    print(
+                        f"  (refresh got {new_img.shape[1]}x{new_img.shape[0]}, "
+                        f"expected {W}x{H} — keeping current frame)"
+                    )
+                else:
+                    img_box[0] = new_img
+                    print("  (frame refreshed; clicks preserved)")
         if k in (13, 10):
             break
 
@@ -265,6 +288,7 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    url: str | None = None
     if args.frame:
         img = cv2.imread(args.frame)
         if img is None:
@@ -277,6 +301,7 @@ def main() -> None:
         if img is None:
             sys.exit(f"failed to read cached {SNAPSHOT}")
         print(f"Using cached frame: {SNAPSHOT} ({img.shape[1]}x{img.shape[0]})")
+        url = build_main_url()
     else:
         url = build_main_url()
         img = grab_mainstream_frame(url)
@@ -288,7 +313,16 @@ def main() -> None:
         img = overlay_grid_from_homography(img)
         print("Overlaid 5ft grid + axes from current homography (display only).")
 
-    points = click_loop(img)
+    def refresh_from_stream() -> np.ndarray:
+        assert url is not None
+        new_img = grab_mainstream_frame(url)
+        SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(SNAPSHOT), new_img)
+        print(f"  (saved refreshed snapshot to {SNAPSHOT})")
+        return new_img
+
+    refresh = refresh_from_stream if (url is not None and not args.with_grid) else None
+    points = click_loop(img, refresh=refresh)
     if not points:
         sys.exit("no points marked; nothing saved")
     save(img, points)

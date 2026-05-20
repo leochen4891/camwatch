@@ -36,12 +36,7 @@ class PreviewBuffer:
         # whenever the homography or grid bounds change. None disables drawing.
         self._grid_polylines: list[np.ndarray] | None = None
 
-    def configure(
-        self,
-        roi: tuple[int, int, int, int] | None,
-        line_a_x: int = 0,  # noqa: ARG002 (kept for caller compat; unused)
-        line_b_x: int = 0,  # noqa: ARG002
-    ) -> None:
+    def configure(self, roi: tuple[int, int, int, int] | None) -> None:
         self._roi = roi
 
     def set_grid(

@@ -417,17 +417,13 @@ class CaptureWorker(threading.Thread):
         if cal is None:
             log.warning(
                 "calibration.yaml not found; capture worker idle. "
-                "Run `python -m camwatch.calibrate pick-lines` first."
+                "Run `python -m camwatch.calibrate pick-roi` first."
             )
-            return
-        if cal.line_a_x >= cal.line_b_x:
-            log.warning("invalid line positions in calibration.yaml; capture worker idle")
             return
 
         log.info(
-            "capture worker starting (threshold=%.1f mph, lines a=%d b=%d for clip annotation only, "
-            "trigger=grid-entry/exit)",
-            self._cfg.alert_threshold_mph, cal.line_a_x, cal.line_b_x,
+            "capture worker starting (threshold=%.1f mph, trigger=grid-entry/exit)",
+            self._cfg.alert_threshold_mph,
         )
 
         # YOLO sees the full frame. Tracks are filtered by an in-grid check
@@ -466,7 +462,7 @@ class CaptureWorker(threading.Thread):
             max_track_age_s=self._cfg.max_track_age_s,
         )
         if self._preview is not None:
-            self._preview.configure(cal.roi, cal.line_a_x, cal.line_b_x)
+            self._preview.configure(cal.roi)
             self._preview.set_grid(
                 self._homog,
                 _GRID_X_MIN, _GRID_X_MAX,
@@ -743,8 +739,6 @@ class CaptureWorker(threading.Thread):
                     clip_path = recorder.trigger(
                         name=clip_name,
                         focus_track_id=ev.track_id,
-                        line_a_x=cal.line_a_x,
-                        line_b_x=cal.line_b_x,
                         t_a=ev.t_a,
                         t_b=ev.t_b,
                         speed_mph=speed_mph,

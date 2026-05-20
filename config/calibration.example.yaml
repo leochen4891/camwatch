@@ -1,22 +1,21 @@
-# Two vertical screen lines and the real-world distance between them per direction.
-# Populated by `python -m camwatch.calibrate pick-lines` and `... annotate ...`.
-
-line_a_x: 800              # left line, pixel x in source frame
-line_b_x: 1200             # right line, pixel x in source frame
-frame_width: 2560          # source frame width (sanity check)
-frame_height: 1920
-
-# Real-world distance between line_a and line_b, in meters, per direction.
-# Northbound = left to right, Southbound = right to left.
-line_distance_m_north: 0.0
-line_distance_m_south: 0.0
+# Camera main-stream frame size (written by `camwatch.calibrate pick-roi`).
+frame_width: 3840
+frame_height: 2160
 
 # Region of interest cropped from the full frame before YOLO inference.
 # Lawn / sky / driveway pixels outside this rectangle are not seen by the
 # detector; clips and any future security view still use the full frame.
-# Set with `python -m camwatch.calibrate pick-roi`. Leave all zeros to feed
-# the full frame to YOLO.
+# Set interactively with `python -m camwatch.calibrate pick-roi`.
+# Leave all zeros to feed the full frame to YOLO.
 roi_x1: 0
 roi_y1: 0
 roi_x2: 0
 roi_y2: 0
+
+# Legacy per-direction "meters between the deprecated screen lines".
+# Retained only as a fallback conversion factor for any pre-grid_crossing
+# DB rows that recorded `elapsed_s` but no `speed_mph`. All new passes get
+# their speed from the homography running-avg, so 0.0 is fine on fresh
+# installs. Populated historically by `camwatch.calibrate compute`.
+line_distance_m_north: 0.0
+line_distance_m_south: 0.0

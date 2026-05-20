@@ -91,6 +91,10 @@ def project_world_to_pixel(Hinv, K, D, X, Y) -> tuple[float, float] | None:
 def polyline_for_segment(Hinv, K, D, X1, Y1, X2, Y2, n=64) -> np.ndarray:
     ts = np.linspace(0.0, 1.0, n)
     pts: list[tuple[int, int]] = []
+    # A badly-fit H can project grid lines to pixel values billions away.
+    # Clip to a generous int32-safe window so the polyline still renders
+    # something (cv2 will clip to the canvas) instead of overflowing.
+    LIMIT = 1_000_000
     for t in ts:
         X = X1 + (X2 - X1) * t
         Y = Y1 + (Y2 - Y1) * t
@@ -99,6 +103,8 @@ def polyline_for_segment(Hinv, K, D, X1, Y1, X2, Y2, n=64) -> np.ndarray:
             continue
         u, v = p
         if not (math.isfinite(u) and math.isfinite(v)):
+            continue
+        if abs(u) > LIMIT or abs(v) > LIMIT:
             continue
         pts.append((int(round(u)), int(round(v))))
     return np.array(pts, dtype=np.int32) if pts else np.zeros((0, 2), dtype=np.int32)
@@ -280,20 +286,23 @@ def main() -> None:
                 color = DOT_CORNER
             else:
                 color = DOT
-            cv2.circle(out, (u, v), 7, color, -1, cv2.LINE_AA)
-            cv2.circle(out, (u, v), 8, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.circle(out, (u, v), 14, color, -1, cv2.LINE_AA)
+            cv2.circle(out, (u, v), 16, (255, 255, 255), 2, cv2.LINE_AA)
             # Labels outside the grid: east-curb dots (idx 1-14, near the
             # image bottom) get labels below; west-curb dots (15-17) above.
             if 1 <= idx <= 14:
-                lx, ly = u - 6, v + 24
+                lx, ly = u - 14, v + 56
             else:
-                lx, ly = u - 6, v - 14
+                lx, ly = u - 14, v - 28
             cv2.putText(out, str(idx), (lx, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 3, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 6, cv2.LINE_AA)
             cv2.putText(out, str(idx), (lx, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 2, cv2.LINE_AA)
 
-        cv2.rectangle(out, (0, 0), (W_img, 30), (0, 0, 0), -1)
+        # Bar height sized for 4K → ~1600-wide display (scale ~0.42); font
+        # scale chosen so text renders ~28 px tall on screen, not ~13.
+        bar_h = 70
+        cv2.rectangle(out, (0, 0), (W_img, bar_h), (0, 0, 0), -1)
         dirty_tag = "  [DIRTY: press c to refit]" if dirty[0] else ""
         status = (
             f"[1]rect [2]5ft [3]1ft [4]axes [5]dots  "
@@ -305,8 +314,8 @@ def main() -> None:
             status = "REFITTING …  " + status
         elif fetching:
             status = "FETCHING FRAME …  " + status
-        cv2.putText(out, status, (8, 21),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(out, status, (12, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
         return out
 
     while True:
