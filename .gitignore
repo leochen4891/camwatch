@@ -32,3 +32,4 @@ camwatch.db-wal
 camwatch.db-shm
 
 .DS_Store
+config/cx410w_archive/
