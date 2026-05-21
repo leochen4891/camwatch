@@ -43,6 +43,12 @@ _ENRICHER_TIMEOUT_S = 30.0
 # Access entirely.
 _CAMWATCH_LOOPBACK_BASE = "http://127.0.0.1:8000"
 
+# Default coords for the daylight gate. Override in config/config.yaml
+# under `enricher.daylight` if the camera ever moves.
+_DAYLIGHT_LAT_DEFAULT = 40.7956
+_DAYLIGHT_LON_DEFAULT = -74.3148
+_DAYLIGHT_BUFFER_HOURS_DEFAULT = 1.0
+
 if TYPE_CHECKING:
     from .capture import RtspStream, StaticFrameStream
     from .metrics import MetricsCollector
@@ -328,7 +334,7 @@ class CaptureWorker(threading.Thread):
         except Exception:
             pass
 
-    def _fire_enrich(self, pass_id: int, direction: str | None) -> None:
+    def _fire_enrich(self, pass_id: int, direction: str | None, captured_at: str) -> None:
         """POST to the local enrichment service with this pass's image URLs.
 
         After the camwatch-enricher repo split the enricher no longer touches
@@ -339,9 +345,27 @@ class CaptureWorker(threading.Thread):
         seconds after insert_pass), so the first POST sometimes lands
         before the thumbnail exists. The enricher returns 404 in that
         case; we retry on a short backoff until the recorder catches up.
+
+        Skips non-daylight captures entirely — IR/night images would
+        force the enricher to label by lighting instead of make/model,
+        and pollute the index if the enricher upserts the embedding.
+        Those passes go straight to the Opus workflow.
         """
         if not self._enricher_enabled:
             return
+        try:
+            from .daylight import is_daylight
+            if not is_daylight(
+                captured_at,
+                lat=_DAYLIGHT_LAT_DEFAULT,
+                lon=_DAYLIGHT_LON_DEFAULT,
+                buffer_hours=_DAYLIGHT_BUFFER_HOURS_DEFAULT,
+            ):
+                log.info("enrich pass=%d skipped: outside daylight window", pass_id)
+                return
+        except Exception as e:  # noqa: BLE001
+            log.warning("daylight check failed for pass=%d: %s (proceeding anyway)",
+                        pass_id, e)
         url = f"{self._enricher_url.rstrip('/')}/enrich"
         image_urls = {
             "thumb": f"{_CAMWATCH_LOOPBACK_BASE}/passes/{int(pass_id)}/thumb",
@@ -893,7 +917,10 @@ class CaptureWorker(threading.Thread):
                     # vehicle_* fields NULL so the existing Opus workflow drains
                     # them in the next batch.
                     if clip_path:
-                        self._enrich_pool.submit(self._fire_enrich, pid, ev.direction)
+                        self._enrich_pool.submit(
+                            self._fire_enrich, pid, ev.direction,
+                            captured_at.isoformat(timespec="seconds"),
+                        )
                     if speed_mph is not None:
                         speed_str = (
                             f"{speed_mph:.2f} mph "

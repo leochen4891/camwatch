@@ -1,0 +1,74 @@
+marked_points:
+  source_image: events/calibration_main_frame.jpg
+  frame_size:
+  - 2560
+  - 1440
+  points:
+  - idx: 1
+    pixel:
+    - 2239
+    - 567
+  - idx: 2
+    pixel:
+    - 2132
+    - 558
+  - idx: 3
+    pixel:
+    - 2017
+    - 550
+  - idx: 4
+    pixel:
+    - 1889
+    - 546
+  - idx: 5
+    pixel:
+    - 1749
+    - 540
+  - idx: 6
+    pixel:
+    - 1604
+    - 532
+  - idx: 7
+    pixel:
+    - 1469
+    - 530
+  - idx: 8
+    pixel:
+    - 1320
+    - 526
+  - idx: 9
+    pixel:
+    - 1176
+    - 523
+  - idx: 10
+    pixel:
+    - 1042
+    - 522
+  - idx: 11
+    pixel:
+    - 917
+    - 523
+  - idx: 12
+    pixel:
+    - 805
+    - 523
+  - idx: 13
+    pixel:
+    - 700
+    - 523
+  - idx: 14
+    pixel:
+    - 616
+    - 525
+  - idx: 15
+    pixel:
+    - 874
+    - 418
+  - idx: 16
+    pixel:
+    - 1131
+    - 414
+  - idx: 17
+    pixel:
+    - 2061
+    - 450

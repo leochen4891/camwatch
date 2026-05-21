@@ -1,0 +1,82 @@
+line_a_x: 135
+line_b_x: 471
+frame_width: 640
+frame_height: 480
+line_distance_m_north: 11.679
+line_distance_m_south: 14.427
+passes: []
+roi_x1: 3
+roi_y1: 137
+roi_x2: 633
+roi_y2: 234
+calibration_points:
+- direction: N
+  known_mph: 35.0
+  elapsed_s: 0.7534224810442538
+  captured_at: '2026-05-05T10:14:00-04:00'
+  track_id: 19
+  cls_name: car
+  clip_path: recordings/cal_20260505T101400_id19_N.mp4
+- direction: S
+  known_mph: 35.0
+  elapsed_s: 0.972507536309422
+  captured_at: '2026-05-05T10:13:28-04:00'
+  track_id: 18
+  cls_name: car
+  clip_path: recordings/cal_20260505T101328_id18_S.mp4
+- direction: N
+  known_mph: 25.0
+  elapsed_s: 1.0242407709301915
+  captured_at: '2026-05-05T10:12:55-04:00'
+  track_id: 16
+  cls_name: car
+  clip_path: recordings/cal_20260505T101255_id16_N.mp4
+- direction: S
+  known_mph: 25.0
+  elapsed_s: 1.2838776409553248
+  captured_at: '2026-05-05T10:12:27-04:00'
+  track_id: 12
+  cls_name: car
+  clip_path: recordings/cal_20260505T101227_id12_S.mp4
+- direction: N
+  known_mph: 15.0
+  elapsed_s: 1.7048203536687652
+  captured_at: '2026-05-05T10:12:05-04:00'
+  track_id: 10
+  cls_name: car
+  clip_path: recordings/cal_20260505T101205_id10_N.mp4
+- direction: S
+  known_mph: 15.0
+  elapsed_s: 2.045370726242254
+  captured_at: '2026-05-05T10:11:34-04:00'
+  track_id: 8
+  cls_name: car
+  clip_path: recordings/cal_20260505T101134_id8_S.mp4
+- direction: N
+  known_mph: 25.0
+  elapsed_s: 0.9643988032985362
+  captured_at: '2026-05-05T13:00:12-04:00'
+  track_id: 144
+  cls_name: car
+  clip_path: recordings/cal_20260505T130012_id144_N.mp4
+- direction: N
+  known_mph: 24.0
+  elapsed_s: 1.1475163640279789
+  captured_at: '2026-05-07T19:49:26-04:00'
+  track_id: 826
+  cls_name: car
+  clip_path: recordings/cal_20260507T194926_id826_N.mp4
+- direction: N
+  known_mph: 34.0
+  elapsed_s: 0.8173028529272415
+  captured_at: '2026-05-08T07:53:57-04:00'
+  track_id: 1163
+  cls_name: car
+  clip_path: recordings/cal_20260508T075357_id1163_N.mp4
+- direction: N
+  known_mph: 29.0
+  elapsed_s: 0.8929651390644722
+  captured_at: '2026-05-08T08:37:10-04:00'
+  track_id: 1242
+  cls_name: car
+  clip_path: recordings/cal_20260508T083710_id1242_N.mp4

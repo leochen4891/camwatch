@@ -21,6 +21,11 @@ dependencies = [
     # enricher was in-process; they now live in the camwatch-enricher
     # repo. Ultralytics still pulls torch transitively for YOLO.
     "httpx>=0.27",
+    # astral computes sunrise/sunset so the capture worker skips the
+    # local enricher call for non-daylight passes (those go straight to
+    # the Opus workflow). The enricher applies its own daylight filter
+    # to the index for defense-in-depth.
+    "astral>=3.2",
 ]
 
 [build-system]
