@@ -539,31 +539,83 @@ class ClipRecorder:
     ) -> np.ndarray | None:
         """Return a tight focus-bbox crop from the frame nearest target_ts
         in the requested direction. None if the focus track is not visible
-        in any clip frame, or if the resulting crop is degenerately small."""
+        in any clip frame, the resulting crop is degenerately small, or
+        every candidate frame has the focus heavily occluded by another
+        vehicle.
+
+        Scoring (parallel to `_write_thumbnail`):
+          - `diff = |rec.ts - target_ts|` with a 10x side penalty for
+            being on the wrong side of target_ts
+          - `+ occlusion_weight * max_overlap` where max_overlap is the
+            largest fraction of the focus's padded crop covered by any
+            other detected vehicle's bbox. Without this, the picker
+            grabs frames where another car is in front of the focus
+            from the camera's POV (e.g., pass 6849: an Audi occluding
+            a Honda Odyssey at the crossing, so the anchor JPEG showed
+            the Audi and Opus labeled accordingly).
+          - Final reject: max_overlap >= max_overlap_reject_threshold
+            (default 0.6) → too occluded to label reliably; return None
+            so no anchor JPEG gets written.
+        """
         s = self._scale
-        best: tuple[float, int, tuple[float, float, float, float]] | None = None
-        # Frames before target_ts get a 10x score penalty when prefer=="after"
-        # (and vice versa) — they still win if nothing on the preferred side
-        # contains the focus track, but lose to any same-side candidate.
         side_penalty = 10.0
+        occlusion_weight = 0.5
+        max_overlap_reject_threshold = 0.6
+        best: tuple[float, int, tuple[float, float, float, float], float] | None = None
         for i, rec in enumerate(clip.frames):
             focus_bbox = None
+            other_bboxes: list[tuple[float, float, float, float]] = []
             for d in rec.detections:
+                bbox = getattr(d, "bbox", None)
+                if bbox is None:
+                    continue
                 if getattr(d, "track_id", None) == clip.focus_track_id:
-                    focus_bbox = getattr(d, "bbox", None)
-                    break
+                    focus_bbox = bbox
+                else:
+                    other_bboxes.append(bbox)
             if focus_bbox is None:
                 continue
+            # Compute max overlap of the focus's padded crop region with
+            # any other vehicle's bbox — same geometry the thumbnail
+            # picker uses.
+            bx1, by1, bx2, by2 = (v * s for v in focus_bbox)
+            bw = bx2 - bx1
+            bh = by2 - by1
+            pad_x = max(bw * 0.6, 40)
+            pad_y = max(bh * 0.7, 40)
+            cx1, cy1, cx2, cy2 = bx1 - pad_x, by1 - pad_y, bx2 + pad_x, by2 + pad_y
+            crop_area = max(1.0, (cx2 - cx1) * (cy2 - cy1))
+            max_overlap = 0.0
+            for ob in other_bboxes:
+                ox1, oy1, ox2, oy2 = (v * s for v in ob)
+                ix1 = max(cx1, ox1)
+                iy1 = max(cy1, oy1)
+                ix2 = min(cx2, ox2)
+                iy2 = min(cy2, oy2)
+                iw = max(0.0, ix2 - ix1)
+                ih = max(0.0, iy2 - iy1)
+                if iw == 0 or ih == 0:
+                    continue
+                overlap = (iw * ih) / crop_area
+                if overlap > max_overlap:
+                    max_overlap = overlap
             dt = rec.ts - target_ts
             if prefer == "after":
-                score = dt if dt >= 0 else -dt * side_penalty
+                diff = dt if dt >= 0 else -dt * side_penalty
             else:  # "before"
-                score = -dt if dt <= 0 else dt * side_penalty
+                diff = -dt if dt <= 0 else dt * side_penalty
+            score = diff + occlusion_weight * max_overlap
             if best is None or score < best[0]:
-                best = (score, i, focus_bbox)
+                best = (score, i, focus_bbox, max_overlap)
         if best is None:
             return None
-        _, idx, bbox = best
+        # If even the best candidate is heavily occluded, refuse to write
+        # the anchor — better to skip it than to label the wrong car.
+        if best[3] >= max_overlap_reject_threshold:
+            log.info("anchor at t=%.2f skipped: max_overlap=%.2f >= %.2f (heavily occluded)",
+                     target_ts, best[3], max_overlap_reject_threshold)
+            return None
+        _, idx, bbox, _ = best
         raw = clip.frames[idx].image
         fh, fw = raw.shape[:2]
         bx1, by1, bx2, by2 = (v * s for v in bbox)
