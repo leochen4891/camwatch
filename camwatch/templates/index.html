@@ -4,6 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>camwatch</title>
+  <script>
+    // Apply saved theme before the stylesheet paints to avoid FOUC.
+    (function () {
+      try {
+        var t = localStorage.getItem("camwatch.theme");
+        if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+      } catch (e) { /* localStorage may be disabled; default to dark */ }
+    })();
+  </script>
   <link rel="stylesheet" href="/static/style.css?v={{ static_v }}">
   <script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
 </head>
@@ -25,6 +34,18 @@
       <h2>Settings</h2>
       <form method="dialog"><button class="muted-btn" aria-label="close">✕</button></form>
     </div>
+
+    <section class="settings-section">
+      <h3>Appearance</h3>
+      <p class="muted-text">Theme applies immediately and is remembered in this browser.</p>
+      <div class="setting-row">
+        <label>Theme</label>
+        <select id="theme-select" onchange="setTheme(this.value)">
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </div>
+    </section>
 
     <form class="settings-form"
           hx-post="/settings"
@@ -506,12 +527,28 @@
       heatmapMask = readHeatmapMaskFromInput();
       const restored = restoreFilterState();
       applyHeatmapMode();
+      // Sync the Theme select with whatever the bootstrap script (in <head>)
+      // applied. data-theme is unset for the default (dark) case.
+      const themeSel = document.getElementById("theme-select");
+      if (themeSel) {
+        themeSel.value = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+      }
       if (restored) {
         // Server rendered with defaults; fire one fetch to bring the list,
         // histogram, and heatmap counts in line with the restored filters.
         htmx.trigger("#filter-form", "change");
       }
     });
+
+    function setTheme(t) {
+      if (t !== "light" && t !== "dark") return;
+      if (t === "dark") {
+        delete document.documentElement.dataset.theme;
+      } else {
+        document.documentElement.dataset.theme = t;
+      }
+      try { localStorage.setItem("camwatch.theme", t); } catch (e) { /* non-fatal */ }
+    }
 
     // Refresh button: re-trigger the filter-form to refetch /passes immediately.
     document.body.addEventListener("click", (e) => {

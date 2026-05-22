@@ -9,6 +9,30 @@
   --alert-bg: rgba(226, 59, 74, 0.12);
   --border: #2a2f3a;
   --green: #4ade80;
+  /* Theme-specific overrides for hardcoded shades elsewhere in the file.
+     Keep these in vars so light mode can swap without per-rule rewrites. */
+  --bar-hover: #354054;
+  --chart-bg: #14181f;
+  --tooltip-bg: #14181f;
+  --heatmap-deselected: #000;
+  --pause-badge-bg: #4a4030;
+}
+:root[data-theme="light"] {
+  --bg: #f4f5f8;
+  --surface: #ffffff;
+  --surface-2: #e9ecf2;
+  --text: #1a1d24;
+  --muted: #5e6577;
+  --accent: #2c70c0;
+  --alert: #c92434;
+  --alert-bg: rgba(201, 36, 52, 0.10);
+  --border: #d2d6df;
+  --green: #16a34a;
+  --bar-hover: #cdd4e0;
+  --chart-bg: #f0f2f6;
+  --tooltip-bg: #ffffff;
+  --heatmap-deselected: #d2d6df;
+  --pause-badge-bg: #f3e2b8;
 }
 
 * { box-sizing: border-box; }
@@ -60,7 +84,7 @@ header {
   line-height: 16px;
   text-align: center;
   border-radius: 50%;
-  background: #4a4030;
+  background: var(--pause-badge-bg);
   color: #d8a52e;
   font-size: 11px;
   font-weight: 700;
@@ -318,7 +342,7 @@ header {
 .metrics-chart {
   display: block;
   width: 100%;
-  background: #14181f;
+  background: var(--chart-bg);
   border-radius: 4px;
 }
 .metrics-chart-legend {
@@ -353,7 +377,7 @@ header {
   width: max-content;
   max-width: 280px;
   padding: 8px 10px;
-  background: #14181f;
+  background: var(--tooltip-bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
@@ -444,7 +468,7 @@ header {
 /* Floor non-zero bars so a single-pass bucket is still visible against
    the taller track. Zero-count bars stay at 0 height (invisible). */
 .bar-nonzero { min-height: 5px; }
-.bar-wrap:hover .bar { background: #354054; }
+.bar-wrap:hover .bar { background: var(--bar-hover); }
 .bar-wrap input:checked + .bar-count + .bar-track .bar,
 .bar-wrap input:checked ~ .bar-track .bar {
   /* fallback in case structure changes */
@@ -1029,7 +1053,7 @@ main { padding: 16px 20px 80px; }
   justify-content: center;
   background: var(--surface-2);
 }
-.heatmap-corner:hover { color: var(--accent); background: #2a3140; }
+.heatmap-corner:hover { color: var(--accent); background: var(--surface-2); }
 .heatmap-day-header {
   height: 36px;
   display: flex;
@@ -1041,7 +1065,7 @@ main { padding: 16px 20px 80px; }
 }
 .heatmap-day-header .heatmap-weekday { color: var(--text); font-weight: 600; font-size: 12px; }
 .heatmap-day-header .heatmap-date { color: var(--muted); font-size: 10px; }
-.heatmap-day-header:hover { background: #2a3140; }
+.heatmap-day-header:hover { background: var(--surface-2); }
 .heatmap-slot-header {
   font-size: 10px;
   text-align: right;
@@ -1056,7 +1080,7 @@ main { padding: 16px 20px 80px; }
 .heatmap-cell {
   position: relative;
   border: 0;
-  background: #000; /* deselected = pure black */
+  background: var(--heatmap-deselected); /* deselected = strong contrast w/ surface */
 }
 /* Selected scale: clearly-visible gray (no data) → blue gradient (count mode). */
 .heatmap-cell.selected.heat-0 { background: #3a3f4a; }
