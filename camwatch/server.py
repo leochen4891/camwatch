@@ -573,19 +573,32 @@ def make_app(
             preview.set_show_grid(bool(preview_show_grid))
         threshold = float(cfg.alert_threshold_mph)
         archive_dir = Path("recordings_archive")
-        # Phase 1: clips_days — delete .mp4 only.
+        # Phase 1: clips_days — archive alarm .mp4 to recordings_archive/,
+        # delete non-alarm .mp4.
         if cfg.clips_days > 0:
             clip_items = db.passes_with_clip_older_than(cfg.clips_days)
+            if clip_items:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+            archived_clips = 0
             removed_clips = 0
-            for _pid, cp, _speed in clip_items:
-                if Path(cp).exists():
-                    try:
-                        Path(cp).unlink(missing_ok=True)
+            for _pid, cp, speed in clip_items:
+                p = Path(cp)
+                if not p.exists():
+                    continue
+                try:
+                    if speed is not None and speed >= threshold:
+                        shutil.move(str(p), archive_dir / p.name)
+                        archived_clips += 1
+                    else:
+                        p.unlink(missing_ok=True)
                         removed_clips += 1
-                    except Exception:
-                        pass
-            if removed_clips:
-                log.info("retention: removed %d .mp4 files on settings save", removed_clips)
+                except Exception:
+                    pass
+            if archived_clips or removed_clips:
+                log.info(
+                    "retention: %d alarm clips archived, %d non-alarm deleted on settings save",
+                    archived_clips, removed_clips,
+                )
         # Phase 2: thumbs_days — delete .jpg (archive for alarm passes), NULL clip_path.
         if cfg.thumbs_days > 0:
             thumb_items = db.purge_thumbs_older_than(cfg.thumbs_days)
@@ -596,11 +609,17 @@ def make_app(
             for _pid, cp, speed in thumb_items:
                 base = cp[:-4] if cp.endswith(".mp4") else cp
                 thumb = base + ".jpg"
-                # Also remove the .mp4 if it somehow outlived clips_days.
-                try:
-                    Path(cp).unlink(missing_ok=True)
-                except Exception:
-                    pass
+                # Belt-and-braces: archive (alarm) or remove (non-alarm) the
+                # .mp4 if it somehow outlived clips_days.
+                mp4 = Path(cp)
+                if mp4.exists():
+                    try:
+                        if speed is not None and speed >= threshold:
+                            shutil.move(str(mp4), archive_dir / mp4.name)
+                        else:
+                            mp4.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 if speed is not None and speed >= threshold:
                     if Path(thumb).exists():
                         try:

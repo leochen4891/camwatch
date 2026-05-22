@@ -603,18 +603,28 @@ class CaptureWorker(threading.Thread):
                     days_clips = int(self._cfg.clips_days or 0)
                     if days_clips > 0:
                         clip_items = self._db.passes_with_clip_older_than(days_clips)
+                        if clip_items:
+                            archive_dir.mkdir(parents=True, exist_ok=True)
+                        archived_clips = 0
                         removed_clips = 0
-                        for _pid, cp, _speed in clip_items:
-                            if Path(cp).exists():
-                                try:
-                                    Path(cp).unlink(missing_ok=True)
+                        for _pid, cp, speed in clip_items:
+                            p = Path(cp)
+                            if not p.exists():
+                                continue
+                            try:
+                                if speed is not None and speed >= threshold_mph:
+                                    shutil.move(str(p), archive_dir / p.name)
+                                    archived_clips += 1
+                                else:
+                                    p.unlink(missing_ok=True)
                                     removed_clips += 1
-                                except Exception as e:  # noqa: BLE001
-                                    log.debug("clip cleanup: %s: %s", cp, e)
-                        if removed_clips:
+                            except Exception as e:  # noqa: BLE001
+                                log.debug("clip cleanup: %s: %s", cp, e)
+                        if archived_clips or removed_clips:
                             log.info(
-                                "retention: removed %d .mp4 files (clips_days=%d)",
-                                removed_clips, days_clips,
+                                "retention: %d alarm clips archived, %d non-alarm deleted "
+                                "(clips_days=%d, threshold=%.1f mph)",
+                                archived_clips, removed_clips, days_clips, threshold_mph,
                             )
 
                     days_thumbs = int(self._cfg.thumbs_days or 0)
@@ -627,11 +637,17 @@ class CaptureWorker(threading.Thread):
                         for _pid, cp, speed in thumb_items:
                             base = cp[:-4] if cp.endswith(".mp4") else cp
                             thumb = base + ".jpg"
-                            # Belt-and-braces: nuke the .mp4 if it survived phase 1.
-                            try:
-                                Path(cp).unlink(missing_ok=True)
-                            except Exception as e:  # noqa: BLE001
-                                log.debug("late clip cleanup: %s: %s", cp, e)
+                            # Belt-and-braces: archive (alarm) or nuke (non-alarm)
+                            # the .mp4 if it survived phase 1.
+                            mp4 = Path(cp)
+                            if mp4.exists():
+                                try:
+                                    if speed is not None and speed >= threshold_mph:
+                                        shutil.move(str(mp4), archive_dir / mp4.name)
+                                    else:
+                                        mp4.unlink(missing_ok=True)
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("late clip cleanup: %s: %s", cp, e)
                             if speed is not None and speed >= threshold_mph:
                                 if Path(thumb).exists():
                                     try:
