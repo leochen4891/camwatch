@@ -401,7 +401,7 @@ header {
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  min-height: 510px;
+  min-height: 340px;
 }
 .bar-wrap {
   display: flex;
