@@ -280,8 +280,11 @@ class CaptureWorker(threading.Thread):
         self._enrich_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="enrich")
         enricher_cfg = getattr(cfg, "enricher", None) or {}
         self._enricher_url = enricher_cfg.get("url", _ENRICHER_DEFAULT_URL) if isinstance(enricher_cfg, dict) else _ENRICHER_DEFAULT_URL
+        # Disabled by default while the local enricher is still being trained
+        # offline against captured passes. Flip `enricher.enabled: true` in
+        # config once the trained model is ready to serve live /enrich calls.
         self._enricher_enabled = bool(
-            enricher_cfg.get("enabled", True) if isinstance(enricher_cfg, dict) else True
+            enricher_cfg.get("enabled", False) if isinstance(enricher_cfg, dict) else False
         )
 
     def is_night_mode(self) -> bool:
