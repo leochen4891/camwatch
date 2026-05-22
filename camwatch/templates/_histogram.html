@@ -12,7 +12,7 @@
                  {% if b.selected %}checked{% endif %}>
           <span class="bar-count">{{ b.count if b.count else "" }}</span>
           <span class="bar-track">
-            <span class="bar" style="height: {{ b.height_pct }}%"></span>
+            <span class="bar{% if b.count %} bar-nonzero{% endif %}" style="height: {{ b.height_pct }}%"></span>
           </span>
           <span class="bar-label">{{ b.label }}</span>
         </label>

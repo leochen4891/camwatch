@@ -401,7 +401,7 @@ header {
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  min-height: 255px;
+  min-height: 510px;
 }
 .bar-wrap {
   display: flex;
@@ -428,7 +428,7 @@ header {
   display: flex;
   align-items: flex-end;
   width: 100%;
-  height: 150px;
+  height: 300px;
   background: transparent;
   border-bottom: 1px solid var(--border);
   border-radius: 2px;
@@ -441,6 +441,9 @@ header {
   border-radius: 2px 2px 0 0;
   transition: background-color 0.1s ease;
 }
+/* Floor non-zero bars so a single-pass bucket is still visible against
+   the taller track. Zero-count bars stay at 0 height (invisible). */
+.bar-nonzero { min-height: 5px; }
 .bar-wrap:hover .bar { background: #354054; }
 .bar-wrap input:checked + .bar-count + .bar-track .bar,
 .bar-wrap input:checked ~ .bar-track .bar {
