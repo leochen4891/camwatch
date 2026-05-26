@@ -243,11 +243,22 @@ def make_app(
         app.state.db = db
         app.state.preview = preview
         app.state.metrics = metrics
+
+        uploader = None
+        cloud_url = os.environ.get("CAMWATCH_CLOUD_URL")
+        cloud_key = os.environ.get("CAMWATCH_CLOUD_KEY")
+        if cloud_url and cloud_key:
+            from .uploader import Uploader
+            uploader = Uploader(db, cfg, cloud_url, cloud_key)
+            uploader.start()
+
         log.info("server startup complete")
         try:
             yield
         finally:
             log.info("server shutdown: stopping capture worker")
+            if uploader:
+                uploader.stop()
             worker.stop()
             worker.join(timeout=10)
             metrics.stop()
