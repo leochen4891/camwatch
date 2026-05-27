@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 POLL_INTERVAL_S = 30
 BATCH_SIZE = 10
 LOCAL_SERVER = "http://127.0.0.1:8000"
+MIN_PASS_ID = 8651
 
 
 class Uploader:
@@ -84,9 +85,10 @@ class Uploader:
                    WHERE deleted = 0
                      AND uploaded_at IS NULL
                      AND clip_path IS NOT NULL
+                     AND id >= ?
                    ORDER BY id ASC
                    LIMIT ?""",
-                (BATCH_SIZE,),
+                (MIN_PASS_ID, BATCH_SIZE),
             ).fetchall()
 
         count = 0
