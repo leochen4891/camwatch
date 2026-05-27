@@ -74,6 +74,7 @@ class Uploader:
             self._thread.join(timeout=10)
 
     def _run(self) -> None:
+        self._fix_missing_media()
         while not self._stop.is_set():
             try:
                 uploaded = self._upload_batch()
@@ -83,6 +84,33 @@ class Uploader:
             except Exception:
                 log.exception("uploader error")
                 self._stop.wait(POLL_INTERVAL_S)
+
+    def _fix_missing_media(self) -> None:
+        """Re-upload passes that were sent before their thumbnail existed."""
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM passes
+                   WHERE uploaded_at IS NOT NULL
+                     AND clip_path IS NOT NULL
+                     AND id >= ?
+                   ORDER BY id DESC
+                   LIMIT 200""",
+                (MIN_PASS_ID,),
+            ).fetchall()
+
+        count = 0
+        for row in rows:
+            p = Pass.from_row(row)
+            if not p.clip_path:
+                continue
+            thumb_path = Path(p.clip_path).with_suffix(".jpg")
+            if not thumb_path.exists():
+                continue
+            if self._upload_pass(p):
+                count += 1
+                log.info("re-uploaded pass %d (media fix)", p.id)
+        if count:
+            log.info("fixed media for %d passes", count)
 
     def _upload_batch(self) -> int:
         with self.db.connect() as conn:
