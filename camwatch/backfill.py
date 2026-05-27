@@ -29,8 +29,8 @@ LOCAL_SERVER = "http://127.0.0.1:8000"
 
 def has_anchors(pass_id: int) -> bool:
     try:
-        r = httpx.head(f"{LOCAL_SERVER}/passes/{pass_id}/thumb?anchor=entry", timeout=3.0)
-        return r.status_code == 200
+        r = httpx.get(f"{LOCAL_SERVER}/passes/{pass_id}/thumb?anchor=entry", timeout=3.0)
+        return r.status_code == 200 and len(r.content) > 100
     except httpx.HTTPError:
         return False
 
