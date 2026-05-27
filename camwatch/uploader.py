@@ -107,6 +107,7 @@ class Uploader:
     def _upload_pass(self, p: Pass) -> bool:
         metadata = {
             "captured_at": p.captured_at,
+            "engine_pass_id": p.id,
             "track_id": p.track_id,
             "cls_name": p.cls_name,
             "direction": p.direction,
