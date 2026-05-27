@@ -100,6 +100,10 @@ class Uploader:
         count = 0
         for row in rows:
             p = Pass.from_row(row)
+            if p.clip_path:
+                thumb_path = Path(p.clip_path).with_suffix(".jpg")
+                if not thumb_path.exists():
+                    continue
             if self._upload_pass(p):
                 with self.db.connect() as conn:
                     conn.execute(
