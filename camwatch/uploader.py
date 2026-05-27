@@ -2,7 +2,8 @@
 
 Runs as a background thread alongside the capture worker. Periodically
 scans for un-uploaded passes, assembles the multipart payload, and POSTs
-to the cloud ingest endpoint.
+to the cloud ingest endpoint. Also syncs enrichment data that arrives
+after the initial upload.
 
 Usage:
     from camwatch.uploader import Uploader
@@ -48,15 +49,19 @@ class Uploader:
         self.api_key = api_key
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._ensure_column()
+        self._ensure_columns()
 
-    def _ensure_column(self) -> None:
+    def _ensure_columns(self) -> None:
         with self.db.connect() as conn:
-            try:
-                conn.execute("ALTER TABLE passes ADD COLUMN uploaded_at TEXT")
-                conn.commit()
-            except sqlite3.OperationalError:
-                pass
+            for col, decl in [
+                ("uploaded_at", "TEXT"),
+                ("enrichment_synced_at", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE passes ADD COLUMN {col} {decl}")
+                except sqlite3.OperationalError:
+                    pass
+            conn.commit()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name="uploader")
@@ -72,7 +77,8 @@ class Uploader:
         while not self._stop.is_set():
             try:
                 uploaded = self._upload_batch()
-                if uploaded == 0:
+                synced = self._sync_enrichment_batch()
+                if uploaded == 0 and synced == 0:
                     self._stop.wait(POLL_INTERVAL_S)
             except Exception:
                 log.exception("uploader error")
@@ -103,6 +109,55 @@ class Uploader:
                     conn.commit()
                 count += 1
                 log.info("uploaded pass %d", p.id)
+
+        return count
+
+    def _sync_enrichment_batch(self) -> int:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """SELECT id, vehicle_make, vehicle_model, vehicle_color, vehicle_confidence
+                   FROM passes
+                   WHERE uploaded_at IS NOT NULL
+                     AND vehicle_enriched_at IS NOT NULL
+                     AND (enrichment_synced_at IS NULL OR enrichment_synced_at < vehicle_enriched_at)
+                     AND id >= ?
+                   ORDER BY id ASC
+                   LIMIT ?""",
+                (MIN_PASS_ID, BATCH_SIZE),
+            ).fetchall()
+
+        count = 0
+        for row in rows:
+            pass_id = row["id"]
+            payload = {
+                "vehicle_make": row["vehicle_make"],
+                "vehicle_model": row["vehicle_model"],
+                "vehicle_color": row["vehicle_color"],
+                "vehicle_confidence": row["vehicle_confidence"],
+            }
+            try:
+                with httpx.Client(timeout=15.0) as client:
+                    resp = client.post(
+                        f"{self.cloud_url}/api/passes/{pass_id}/enrich",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    )
+                    if resp.status_code == 200:
+                        with self.db.connect() as conn:
+                            conn.execute(
+                                "UPDATE passes SET enrichment_synced_at = datetime('now') WHERE id = ?",
+                                (pass_id,),
+                            )
+                            conn.commit()
+                        count += 1
+                        log.info("synced enrichment for pass %d", pass_id)
+                    else:
+                        log.warning("enrich sync pass %d: HTTP %d", pass_id, resp.status_code)
+            except httpx.HTTPError as e:
+                log.warning("enrich sync pass %d: %s", pass_id, e)
 
         return count
 
