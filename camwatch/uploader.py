@@ -245,7 +245,7 @@ class Uploader:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     files=files,
                 )
-                if resp.status_code == 201:
+                if resp.status_code in (200, 201):
                     return True
                 log.warning("upload pass %d failed: %d %s", p.id, resp.status_code, resp.text[:200])
                 return False
