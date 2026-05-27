@@ -125,6 +125,7 @@ def main() -> None:
     parser.add_argument("--cloud-url", required=True)
     parser.add_argument("--api-key", required=True)
     parser.add_argument("--batch", type=int, default=50, help="Batch size before pause")
+    parser.add_argument("--limit", type=int, default=0, help="Max passes to upload (0=all)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -163,6 +164,10 @@ def main() -> None:
             ok += 1
         else:
             fail += 1
+
+        if args.limit and (ok + fail) >= args.limit:
+            log.info("reached limit of %d", args.limit)
+            break
 
         if (ok + fail) % args.batch == 0 and (ok + fail) > 0:
             log.info("progress: %d ok, %d fail, %d skip — pausing 2s", ok, fail, skip)
