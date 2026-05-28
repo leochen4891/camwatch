@@ -147,11 +147,13 @@ class Uploader:
     def _sync_enrichment_batch(self) -> int:
         with self.db.connect() as conn:
             rows = conn.execute(
-                """SELECT id, vehicle_make, vehicle_model, vehicle_color, vehicle_confidence
+                """SELECT id, vehicle_make, vehicle_model, vehicle_color,
+                          vehicle_confidence, vehicle_enriched_at
                    FROM passes
                    WHERE uploaded_at IS NOT NULL
                      AND vehicle_enriched_at IS NOT NULL
-                     AND (enrichment_synced_at IS NULL OR enrichment_synced_at < vehicle_enriched_at)
+                     AND (enrichment_synced_at IS NULL
+                          OR enrichment_synced_at != vehicle_enriched_at)
                      AND id >= ?
                    ORDER BY id ASC
                    LIMIT ?""",
@@ -180,8 +182,8 @@ class Uploader:
                     if resp.status_code == 200:
                         with self.db.connect() as conn:
                             conn.execute(
-                                "UPDATE passes SET enrichment_synced_at = datetime('now') WHERE id = ?",
-                                (pass_id,),
+                                "UPDATE passes SET enrichment_synced_at = ? WHERE id = ?",
+                                (row["vehicle_enriched_at"], pass_id),
                             )
                             conn.commit()
                         count += 1
