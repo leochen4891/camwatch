@@ -905,22 +905,23 @@
           legend.textContent = "(not enough samples)";
           return;
         }
-        // Y-axis range is driven by the canonical running-average signal
-        // (smooth, the value behind the headline speed) — NOT by v_inst.
-        // Per-frame v_inst spikes to tens/hundreds of mph from PTS bursts
-        // and detection jitter; letting it set the scale squashed the
-        // running line into an unreadable sliver at the bottom. v_inst dots
-        // above the range are clipped to the top edge (drawn red) so the
-        // outliers stay visible without dictating the scale. Fall back to
-        // capped v_inst only when no running samples exist at all.
+        // Y-axis is anchored to the canonical headline speed (the running
+        // average at exit) rather than any series max. Both v_inst AND the
+        // early running-average samples spike to hundreds of mph (tiny
+        // cumulative dt over the first few frames, PTS bursts, edge-of-frame
+        // detections); scaling to their max squashed the real signal into an
+        // unreadable sliver at the bottom. Anchor to ~1.6x the headline and
+        // clip anything above to the top edge so outliers stay visible
+        // without dictating the scale.
+        const canonical = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
         const vRunningVals = samples.map(s => s.v_running_mph).filter(v => v != null);
-        const rangeBasis = vRunningVals.length
-          ? vRunningVals
-          : samples.map(s => s.v_inst_mph).filter(v => v != null && v < 100);
+        const anchor = (canonical != null && isFinite(canonical) && canonical > 0)
+          ? canonical * 1.6
+          : Math.max(...vRunningVals.filter(v => v < 100), 0);
         const uMin = 0;
         const uMax = (m.frame_size && m.frame_size[0]) || 2048;
         const vMin = 0;
-        const vMax = Math.max(40, Math.ceil(Math.max(...rangeBasis, 0) / 10) * 10 + 5);
+        const vMax = Math.max(40, Math.ceil(anchor / 10) * 10 + 5);
         chartGeo = { samples, padL, padR, padT, padB, chW, chH,
                      uMin, uMax, vMin, vMax, clipStart, clipDur };
 
@@ -987,7 +988,8 @@
           ctx.beginPath();
           runningSeq.forEach((s, i) => {
             const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
-            const y = padT + chH - (s.v_running_mph - vMin) / (vMax - vMin) * chH;
+            const yRaw = padT + chH - (s.v_running_mph - vMin) / (vMax - vMin) * chH;
+            const y = Math.max(padT, Math.min(padT + chH, yRaw));
             if (i === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
           });
@@ -1161,17 +1163,18 @@
           legend.textContent = "(not enough samples)";
           return;
         }
-        // Y-axis scales to the running-average signal only (see the player
-        // chart above for the rationale); v_inst outliers are clipped to the
-        // top edge rather than blowing out the scale.
+        // Y-axis anchored to the canonical headline speed (see the player
+        // chart above for the rationale); both v_inst and early running-avg
+        // outliers are clipped to the top edge rather than blowing out scale.
+        const canonical = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
         const vRunningVals = samples.map(s => s.v_running_mph).filter(v => v != null);
-        const rangeBasis = vRunningVals.length
-          ? vRunningVals
-          : samples.map(s => s.v_inst_mph).filter(v => v != null && v < 100);
+        const anchor = (canonical != null && isFinite(canonical) && canonical > 0)
+          ? canonical * 1.6
+          : Math.max(...vRunningVals.filter(v => v < 100), 0);
         const uMin = 0;
         const uMax = (m.frame_size && m.frame_size[0]) || 2048;
         const vMin = 0;
-        const vMax = Math.max(40, Math.ceil(Math.max(...rangeBasis, 0) / 10) * 10 + 5);
+        const vMax = Math.max(40, Math.ceil(anchor / 10) * 10 + 5);
         ctx.strokeStyle = "#444"; ctx.fillStyle = "#888";
         ctx.font = "10px system-ui";
         ctx.lineWidth = 1;
@@ -1217,7 +1220,8 @@
           ctx.beginPath();
           runningSeq.forEach((s, i) => {
             const x = padL + (s.u - uMin) / (uMax - uMin) * chW;
-            const y = padT + chH - (s.v_running_mph - vMin) / (vMax - vMin) * chH;
+            const yRaw = padT + chH - (s.v_running_mph - vMin) / (vMax - vMin) * chH;
+            const y = Math.max(padT, Math.min(padT + chH, yRaw));
             if (i === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
           });
