@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## System context
 
-This repo is **one component of the CamWatch system**. See the whole-system map in
-`camwatch-system/SYSTEM.md` (architecture, data flow, the web API contract, shared
-glossary, ADRs) before making cross-component changes.
+This repo is **one component of the CamWatch system**. See the whole-system map,
+`SYSTEM.md` in the `camwatch-system` repo (`leochen4891/camwatch-system`, docs-only)
+— architecture, data flow, the web API contract, shared glossary, and ADRs — before
+making cross-component changes.
 
 **This component's role:** Producer. Captures passes off the speed camera, computes
 speed and direction, records media, stores them in local `camwatch.db`, and uploads
