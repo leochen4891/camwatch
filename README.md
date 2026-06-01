@@ -146,7 +146,7 @@ For remote access: Tailscale for personal use, Cloudflare Tunnel + Access for sh
 
 ## Vehicle enrichment (optional)
 
-The `passes` table reserves columns for `vehicle_make`, `vehicle_model`, `vehicle_year_range`, `vehicle_color`, and `vehicle_confidence`. They are populated out-of-band, not by the live capture loop. The shipped setup is `scripts/camwatch-tick.sh` — a small hourly cron that calls `scripts/enrich_apply.py`, which scans for new passes with an unread thumbnail, asks a vision model to identify the vehicle, and writes the result back to the row. See [the camwatch-3 post](https://leidevs.com/blog/camwatch-3/#reliable-hd-then-automated-vehicle-enrichment) for the reasoning behind running this as a stateless cron tick rather than one long agent session.
+The `passes` table reserves columns for `vehicle_make`, `vehicle_model`, `vehicle_year_range`, `vehicle_color`, and `vehicle_confidence`. They are populated out-of-band, not by the live capture loop. The shipped setup is an hourly cron (with a 15-45 min jitter) that runs `scripts/camwatch-tick.sh`, which spawns a fresh headless Claude Code session: it scans for new passes with an unread thumbnail, asks Opus to identify the vehicle, and applies the result to the row via `scripts/enrich_apply.py`. See [the camwatch-3 post](https://leidevs.com/blog/camwatch-3/#reliable-hd-then-automated-vehicle-enrichment) for the reasoning behind running this as a stateless cron tick rather than one long agent session.
 
 When the columns are populated, the UI exposes a one-click "filter by this vehicle" action on every row. Color matching is fuzzy (silver, light-grey, off-white all bucket into "light"), so lighting drift across days does not split one repeat offender into three.
 

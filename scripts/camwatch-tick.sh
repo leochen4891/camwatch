@@ -5,8 +5,9 @@
 # new Claude Code session; nothing persists between ticks except what the
 # spec writes to ~/.claude/camwatch-check-status.md.
 #
-# Schedule (cron, every 6h):
-#   0 */6 * * * /home/lchen/git/camwatch/scripts/camwatch-tick.sh
+# Schedule (cron, hourly with jitter):
+#   0 * * * * sleep $(shuf -i 900-2700 -n 1) && /home/lchen/git/camwatch/scripts/camwatch-tick.sh
+#   (the sleep spreads the run 15-45 min past the top of the hour)
 #
 # Manual dry run:
 #   /home/lchen/git/camwatch/scripts/camwatch-tick.sh
