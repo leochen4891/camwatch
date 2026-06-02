@@ -100,6 +100,24 @@ _STATIONARY_SPREAD_M = 0.5
 # to be useful even as a "current" reading).
 _MIN_RUNNING_SAMPLES = 5
 
+# Trustworthiness guards on the headline speed. The running average is only
+# meaningful when the trajectory's time base and the focus track are sound;
+# two failure modes corrupt it and produce phantom over-speeds:
+#   1. Timing compression. A variable-frame-rate source (or a network/decoder
+#      burst) can deliver frames with bunched presentation timestamps, so the
+#      trajectory's total span — the speed denominator — collapses and the
+#      reported speed inflates. A pass whose frames imply a frame rate above
+#      what the camera can physically produce is rejected. The 4K Reolink tops
+#      out near 25 fps; 35 leaves headroom for a constant-fps stream without
+#      admitting the 40-50 fps bursts that VFR produced.
+#   2. Spatial jump. When the focus track's box merges with an oncoming vehicle
+#      (two cars meeting in frame), its ground point leaps sideways/backward,
+#      inflating cumulative arc length far past the straight-line displacement.
+#      A clean crossing stays within ~1.03; 1.4 rejects a doubled-back path.
+# A tripped guard yields speed "unknown" (NULL) rather than a fabricated number.
+_MAX_PLAUSIBLE_FPS = 35.0
+_MAX_ARC_DISPLACEMENT_RATIO = 1.4
+
 # Night-mode (IR) gate. The Reolink E1 switches to monochrome IR illumination
 # in low light; speed measurements from those frames are unreliable because
 # only headlights/taillights are bright enough to detect, the bbox represents
@@ -844,6 +862,8 @@ class CaptureWorker(threading.Thread):
                         speed_samples = [(t, u, v) for (t, u, v, _bb) in traj_for_speed]
                         final_mph, _per_frame, n = self._homog.running_avg_speed(
                             speed_samples, min_samples=_MIN_RUNNING_SAMPLES,
+                            max_plausible_fps=_MAX_PLAUSIBLE_FPS,
+                            max_arc_displacement_ratio=_MAX_ARC_DISPLACEMENT_RATIO,
                         )
                         if final_mph == final_mph:  # not NaN
                             speed_mph = float(final_mph)
@@ -947,7 +967,8 @@ class CaptureWorker(threading.Thread):
                         )
                     else:
                         speed_str = (
-                            f"speed unavailable (insufficient trajectory samples)"
+                            "speed unavailable (too few samples, or trajectory "
+                            "rejected as timing-compressed / spatially jumped)"
                         )
                     log.info(
                         "pass id=%d track=%d %s %s %s  elapsed=%.3fs  clip=%s",
