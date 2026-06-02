@@ -122,6 +122,7 @@ class Homography:
         min_samples: int = 5,
         max_plausible_fps: float | None = None,
         max_arc_displacement_ratio: float | None = None,
+        max_exit_descent: float | None = None,
     ) -> tuple[float, list[float], int]:
         """Cumulative-distance / cumulative-time speed from the first sample.
 
@@ -150,6 +151,15 @@ class Homography:
           straight-line displacement by more than this factor, the track
           doubled back (e.g. the focus box merged with an oncoming vehicle),
           inflating distance. A clean crossing stays within ~1.03.
+        * `max_exit_descent` — catches a *partial* early burst that the global
+          fps guard misses: a cluster of bunched-PTS frames at track
+          acquisition followed by a normally-timed tail. The early frames
+          contribute distance with almost no time, so the running average
+          starts high and is still descending at grid exit — it never
+          converged. A real vehicle can't lose this fraction of its speed in
+          the final inter-frame interval, so a still-descending exit means the
+          headline is a timing artifact. Rejected only when the tail is
+          consistently descending (guards against a single noisy final frame).
 
         Returns:
             (final_mph, per_frame_running, n_samples).
@@ -192,6 +202,18 @@ class Homography:
                 + (projected[-1][2] - projected[0][2]) ** 2
             ) ** 0.5
             if net > 0 and cum_dist / net > max_arc_displacement_ratio:
+                return float("nan"), per_frame, n
+        if max_exit_descent is not None:
+            vr = [v for v in per_frame if v == v]  # drop NaNs
+            # Need a settled tail to distinguish "still paying off an early
+            # burst" (high → descending) from a clean pass converging up from
+            # below; require a consistently descending final pair.
+            if (
+                len(vr) >= 5
+                and vr[-1] > 0
+                and vr[-3] > vr[-2] > vr[-1]
+                and (vr[-2] - vr[-1]) / vr[-1] > max_exit_descent
+            ):
                 return float("nan"), per_frame, n
         return last_valid, per_frame, n
 

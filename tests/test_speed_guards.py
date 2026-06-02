@@ -21,6 +21,7 @@ import math
 
 from camwatch.capture_worker import (
     _MAX_ARC_DISPLACEMENT_RATIO,
+    _MAX_EXIT_DESCENT,
     _MAX_PLAUSIBLE_FPS,
     _MIN_RUNNING_SAMPLES,
 )
@@ -35,13 +36,15 @@ def _homog() -> Homography:
     return h
 
 
-def _speed(samples):
-    final, _per_frame, _n = _homog().running_avg_speed(
-        samples,
+def _speed(samples, **overrides):
+    kwargs = dict(
         min_samples=_MIN_RUNNING_SAMPLES,
         max_plausible_fps=_MAX_PLAUSIBLE_FPS,
         max_arc_displacement_ratio=_MAX_ARC_DISPLACEMENT_RATIO,
+        max_exit_descent=_MAX_EXIT_DESCENT,
     )
+    kwargs.update(overrides)
+    final, _per_frame, _n = _homog().running_avg_speed(samples, **kwargs)
     return final
 
 
@@ -73,6 +76,34 @@ def test_spatial_jump_is_rejected():
     samples = _straight(n=10, dt=0.05, mps=mps)
     t, x, y = samples[5]
     samples[5] = (t, x + 12.0, y)  # 12 m lateral excursion
+    assert math.isnan(_speed(samples))
+
+
+def _early_burst():
+    """An acquisition burst (7 frames bunched in time but spread in space) then
+    a normally-timed tail at the true speed. The per-pass average frame rate
+    stays under the fps cap, but the burst inflates the running average so it is
+    still descending at grid exit — the partial-burst case (cf. pass 12708)."""
+    samples = []
+    t = 0.0
+    for i in range(7):           # burst: dt 0.006 s, 2 m apart  → ~fast
+        samples.append((t, 0.0, 2.0 * i))
+        t += 0.006
+    y = 2.0 * 6
+    for _ in range(6):           # tail: dt 0.07 s, 1 m apart  → true speed
+        y += 1.0
+        t += 0.07
+        samples.append((t, 0.0, y))
+    return samples
+
+
+def test_partial_burst_not_converged_is_rejected():
+    samples = _early_burst()
+    # The global fps guard must NOT be what fires here (the tail dilutes it)...
+    fps = (len(samples) - 1) / (samples[-1][0] - samples[0][0])
+    assert fps < _MAX_PLAUSIBLE_FPS
+    assert not math.isnan(_speed(samples, max_exit_descent=None))  # only guard C rejects
+    # ...the convergence guard is.
     assert math.isnan(_speed(samples))
 
 

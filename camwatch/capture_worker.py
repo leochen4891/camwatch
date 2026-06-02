@@ -114,9 +114,18 @@ _MIN_RUNNING_SAMPLES = 5
 #      (two cars meeting in frame), its ground point leaps sideways/backward,
 #      inflating cumulative arc length far past the straight-line displacement.
 #      A clean crossing stays within ~1.03; 1.4 rejects a doubled-back path.
+#   3. Partial early burst. A cluster of bunched-PTS frames at track acquisition
+#      followed by a normally-timed tail: the per-pass average frame rate stays
+#      under the cap (the tail dilutes it), so guard 1 misses it, but the early
+#      frames inflate the running average so it is still descending at grid exit
+#      instead of converged. A real vehicle can't shed >8% of its speed in one
+#      ~0.08 s interval, so a consistently-descending exit is a timing artifact.
+#      (The pre-2026-05 2-line speed method was immune to this; the trajectory
+#      running-average integrates from acquisition, so it is not.)
 # A tripped guard yields speed "unknown" (NULL) rather than a fabricated number.
 _MAX_PLAUSIBLE_FPS = 35.0
 _MAX_ARC_DISPLACEMENT_RATIO = 1.4
+_MAX_EXIT_DESCENT = 0.08
 
 # Night-mode (IR) gate. The Reolink E1 switches to monochrome IR illumination
 # in low light; speed measurements from those frames are unreliable because
@@ -864,6 +873,7 @@ class CaptureWorker(threading.Thread):
                             speed_samples, min_samples=_MIN_RUNNING_SAMPLES,
                             max_plausible_fps=_MAX_PLAUSIBLE_FPS,
                             max_arc_displacement_ratio=_MAX_ARC_DISPLACEMENT_RATIO,
+                            max_exit_descent=_MAX_EXIT_DESCENT,
                         )
                         if final_mph == final_mph:  # not NaN
                             speed_mph = float(final_mph)
