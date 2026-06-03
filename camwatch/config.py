@@ -88,6 +88,7 @@ class Config:
     clip_capture_max_mph: float = 999.0  # passes above this speed are logged but skip clip
     preview_show_grid: bool = True  # draw the calibrated measurement grid on the live preview
     pause_at_night: bool = True  # skip YOLO/triggering when the camera is in IR/night mode
+    upload_enabled: bool = True  # when False, the hub uploader stays idle (creds still required to run at all)
     # Inset (in feet) for the entry/exit anchor images relative to the grid
     # edges. The speed-measurement grid is unchanged; only the anchor image
     # picker shifts. Positive values move the anchor inward from the grid
@@ -199,6 +200,7 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         clip_capture_max_mph=float((raw.get("clip") or {}).get("capture_max_mph", 999.0) or 999.0),
         preview_show_grid=bool((raw.get("preview") or {}).get("show_grid", True)),
         pause_at_night=bool((raw.get("capture") or {}).get("pause_at_night", True)),
+        upload_enabled=bool((raw.get("upload") or {}).get("enabled", True)),
         recorder_south_anchor_inset_ft=float(
             ((raw.get("recorder") or {}).get("anchor_inset_ft") or {}).get("south", 0.0) or 0.0
         ),

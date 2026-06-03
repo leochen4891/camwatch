@@ -107,6 +107,18 @@
       </section>
 
       <section class="settings-section">
+        <h3>Hub upload</h3>
+        <p class="muted-text">Upload finalized passes to the camwatch-web hub. Turn off while recalibrating or experimenting so provisional passes don't reach the hub; turn back on to resume (queued passes upload on the next poll). Requires hub credentials to be configured.</p>
+        <div class="setting-row">
+          <label class="checkbox">
+            <input type="checkbox" name="upload_enabled" value="true"
+                   {% if upload_enabled %}checked{% endif %}>
+            Upload passes to the hub
+          </label>
+        </div>
+      </section>
+
+      <section class="settings-section">
         <h3>Storage retention</h3>
         <p class="muted-text">Three phases, in order. <code>0</code> on any knob disables that phase. Typical layout: clips &lt; thumbnails &lt; pass records.</p>
         <div class="setting-row">

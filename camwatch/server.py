@@ -244,13 +244,17 @@ def make_app(
         app.state.preview = preview
         app.state.metrics = metrics
 
+        # The uploader thread starts whenever hub credentials are present, but
+        # only POSTs while cfg.upload_enabled is true. That lets the /settings
+        # switch pause/resume uploads live without a restart.
         uploader = None
         cloud_url = os.environ.get("CAMWATCH_CLOUD_URL")
         cloud_key = os.environ.get("CAMWATCH_CLOUD_KEY")
         if cloud_url and cloud_key:
             from .uploader import Uploader
-            uploader = Uploader(db, cfg, cloud_url, cloud_key)
+            uploader = Uploader(db, cfg, cloud_url, cloud_key, enabled=cfg.upload_enabled)
             uploader.start()
+        app.state.uploader = uploader
 
         log.info("server startup complete")
         try:
@@ -535,6 +539,7 @@ def make_app(
         clip_capture_max_mph: float = Form(default=999.0),
         preview_show_grid: bool = Form(default=False),
         pause_at_night: bool = Form(default=False),
+        upload_enabled: bool = Form(default=False),
     ):
         cfg_path = Path("config/config.yaml")
         margin = max(0.0, float(clip_margin_s))
@@ -561,6 +566,7 @@ def make_app(
         clip_section["capture_max_mph"] = cap_max
         data.setdefault("preview", {})["show_grid"] = bool(preview_show_grid)
         data.setdefault("capture", {})["pause_at_night"] = bool(pause_at_night)
+        data.setdefault("upload", {})["enabled"] = bool(upload_enabled)
         with cfg_path.open("w") as f:
             yaml.safe_dump(data, f, sort_keys=False)
         cfg.alert_threshold_mph = float(threshold_mph)
@@ -574,6 +580,7 @@ def make_app(
         cfg.clip_capture_max_mph = cap_max
         cfg.preview_show_grid = bool(preview_show_grid)
         cfg.pause_at_night = bool(pause_at_night)
+        cfg.upload_enabled = bool(upload_enabled)
         # Push the new margin to the running capture worker without a restart.
         worker = getattr(request.app.state, "worker", None)
         if worker is not None:
@@ -582,6 +589,10 @@ def make_app(
         preview = getattr(request.app.state, "preview", None)
         if preview is not None:
             preview.set_show_grid(bool(preview_show_grid))
+        # Flip hub uploading on/off live (no-op if no creds / uploader absent).
+        uploader = getattr(request.app.state, "uploader", None)
+        if uploader is not None:
+            uploader.set_enabled(bool(upload_enabled))
         threshold = float(cfg.alert_threshold_mph)
         archive_dir = Path("recordings_archive")
         # Phase 1: clips_days — archive alarm .mp4 to recordings_archive/,
@@ -1189,6 +1200,7 @@ def _render_index(request: Request, cfg: Config, db: Database):
             "clip_capture_max_mph": cfg.clip_capture_max_mph,
             "preview_show_grid": cfg.preview_show_grid,
             "pause_at_night": cfg.pause_at_night,
+            "upload_enabled": cfg.upload_enabled,
             "running": True,
             "paused_night": _is_paused_night(request, cfg),
             **_load_homography_meta(),
