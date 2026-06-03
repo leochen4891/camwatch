@@ -128,6 +128,13 @@ class RtspStream:
         # between the camera and our decoder; any apparent loss downstream
         # is then in our wrapper code, not the network or codec.
         self._frames_read = 0
+        # Monotonic arrival stamp of every decoded frame, for the rolling
+        # received-frame rate (`received_fps`). The camera's RTP timestamps
+        # are not trustworthy (see pts_timing_investigation.md), so the
+        # cadence-based speed path times passes against this wall-clock rate
+        # instead. Sized to cover >60s at any plausible frame rate.
+        self._arrivals: "deque[float]" = deque(maxlen=2048)
+        self._arrivals_lock = threading.Lock()
         self._log_label = log_label
         self._metrics = metrics
         self._queue_size = int(queue_size)
@@ -144,6 +151,28 @@ class RtspStream:
     @property
     def session_epoch(self) -> int:
         return self._session_epoch
+
+    def received_fps(self, window_s: float = 60.0) -> "float | None":
+        """Rolling received-frame rate over the trailing `window_s` seconds,
+        measured against the local monotonic clock (independent of the
+        camera's unreliable RTP timestamps).
+
+        Returns None during warm-up: fewer than 2 frames in the window, or
+        less than ~30s of coverage. The coverage floor matters: right after a
+        (re)connect the camera flushes a catch-up burst of buffered frames,
+        which inflates a young window by ~5-10% (observed: 14.5 vs the steady
+        13.7 twenty seconds after a restart). 30s dilutes that transient to
+        a few percent; by 60s it has aged out entirely.
+        """
+        now = time.monotonic()
+        with self._arrivals_lock:
+            stamps = [t for t in self._arrivals if t >= now - window_s]
+        if len(stamps) < 2:
+            return None
+        span = stamps[-1] - stamps[0]
+        if span < 30.0:
+            return None
+        return (len(stamps) - 1) / span
 
     def stop(self) -> None:
         self._stop = True
@@ -228,9 +257,15 @@ class RtspStream:
                         for frame in decoded:
                             reader_failures[0] = 0
                             self._frames_read += 1
+                            # Arrival stamp for received_fps(). Recorded for
+                            # every decoded frame regardless of whether the
+                            # metrics collector is attached — the cadence
+                            # speed path depends on this rate.
+                            arrival_mono = time.monotonic()
+                            with self._arrivals_lock:
+                                self._arrivals.append(arrival_mono)
                             if self._metrics is not None:
                                 self._metrics.record_frame(self._log_label)
-                                arrival_mono = time.monotonic()
                                 if last_arrival_mono is not None:
                                     self._metrics.record_frame_gap(
                                         self._log_label,
@@ -413,10 +448,16 @@ class StaticFrameStream:
         self._metrics = metrics
         self._stop = False
         self._session_epoch = 1
+        # Same rolling arrival record as RtspStream so dev mode exercises
+        # the real cadence-speed path (converges to the configured fps).
+        self._arrivals: "deque[float]" = deque(maxlen=2048)
+        self._arrivals_lock = threading.Lock()
 
     @property
     def session_epoch(self) -> int:
         return self._session_epoch
+
+    received_fps = RtspStream.received_fps
 
     def stop(self) -> None:
         self._stop = True
@@ -437,6 +478,8 @@ class StaticFrameStream:
             next_t += self._interval
             seq += 1
             ts = time.monotonic()
+            with self._arrivals_lock:
+                self._arrivals.append(ts)
             if self._metrics is not None:
                 self._metrics.record_frame(self._log_label)
                 if last_arrival_mono is not None:

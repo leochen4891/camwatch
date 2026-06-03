@@ -25,6 +25,7 @@ from camwatch.capture_worker import (
     _MAX_PLAUSIBLE_FPS,
     _MAX_PLAUSIBLE_MPH,
     _MIN_RUNNING_SAMPLES,
+    _cadence_speed,
 )
 from camwatch.homography import MPH_PER_MPS, Homography
 
@@ -125,6 +126,94 @@ def test_magnitude_gate_keeps_plausible_suspicious_pass():
 def test_too_few_samples_is_nan():
     mps = 30.0 / MPH_PER_MPS
     assert math.isnan(_speed(_straight(n=_MIN_RUNNING_SAMPLES - 1, dt=0.05, mps=mps)))
+
+
+# ---------------------------------------------------------------------------
+# Cadence-path tests. `_cadence_speed` is the live headline path: per-frame
+# time is reconstructed from received-frame sequence numbers and the stream's
+# measured received rate; the camera's PTS (first tuple element) is never
+# consulted, because it is untrustworthy (see pts_timing_investigation.md).
+
+
+def _cadence_traj(n, rate, mps, *, seq0=100, epoch=3, scrambled_ts=True):
+    """Trajectory tuples (ts, u, v, bbox, seq, epoch) for a straight crossing
+    at constant speed. Position advances with seq (i.e. with real time); ts is
+    deliberately a constant garbage value by default, mimicking the camera's
+    broken PTS — the cadence path must not care."""
+    out = []
+    for i in range(n):
+        seq = seq0 + i
+        y = mps * (seq - seq0) / rate
+        ts = 999.0 if scrambled_ts else (seq - seq0) / rate
+        out.append((ts, 0.0, y, (0.0, 0.0, 1.0, 1.0), seq, epoch))
+    return out
+
+
+def test_cadence_clean_pass():
+    mps = 30.0 / MPH_PER_MPS
+    mph, n = _cadence_speed(_cadence_traj(12, rate=13.8, mps=mps), 13.8, _homog())
+    assert mph is not None
+    assert abs(mph - 30.0) < 0.5
+    assert n == 12
+
+
+def test_cadence_ignores_scrambled_pts():
+    # Identical positions and seqs, totally different ts values -> same speed.
+    mps = 25.0 / MPH_PER_MPS
+    a, _ = _cadence_speed(
+        _cadence_traj(10, rate=14.0, mps=mps, scrambled_ts=True), 14.0, _homog())
+    b, _ = _cadence_speed(
+        _cadence_traj(10, rate=14.0, mps=mps, scrambled_ts=False), 14.0, _homog())
+    assert a is not None and b is not None
+    assert abs(a - b) < 1e-9
+
+
+def test_cadence_seq_gap_adds_time():
+    # A missed detection (or a frame dropped before YOLO) leaves a seq gap.
+    # The car covered two frame-periods of distance in two frame-periods of
+    # inferred time, so the speed stays true.
+    mps = 30.0 / MPH_PER_MPS
+    traj = _cadence_traj(12, rate=14.0, mps=mps)
+    gapped = traj[:5] + traj[6:]  # drop one mid-pass detection
+    mph, _ = _cadence_speed(gapped, 14.0, _homog())
+    assert mph is not None
+    assert abs(mph - 30.0) < 0.5
+
+
+def test_cadence_epoch_change_returns_none():
+    # A pass spanning an RTSP reconnect has no meaningful seq spacing.
+    mps = 30.0 / MPH_PER_MPS
+    traj = _cadence_traj(12, rate=14.0, mps=mps)
+    t = traj[-1]
+    traj[-1] = (t[0], t[1], t[2], t[3], t[4], t[5] + 1)
+    mph, _ = _cadence_speed(traj, 14.0, _homog())
+    assert mph is None
+
+
+def test_cadence_no_rate_returns_none():
+    # Stream warm-up: received_fps() has <10s of data and returns None.
+    mps = 30.0 / MPH_PER_MPS
+    traj = _cadence_traj(12, rate=14.0, mps=mps)
+    assert _cadence_speed(traj, None, _homog())[0] is None
+    assert _cadence_speed(traj, 0.0, _homog())[0] is None
+
+
+def test_cadence_track_merge_rejected_on_shape_alone():
+    # Arc length far beyond net displacement (a box merge) corrupts the
+    # measured distance, so the speed is unknown even when the resulting
+    # number is plausible — no magnitude gate on the cadence path.
+    mps = 8.0 / MPH_PER_MPS  # slow, so the inflated headline stays under 55
+    traj = _cadence_traj(12, rate=14.0, mps=mps)
+    t = traj[6]
+    traj[6] = (t[0], t[1] + 3.0, t[2], t[3], t[4], t[5])  # 3 m lateral leap
+    mph, _ = _cadence_speed(traj, 14.0, _homog())
+    assert mph is None
+
+
+def test_cadence_too_few_samples_returns_none():
+    mps = 30.0 / MPH_PER_MPS
+    traj = _cadence_traj(_MIN_RUNNING_SAMPLES - 1, rate=14.0, mps=mps)
+    assert _cadence_speed(traj, 14.0, _homog())[0] is None
 
 
 if __name__ == "__main__":

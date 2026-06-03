@@ -135,6 +135,63 @@ _MAX_PLAUSIBLE_FPS = 35.0
 _MAX_ARC_DISPLACEMENT_RATIO = 1.4
 _MAX_EXIT_DESCENT = 0.08
 _MAX_PLAUSIBLE_MPH = 55.0
+# NOTE (2026-06): the live headline path now uses the cadence time base
+# (`_cadence_speed` below), which makes the timing guards (1 and 3) and the
+# speed ceiling unnecessary there — only the spatial-jump guard (2) remains
+# active, rejecting on shape alone since a merged track corrupts the distance
+# itself. The constants above still parameterize `running_avg_speed` as a
+# primitive (tests, legacy data tooling).
+
+
+def _cadence_speed(
+    traj,
+    rate_fps: "float | None",
+    homog,
+    *,
+    min_samples: int = _MIN_RUNNING_SAMPLES,
+    max_arc_displacement_ratio: float = _MAX_ARC_DISPLACEMENT_RATIO,
+) -> "tuple[float | None, int]":
+    """Headline speed from the cadence time base.
+
+    `traj` is a sequence of (ts, u, v, bbox, seq, epoch) trajectory tuples.
+    Per-frame times are reconstructed as t_i = (seq_i - seq_0) / rate_fps —
+    the camera's PTS is never consulted (it is untrustworthy; see
+    pts_timing_investigation.md). Seq gaps from missed detections or dropped
+    frames correctly lengthen the elapsed time.
+
+    Returns (mph, n_samples), with mph None when no trustworthy speed can be
+    produced:
+      - rate_fps is None (stream warm-up) or non-positive
+      - fewer than `min_samples` trajectory points
+      - the pass spans an RTSP reconnect (epoch changed; seq spacing is not
+        meaningful across sessions)
+      - non-increasing seq span
+      - the spatial-jump guard fires (arc length far beyond the net
+        displacement: a track merge corrupted the distance, so the speed is
+        unknown at any magnitude)
+    """
+    n = len(traj)
+    if homog is None or rate_fps is None or rate_fps <= 0 or n < min_samples:
+        return None, n
+    seq0, epoch0 = traj[0][4], traj[0][5]
+    seq_last, epoch_last = traj[-1][4], traj[-1][5]
+    if epoch_last != epoch0 or seq_last <= seq0:
+        return None, n
+    samples = [
+        ((seq - seq0) / rate_fps, u, v)
+        for (_ts, u, v, _bb, seq, _epoch) in traj
+    ]
+    final_mph, _per_frame, n_used = homog.running_avg_speed(
+        samples, min_samples=min_samples,
+        max_plausible_fps=None,          # timing is trustworthy by construction
+        max_arc_displacement_ratio=max_arc_displacement_ratio,
+        max_exit_descent=None,           # timing is trustworthy by construction
+        max_plausible_mph=None,          # reject merged tracks on shape alone
+    )
+    if final_mph != final_mph:  # NaN: guard rejected or degenerate
+        return None, n_used
+    return float(final_mph), n_used
+
 
 # Night-mode (IR) gate. The Reolink E1 switches to monochrome IR illumination
 # in low light; speed measurements from those frames are unreliable because
@@ -296,12 +353,23 @@ class CaptureWorker(threading.Thread):
                 self._homog.max_reproj_err_m * 100,
             )
         # Per-track ground-point trajectory: track_id → deque of
-        # (ts, ground_u, ground_v, (bbox_x1, bbox_y1, bbox_x2, bbox_y2)).
+        # (ts, ground_u, ground_v, (bbox_x1, bbox_y1, bbox_x2, bbox_y2),
+        # frame_seq, stream_epoch). `frame_seq` is the stream's received-frame
+        # sequence number and `stream_epoch` its reconnect epoch — together
+        # with the stream's received_fps() they form the cadence time base
+        # for speed (the camera's per-frame PTS is untrustworthy; see
+        # pts_timing_investigation.md).
         # Bounded per-track memory; whole-dict pruning happens on track GC
         # mirrored to the CrossingDetector's max_age window.
         self._trajectories: dict[
             int,
-            deque[tuple[float, float, float, tuple[float, float, float, float]]],
+            deque[
+                tuple[
+                    float, float, float,
+                    tuple[float, float, float, float],
+                    int, int,
+                ]
+            ],
         ] = {}
         # Per-track hysteresis: once a track has been strictly inside the
         # grid at least once, subsequent samples can drift up to
@@ -341,7 +409,7 @@ class CaptureWorker(threading.Thread):
         recent = list(traj)[-_STATIONARY_WINDOW_FRAMES:]
         Xs: list[float] = []
         Ys: list[float] = []
-        for _ts, u, v, _bb in recent:
+        for _ts, u, v, _bb, _seq, _epoch in recent:
             X, Y = self._homog.project(u, v)
             Xs.append(X)
             Ys.append(Y)
@@ -450,19 +518,34 @@ class CaptureWorker(threading.Thread):
         *,
         pid: int,
         ev,
-        traj: list[tuple[float, float, float, tuple[float, float, float, float]]],
+        traj: list[
+            tuple[
+                float, float, float,
+                tuple[float, float, float, float],
+                int, int,
+            ]
+        ],
         speed_mph: float | None,
         speed_method: str | None = None,
+        rate_fps: float | None = None,
     ) -> None:
         """Write per-frame trajectory to events/pass_<pid>.jsonl.
 
         Format:
           line 0: manifest dict with pass-level metadata
-          line 1+: one dict per frame, with PTS-anchored timestamp, ground
+          line 1+: one dict per frame, with PTS-anchored timestamp (raw,
+                   diagnostic — the camera's PTS is untrustworthy), ground
                    pixel, bbox, homography-projected (X, Y), instantaneous
-                   speed (consecutive-frame diff — diagnostic), and the
-                   running average since the first sample (the canonical
-                   per-frame speed; final value matches the headline).
+                   speed, and the running average since the first sample
+                   (the canonical per-frame speed; final value matches the
+                   headline).
+
+        When `rate_fps` is given (cadence path), per-frame times for
+        t_rel / v_inst / v_running are reconstructed from the received-frame
+        sequence numbers: t_i = (seq_i - seq_0) / rate_fps. The raw PTS `ts`
+        is still written per row for diagnostics, and clip_start_ts /
+        clip_end_ts stay PTS-anchored — the recorder ring and the browser's
+        video.currentTime mapping are indexed by PTS.
         """
         if self._homog is None or not traj:
             return
@@ -470,44 +553,62 @@ class CaptureWorker(threading.Thread):
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"pass_{pid}.jsonl"
 
-        projected: list[tuple[float, float, float, tuple, float, float]] = []
-        for ts, u, v, bb in traj:
+        projected: list[
+            tuple[float, float, float, tuple, float, float, int, int]
+        ] = []
+        for ts, u, v, bb, seq, epoch in traj:
             X, Y = self._homog.project(u, v)
-            projected.append((float(ts), float(u), float(v), bb, float(X), float(Y)))
+            projected.append(
+                (float(ts), float(u), float(v), bb, float(X), float(Y),
+                 int(seq), int(epoch))
+            )
+
+        seq0 = projected[0][6]
+        epoch_span = projected[-1][7] - projected[0][7]
+        use_cadence = rate_fps is not None and rate_fps > 0 and epoch_span == 0
+
+        def t_of(idx: int) -> float:
+            """Per-frame time: cadence-reconstructed when available, else
+            the raw (unreliable) PTS."""
+            if use_cadence:
+                return (projected[idx][6] - seq0) / rate_fps
+            return projected[idx][0]
 
         rows: list[dict] = []
-        t0 = projected[0][0]
+        t0 = t_of(0)
         cum_dist = 0.0
-        for i, (ts, u, v, bb, X, Y) in enumerate(projected):
+        for i, (ts, u, v, bb, X, Y, seq, _epoch) in enumerate(projected):
             in_grid = _in_grid(X, Y)
+            t_i = t_of(i)
             v_inst_mph: float | None = None
             v_running_mph: float | None = None
             if i > 0:
-                ts_p, _, _, _, X_p, Y_p = projected[i - 1]
-                dt_step = ts - ts_p
+                _, _, _, _, X_p, Y_p, _, _ = projected[i - 1]
+                dt_step = t_i - t_of(i - 1)
                 d_step = ((X - X_p) ** 2 + (Y - Y_p) ** 2) ** 0.5
                 cum_dist += d_step
-                # v_inst: only when both this and prior frame are in-grid
-                # (preserves the existing per-frame diagnostic; gets noisy
-                # spikes when PTS bursts cluster frames in time).
+                # v_inst: only when both this and prior frame are in-grid.
+                # On the cadence time base a seq gap (missed detection or
+                # dropped frame) correctly lengthens dt_step.
                 if in_grid and _in_grid(X_p, Y_p) and dt_step > 0:
                     v_inst_mph = (d_step / dt_step) * _MPH_PER_MPS
                 # v_running: cumulative distance / cumulative time. Starts
-                # at min-samples and is the canonical speed signal — robust
-                # to PTS-burst stutter that breaks v_inst.
-                cum_dt = ts - t0
+                # at min-samples and is the canonical speed signal; final
+                # value matches the headline on the cadence path.
+                cum_dt = t_i - t0
                 if (i + 1) >= _MIN_RUNNING_SAMPLES and cum_dt > 0:
                     v_running_mph = (cum_dist / cum_dt) * _MPH_PER_MPS
             rows.append({
                 "frame": i,
                 "ts": ts,
-                "t_rel": ts - t0,
+                "t_rel": t_i - t0,
                 "u": u,
                 "v": v,
                 "bbox": list(bb),
                 "X": X,
                 "Y": Y,
                 "in_grid": in_grid,
+                "seq": seq,
                 "v_inst_mph": v_inst_mph,
                 "v_running_mph": v_running_mph,
             })
@@ -539,7 +640,12 @@ class CaptureWorker(threading.Thread):
             # (and thus the whole chart) for every rejected pass.
             "v_homog_mph": speed_mph,
             "speed_mph": speed_mph,
-            "speed_method": speed_method,  # 'running_avg' | None
+            "speed_method": speed_method,  # 'cadence_seq' | 'running_avg' | None
+            # Cadence time-base diagnostics (None / 0 on the legacy path).
+            "rate_fps": rate_fps,
+            "seq_first": seq0,
+            "seq_last": projected[-1][6],
+            "epoch_span": epoch_span,
             "n_frames": len(rows),
             "frame_size": list(self._homog.frame_size),
         }
@@ -808,7 +914,9 @@ class CaptureWorker(threading.Thread):
                             self._entered_strict[tid] = True
                         traj = self._trajectories.setdefault(tid, deque(maxlen=200))
                         bb = tuple(float(x) for x in tr.bbox)
-                        traj.append((fr.ts, float(gx), float(gy), bb))
+                        traj.append(
+                            (fr.ts, float(gx), float(gy), bb, fr.seq, fr.epoch)
+                        )
 
                 # Stationary-track gate at the trajectory layer. When a track
                 # has been sitting still for _STATIONARY_WINDOW_FRAMES samples
@@ -870,28 +978,28 @@ class CaptureWorker(threading.Thread):
                     stamp = captured_at.strftime("%Y%m%dT%H%M%S")
                     clip_name = f"cal_{stamp}_id{ev.track_id}_{ev.direction}.mp4"
 
-                    # Reported speed: running average from grid entry —
-                    # `mph = cumulative_arc_length / (t_current - t_entry)`,
-                    # evaluated at grid exit. Robust to PTS-burst stutter:
-                    # bunched timestamps within the trajectory don't shift
-                    # the totals, only individual v_inst readings.
+                    # Reported speed: cadence time base — total projected
+                    # distance over (received-frame count / live received
+                    # rate). The camera's per-frame PTS is untrustworthy
+                    # (see pts_timing_investigation.md); the received-frame
+                    # cadence against the local clock is. Seq gaps from
+                    # missed detections or dropped frames correctly add
+                    # elapsed time. Validated at 3-6% error against
+                    # camera-native ground truth.
                     speed_mph: float | None = None
                     speed_method: str | None = None
                     n_speed_samples = 0
+                    rate_fps = (
+                        self._stream.received_fps()
+                        if self._stream is not None else None
+                    )
+                    traj_for_speed = list(self._trajectories.get(ev.track_id, ()))
                     if self._homog is not None:
-                        traj_for_speed = list(self._trajectories.get(ev.track_id, ()))
-                        speed_samples = [(t, u, v) for (t, u, v, _bb) in traj_for_speed]
-                        final_mph, _per_frame, n = self._homog.running_avg_speed(
-                            speed_samples, min_samples=_MIN_RUNNING_SAMPLES,
-                            max_plausible_fps=_MAX_PLAUSIBLE_FPS,
-                            max_arc_displacement_ratio=_MAX_ARC_DISPLACEMENT_RATIO,
-                            max_exit_descent=_MAX_EXIT_DESCENT,
-                            max_plausible_mph=_MAX_PLAUSIBLE_MPH,
+                        speed_mph, n_speed_samples = _cadence_speed(
+                            traj_for_speed, rate_fps, self._homog,
                         )
-                        if final_mph == final_mph:  # not NaN
-                            speed_mph = float(final_mph)
-                            speed_method = "running_avg"
-                            n_speed_samples = n
+                        if speed_mph is not None:
+                            speed_method = "cadence_seq"
                     # Gate VIDEO recording on the configured capture-speed range.
                     # Thumbnails are always written so the list shows a preview
                     # for every pass. If speed is unknown (no calibration), we
@@ -926,7 +1034,7 @@ class CaptureWorker(threading.Thread):
                         if traj:
                             samples_xy = [
                                 (ts, self._homog.project(u, v)[1])
-                                for ts, u, v, _bb in traj
+                                for ts, u, v, _bb, _seq, _epoch in traj
                             ]
                             y_min = min(y for _, y in samples_xy)
                             y_max = max(y for _, y in samples_xy)
@@ -986,12 +1094,14 @@ class CaptureWorker(threading.Thread):
                     if speed_mph is not None:
                         speed_str = (
                             f"{speed_mph:.2f} mph "
-                            f"(running_avg over {n_speed_samples} samples)"
+                            f"(cadence_seq over {n_speed_samples} samples"
+                            f" @ {rate_fps:.2f} fps)"
                         )
                     else:
                         speed_str = (
-                            "speed unavailable (too few samples, or trajectory "
-                            "rejected as timing-compressed / spatially jumped)"
+                            "speed unavailable (too few samples, stream "
+                            "warm-up/reconnect, or trajectory rejected as "
+                            "spatially jumped)"
                         )
                     log.info(
                         "pass id=%d track=%d %s %s %s  elapsed=%.3fs  clip=%s",
@@ -1000,15 +1110,16 @@ class CaptureWorker(threading.Thread):
                     )
                     # Persist the full per-frame trajectory + computed v_inst
                     # to events/pass_<pid>.jsonl so the chart and any future
-                    # offline analysis has real-PTS-anchored timing. Also
-                    # records the canonical speed_mph in the manifest.
+                    # offline analysis has cadence-anchored timing (raw PTS is
+                    # also kept per row, for diagnostics). Also records the
+                    # canonical speed_mph in the manifest.
                     if self._homog is not None:
-                        traj = list(self._trajectories.get(ev.track_id, ()))
                         try:
                             self._save_pass_trajectory_jsonl(
-                                pid=pid, ev=ev, traj=traj,
+                                pid=pid, ev=ev, traj=traj_for_speed,
                                 speed_mph=speed_mph,
                                 speed_method=speed_method,
+                                rate_fps=rate_fps,
                             )
                         except Exception as e:  # noqa: BLE001
                             log.warning(
