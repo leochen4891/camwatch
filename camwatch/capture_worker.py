@@ -533,8 +533,11 @@ class CaptureWorker(threading.Thread):
             "clip_pre_roll_s": clip_pre_roll_s,
             "clip_post_roll_s": clip_post_roll_s,
             # v_homog_mph is kept for compatibility with the existing JS chart
-            # legend that reads from manifest. Same canonical speed.
-            "v_homog_mph": speed_mph if speed_mph is not None else float("nan"),
+            # legend that reads from manifest. Same canonical speed. Stays None
+            # (-> JSON null) when a guard rejected the speed; never NaN, which
+            # would emit the bare `NaN` token and break the browser JSON parse
+            # (and thus the whole chart) for every rejected pass.
+            "v_homog_mph": speed_mph,
             "speed_mph": speed_mph,
             "speed_method": speed_method,  # 'running_avg' | None
             "n_frames": len(rows),
