@@ -122,10 +122,19 @@ _MIN_RUNNING_SAMPLES = 5
 #      ~0.08 s interval, so a consistently-descending exit is a timing artifact.
 #      (The pre-2026-05 2-line speed method was immune to this; the trajectory
 #      running-average integrates from acquisition, so it is not.)
+# The three checks above flag suspicious *shape*, but on their own they also
+# fire on plausible passes (a brief acquisition burst leaves a 25 mph headline
+# mildly non-converged; a slow curb-side wobble doubles back). A corrupted
+# shape only yields a *wrong* number when the result is also implausibly fast,
+# so the speed ceiling gates them: a suspicious pass is rejected only when its
+# headline exceeds it. Residential traffic here runs ~10-40 mph; 55 sits above
+# any real speeder but below the phantom over-speeds (67-100 mph) the bursts
+# produce, and a clean reading above 55 (no suspicious shape) is kept.
 # A tripped guard yields speed "unknown" (NULL) rather than a fabricated number.
 _MAX_PLAUSIBLE_FPS = 35.0
 _MAX_ARC_DISPLACEMENT_RATIO = 1.4
 _MAX_EXIT_DESCENT = 0.08
+_MAX_PLAUSIBLE_MPH = 55.0
 
 # Night-mode (IR) gate. The Reolink E1 switches to monochrome IR illumination
 # in low light; speed measurements from those frames are unreliable because
@@ -874,6 +883,7 @@ class CaptureWorker(threading.Thread):
                             max_plausible_fps=_MAX_PLAUSIBLE_FPS,
                             max_arc_displacement_ratio=_MAX_ARC_DISPLACEMENT_RATIO,
                             max_exit_descent=_MAX_EXIT_DESCENT,
+                            max_plausible_mph=_MAX_PLAUSIBLE_MPH,
                         )
                         if final_mph == final_mph:  # not NaN
                             speed_mph = float(final_mph)

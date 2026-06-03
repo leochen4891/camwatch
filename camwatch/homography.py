@@ -123,6 +123,7 @@ class Homography:
         max_plausible_fps: float | None = None,
         max_arc_displacement_ratio: float | None = None,
         max_exit_descent: float | None = None,
+        max_plausible_mph: float | None = None,
     ) -> tuple[float, list[float], int]:
         """Cumulative-distance / cumulative-time speed from the first sample.
 
@@ -161,6 +162,15 @@ class Homography:
           headline is a timing artifact. Rejected only when the tail is
           consistently descending (guards against a single noisy final frame).
 
+        `max_plausible_mph` gates all three checks: a suspicious-shape pass is
+        rejected only when its headline also exceeds this ceiling. Most
+        acquisition bursts and track wobbles leave a *plausible* speed (the
+        residential traffic here runs well under it) and are kept; only a
+        reading that is both suspicious and implausibly fast — a phantom
+        over-speed — is discarded. A clean high reading (a real speeder, no
+        suspicious shape) is never rejected. When None, the checks reject on
+        suspicious shape alone.
+
         Returns:
             (final_mph, per_frame_running, n_samples).
             `final_mph` is NaN if fewer than `min_samples` samples, the
@@ -194,15 +204,27 @@ class Homography:
         span = projected[-1][0] - t0
         if span <= 0:
             return float("nan"), per_frame, n
+
+        # The three checks below detect *suspicious shape* (corrupted timing or
+        # a track jump). On their own they also fire on plenty of plausible
+        # passes — e.g. a brief acquisition burst leaves a 25 mph headline
+        # mildly non-converged. A high frame rate or a doubled-back path only
+        # produces a *wrong* speed when the result is also implausibly high, so
+        # `max_plausible_mph` gates them: a suspicious pass is rejected only
+        # when its headline exceeds the ceiling. A clean high reading (real
+        # speeder) is kept; a plausible reading is kept even if its shape is
+        # suspicious. When `max_plausible_mph` is None the checks reject on
+        # suspicion alone (legacy behavior).
+        suspicious = False
         if max_plausible_fps is not None and (n - 1) / span > max_plausible_fps:
-            return float("nan"), per_frame, n
+            suspicious = True
         if max_arc_displacement_ratio is not None:
             net = (
                 (projected[-1][1] - projected[0][1]) ** 2
                 + (projected[-1][2] - projected[0][2]) ** 2
             ) ** 0.5
             if net > 0 and cum_dist / net > max_arc_displacement_ratio:
-                return float("nan"), per_frame, n
+                suspicious = True
         if max_exit_descent is not None:
             vr = [v for v in per_frame if v == v]  # drop NaNs
             # Need a settled tail to distinguish "still paying off an early
@@ -214,6 +236,10 @@ class Homography:
                 and vr[-3] > vr[-2] > vr[-1]
                 and (vr[-2] - vr[-1]) / vr[-1] > max_exit_descent
             ):
-                return float("nan"), per_frame, n
+                suspicious = True
+        if suspicious and (
+            max_plausible_mph is None or last_valid > max_plausible_mph
+        ):
+            return float("nan"), per_frame, n
         return last_valid, per_frame, n
 

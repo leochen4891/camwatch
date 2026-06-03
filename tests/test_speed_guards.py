@@ -23,6 +23,7 @@ from camwatch.capture_worker import (
     _MAX_ARC_DISPLACEMENT_RATIO,
     _MAX_EXIT_DESCENT,
     _MAX_PLAUSIBLE_FPS,
+    _MAX_PLAUSIBLE_MPH,
     _MIN_RUNNING_SAMPLES,
 )
 from camwatch.homography import MPH_PER_MPS, Homography
@@ -42,6 +43,7 @@ def _speed(samples, **overrides):
         max_plausible_fps=_MAX_PLAUSIBLE_FPS,
         max_arc_displacement_ratio=_MAX_ARC_DISPLACEMENT_RATIO,
         max_exit_descent=_MAX_EXIT_DESCENT,
+        max_plausible_mph=_MAX_PLAUSIBLE_MPH,
     )
     kwargs.update(overrides)
     final, _per_frame, _n = _homog().running_avg_speed(samples, **kwargs)
@@ -62,9 +64,12 @@ def test_clean_crossing_reports_true_speed():
 
 
 def test_timing_compressed_is_rejected():
-    # Same straight path but at 100 fps (bunched PTS) — denominator collapsed.
-    mps = 30.0 / MPH_PER_MPS
-    samples = _straight(n=10, dt=0.01, mps=mps)
+    # A 30 mph crossing whose timestamps are compressed 6x (real dt 0.06 s
+    # recorded as 0.01 s): the distance is real but the span collapses, so the
+    # headline inflates to ~180 mph — both suspicious (≈900 fps) and over the
+    # ceiling, so it is rejected.
+    real_mps = 30.0 / MPH_PER_MPS
+    samples = [(i * 0.01, 0.0, i * real_mps * 0.06) for i in range(10)]
     assert (len(samples) - 1) / (samples[-1][0] - samples[0][0]) > _MAX_PLAUSIBLE_FPS
     assert math.isnan(_speed(samples))
 
@@ -103,8 +108,18 @@ def test_partial_burst_not_converged_is_rejected():
     fps = (len(samples) - 1) / (samples[-1][0] - samples[0][0])
     assert fps < _MAX_PLAUSIBLE_FPS
     assert not math.isnan(_speed(samples, max_exit_descent=None))  # only guard C rejects
-    # ...the convergence guard is.
+    # ...the convergence guard is (the headline ~87 mph is over the ceiling).
     assert math.isnan(_speed(samples))
+
+
+def test_magnitude_gate_keeps_plausible_suspicious_pass():
+    # The same suspicious-shape burst is KEPT when its headline is below the
+    # ceiling: raising the ceiling above the ~87 mph headline means the
+    # convergence flag no longer rejects it. A suspicious shape alone is not
+    # enough — the speed must also be implausibly high.
+    samples = _early_burst()
+    assert math.isnan(_speed(samples, max_plausible_mph=55.0))
+    assert not math.isnan(_speed(samples, max_plausible_mph=200.0))
 
 
 def test_too_few_samples_is_nan():

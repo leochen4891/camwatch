@@ -729,29 +729,40 @@
     const SPEED_MAX_PLAUSIBLE_FPS = 35.0;      // matches capture_worker._MAX_PLAUSIBLE_FPS
     const SPEED_MAX_ARC_DISP_RATIO = 1.4;      // matches capture_worker._MAX_ARC_DISPLACEMENT_RATIO
     const SPEED_MAX_EXIT_DESCENT = 0.08;       // matches capture_worker._MAX_EXIT_DESCENT
+    const SPEED_MAX_PLAUSIBLE_MPH = 55.0;      // matches capture_worker._MAX_PLAUSIBLE_MPH
     const SPEED_MIN_RUNNING_SAMPLES = 5;
 
     // Re-derive whether the headline speed is trustworthy from the trajectory,
     // applying the same guards the capture worker uses (timing compression,
-    // spatial jump, and a partial early burst that leaves the running average
-    // still descending at grid exit). Returns {reliable, reason}.
+    // spatial jump, partial early burst). These detect suspicious shape; a
+    // shape problem only yields a *wrong* number when the headline is also
+    // implausibly fast, so a suspicious pass is flagged unreliable only when
+    // it exceeds the speed ceiling — plausible passes are kept either way.
+    // Returns {reliable, reason}.
     function speedReliability(samples) {
       const pts = samples.filter(s => s.X != null && s.Y != null && s.ts != null);
       const n = pts.length;
       if (n < SPEED_MIN_RUNNING_SAMPLES) return { reliable: false, reason: "few samples" };
       const span = pts[n - 1].ts - pts[0].ts;
       if (span <= 0) return { reliable: false, reason: "bad timing" };
-      if ((n - 1) / span > SPEED_MAX_PLAUSIBLE_FPS) return { reliable: false, reason: "timing compressed" };
-      let arc = 0;
-      for (let i = 1; i < n; i++) arc += Math.hypot(pts[i].X - pts[i - 1].X, pts[i].Y - pts[i - 1].Y);
-      const net = Math.hypot(pts[n - 1].X - pts[0].X, pts[n - 1].Y - pts[0].Y);
-      if (net > 0 && arc / net > SPEED_MAX_ARC_DISP_RATIO) return { reliable: false, reason: "track jump" };
       const vr = samples.map(s => s.v_running_mph).filter(v => v != null && isFinite(v));
-      if (vr.length >= 5 && vr[vr.length - 1] > 0
-          && vr[vr.length - 3] > vr[vr.length - 2] && vr[vr.length - 2] > vr[vr.length - 1]
-          && (vr[vr.length - 2] - vr[vr.length - 1]) / vr[vr.length - 1] > SPEED_MAX_EXIT_DESCENT) {
-        return { reliable: false, reason: "timing burst (not converged)" };
+      const headline = vr.length ? vr[vr.length - 1] : 0;
+      let reason = "";
+      if ((n - 1) / span > SPEED_MAX_PLAUSIBLE_FPS) {
+        reason = "timing compressed";
+      } else {
+        let arc = 0;
+        for (let i = 1; i < n; i++) arc += Math.hypot(pts[i].X - pts[i - 1].X, pts[i].Y - pts[i - 1].Y);
+        const net = Math.hypot(pts[n - 1].X - pts[0].X, pts[n - 1].Y - pts[0].Y);
+        if (net > 0 && arc / net > SPEED_MAX_ARC_DISP_RATIO) {
+          reason = "track jump";
+        } else if (vr.length >= 5 && vr[vr.length - 1] > 0
+            && vr[vr.length - 3] > vr[vr.length - 2] && vr[vr.length - 2] > vr[vr.length - 1]
+            && (vr[vr.length - 2] - vr[vr.length - 1]) / vr[vr.length - 1] > SPEED_MAX_EXIT_DESCENT) {
+          reason = "timing burst (not converged)";
+        }
       }
+      if (reason && headline > SPEED_MAX_PLAUSIBLE_MPH) return { reliable: false, reason };
       return { reliable: true, reason: "" };
     }
 
