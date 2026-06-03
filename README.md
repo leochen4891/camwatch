@@ -46,7 +46,9 @@ running avg (cumulative distance ÷ cumulative time) → speed
 passes table + clip + HD thumbnail
 ```
 
-For each car: detect, track, project bbox bottom-center through the homography matrix `H` to get `(X, Y)` meters on the road. A "pass" is a track entering the calibrated grid and later exiting it. Reported speed is a running average — at each frame `i`, the cumulative arc length along the projected trajectory divided by the elapsed time since the first sample. The final value is the headline. This is robust to PTS-burst stutter: a brief cluster of frames sharing nearly identical timestamps doesn't perturb the totals, and once timestamps recover the running average returns to the true speed. See [the camwatch-4 post](https://leidevs.com/blog/camwatch-4/) for the reasoning behind switching from trajectory regression.
+For each car: detect, track, project bbox bottom-center through the homography matrix `H` to get `(X, Y)` meters on the road. A "pass" is a track entering the calibrated grid and later exiting it. Reported speed is a running average — at each frame `i`, the cumulative arc length along the projected trajectory divided by the elapsed time since the first sample. The final value is the headline. See [the camwatch-4 post](https://leidevs.com/blog/camwatch-4/) for the reasoning behind switching from trajectory regression.
+
+> **Update (June 2026): the timing source is being revised.** A timing investigation found per-frame PTS on the CX-series cameras (CX410W, CX810) to be unreliable, fabricated in both directions by a camera RTP-packetizer firmware flaw, so dividing by PTS-derived elapsed time distorts the headline speed rather than being absorbed by the running average as previously assumed. Speed is moving to a two-layer scheme: a live geometry-times-measured-cadence estimate, plus an offline correction from the camera's clean FTP recordings. The architecture and decision record are the single source of truth in the **`camwatch-system`** repo (ADR-010, ADR-011); the full evidence is in [`pts_timing_investigation.md`](./pts_timing_investigation.md).
 
 The web UI lets you browse passes and play the clip with the calibrated grid burned into the frames at write time, so the overlay travels with the file when you download it.
 
@@ -185,6 +187,8 @@ camwatch/
 ```
 
 Three things make the speed measurement work:
+
+> **Update (June 2026):** the PTS-timing assumptions in the second and third points below no longer hold for the CX-series cameras, where per-frame PTS is unreliable. See the speed-method update earlier in this README, and `camwatch-system` ADR-010/011 (with [`pts_timing_investigation.md`](./pts_timing_investigation.md) for the evidence).
 
 - **Homography** maps pixels to metric road coordinates exactly (the road is a flat plane). Once you're in meters, perspective and lane choice stop mattering for speed.
 - **PTS-anchored timestamps**, not wall-clock. RTSP buffers in bursts; the H.264 stream's PTS is the camera's ground truth for when a frame was captured. This was the bug that made the original speeds 3× too high before being found.
