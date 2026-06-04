@@ -666,13 +666,19 @@ def make_app(
                     "retention: %d alarm thumbs archived, %d non-alarm deleted on settings save",
                     archived, deleted,
                 )
-        # Performance metrics are retained for 7 days. Hardcoded cap rather
-        # than a user knob: the panel only ever offers a 24h window, and 7d
-        # of 5s buckets is ~120k rows — small enough to keep, big enough to
-        # never need exposing as a setting.
-        purged_metrics = db.purge_metrics_older_than(7)
-        if purged_metrics:
-            log.info("retention: purged %d metric rows older than 7 days", purged_metrics)
+        # Performance metrics share the pass-record retention. They are the
+        # forensic record of the processing rate at capture time, which is
+        # what bounds how far back a pass's speed can be recomputed (see
+        # pts_timing_investigation.md) — a pass without its era's metrics is
+        # unfixable. Storage is cheap (~17k rows per metric per day).
+        # passes_days == 0 means keep passes forever, so keep metrics too.
+        if cfg.passes_days > 0:
+            purged_metrics = db.purge_metrics_older_than(cfg.passes_days)
+            if purged_metrics:
+                log.info(
+                    "retention: purged %d metric rows older than %d days",
+                    purged_metrics, cfg.passes_days,
+                )
         if cfg.passes_days > 0:
             n, items = db.purge_older_than(cfg.passes_days)
             for pid, cp in items:
