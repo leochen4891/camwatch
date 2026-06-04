@@ -38,6 +38,11 @@ class ModelConfig:
     conf: float
     iou: float
     classes: list[int]
+    # Optional per-class confidence minimums keyed by COCO class name
+    # (e.g. {"motorcycle": 0.6}). Detections of a listed class below its
+    # threshold are dropped. Values at or below `conf` have no effect:
+    # YOLO already filters everything below `conf` at inference.
+    conf_per_class: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -185,6 +190,10 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
             conf=float(mdl["conf"]),
             iou=float(mdl["iou"]),
             classes=list(mdl["classes"]),
+            conf_per_class={
+                str(k): float(v)
+                for k, v in (mdl.get("conf_per_class") or {}).items()
+            },
         ),
         alert_threshold_mph=float(raw["alert"]["threshold_mph"]),
         enrich_offset_mph=float(raw["alert"].get("enrich_offset_mph", 5.0)),
