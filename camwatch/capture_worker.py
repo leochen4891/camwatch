@@ -542,6 +542,7 @@ class CaptureWorker(threading.Thread):
             conf=self._cfg.model.conf,
             iou=self._cfg.model.iou,
             roi=cal.roi,
+            conf_per_class=self._cfg.model.conf_per_class,
         )
         recorder = ClipRecorder(
             self._recordings_dir,
