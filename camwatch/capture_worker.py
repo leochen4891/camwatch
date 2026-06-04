@@ -937,7 +937,7 @@ class CaptureWorker(threading.Thread):
                         crossing.reset_in_grid_entry(tid)
 
                 t0 = time.perf_counter() if prof else 0.0
-                recorder.push(fr.image, fr.ts, tracks)
+                recorder.push(fr.image, fr.ts, tracks, seq=fr.seq)
                 if prof:
                     prof.record("recorder_push", time.perf_counter() - t0)
 
@@ -1066,6 +1066,7 @@ class CaptureWorker(threading.Thread):
                         record_video=in_range,
                         entry_anchor_ts=entry_anchor_ts,
                         exit_anchor_ts=exit_anchor_ts,
+                        rate_fps=rate_fps,
                     )
                     # We always set clip_path (the .mp4 base name) so the
                     # thumbnail can be located by stripping ".mp4" → ".jpg".
