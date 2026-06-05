@@ -37,6 +37,12 @@ class _FrameRec:
     image: np.ndarray
     ts: float
     detections: list[Any]  # objects exposing .track_id, .bbox, .ground_point
+    # Received-frame sequence number from the stream. With the pass's
+    # received rate this is the cadence time base for the burned-in d/t/V
+    # overlay — the camera's PTS (`ts`) is untrustworthy for intervals (see
+    # pts_timing_investigation.md); ts remains the index for ring eviction
+    # and clip windowing, which only need ordering, not interval accuracy.
+    seq: int = 0
 
 
 @dataclass
@@ -56,6 +62,11 @@ class _ActiveClip:
     # at the south crossing). t_a/t_b are still the speed/midpoint references.
     entry_anchor_ts: float | None = None
     exit_anchor_ts: float | None = None
+    # The pass's measured received-frame rate (stream.received_fps() at
+    # trigger time). Drives the overlay's cadence time base and the encoded
+    # clip's playback fps. None during stream warm-up: the overlay then
+    # falls back to PTS dt and playback fps to the PTS span.
+    rate_fps: float | None = None
 
 
 _GRAY = (180, 180, 180)
@@ -126,12 +137,15 @@ class ClipRecorder:
         self._ring: collections.deque[_FrameRec] = collections.deque()
         self._active: list[_ActiveClip] = []
 
-    def push(self, frame: np.ndarray, ts: float, detections: list[Any]) -> None:
+    def push(
+        self, frame: np.ndarray, ts: float, detections: list[Any],
+        seq: int = 0,
+    ) -> None:
         small = self._scale_frame(frame)
         if not self._grid_built and self._homog is not None and self._size is not None:
             self._build_grid_polylines()
             self._grid_built = True
-        rec = _FrameRec(image=small, ts=ts, detections=list(detections))
+        rec = _FrameRec(image=small, ts=ts, detections=list(detections), seq=seq)
         self._ring.append(rec)
         # Time-based eviction: drop frames older than ring_seconds before the
         # newest pushed frame. This is robust to varying capture fps (a frame-
@@ -165,6 +179,7 @@ class ClipRecorder:
         on_finalize: Callable[[], None] | None = None,
         entry_anchor_ts: float | None = None,
         exit_anchor_ts: float | None = None,
+        rate_fps: float | None = None,
     ) -> str:
         if self._size is None:
             raise RuntimeError("trigger() called before any frames were pushed")
@@ -200,6 +215,7 @@ class ClipRecorder:
             on_finalize=on_finalize,
             entry_anchor_ts=entry_anchor_ts,
             exit_anchor_ts=exit_anchor_ts,
+            rate_fps=rate_fps,
         )
         self._active.append(clip)
         return path
@@ -258,10 +274,24 @@ class ClipRecorder:
         ymax = self._grid_y_max + self._grid_tol
         cum_dist = 0.0
         first_in_grid_ts: float | None = None
+        first_in_grid_seq: int | None = None
         prev_xy: tuple[float, float] | None = None
         in_grid_count = 0
         entered_strict = False
         s = self._scale
+        # Cadence time base: elapsed = (seq - entry_seq) / rate. Mirrors the
+        # headline-speed math, so the final in-grid frame's V matches the
+        # stored speed_mph. Falls back to PTS dt when the rate was
+        # unavailable at trigger time (stream warm-up).
+        rate = clip.rate_fps if (clip.rate_fps or 0) > 0 else None
+
+        def elapsed(r: _FrameRec) -> float:
+            if first_in_grid_seq is None:
+                return 0.0
+            if rate is not None:
+                return (r.seq - first_in_grid_seq) / rate
+            return r.ts - first_in_grid_ts
+
         for i, rec in enumerate(clip.frames):
             focus = None
             for d in rec.detections:
@@ -285,11 +315,12 @@ class ClipRecorder:
             else:
                 in_grid = tol_in
             ground_px = (int(round(gx_full * s)), int(round(gy_full * s)))
-            cum_dt = (rec.ts - first_in_grid_ts) if first_in_grid_ts is not None else 0.0
+            cum_dt = elapsed(rec)
             running_mph: float | None = None
             if in_grid:
                 if first_in_grid_ts is None:
                     first_in_grid_ts = rec.ts
+                    first_in_grid_seq = rec.seq
                     cum_dt = 0.0
                 elif prev_xy is not None:
                     dx = X - prev_xy[0]
@@ -297,7 +328,7 @@ class ClipRecorder:
                     cum_dist += (dx * dx + dy * dy) ** 0.5
                 prev_xy = (X, Y)
                 in_grid_count += 1
-                cum_dt = rec.ts - first_in_grid_ts
+                cum_dt = elapsed(rec)
                 if in_grid_count >= self._min_running and cum_dt > 0:
                     running_mph = (cum_dist / cum_dt) * _MPH_PER_MPS
             states[i] = {
@@ -308,6 +339,10 @@ class ClipRecorder:
                 "cum_dist_m": cum_dist,
                 "cum_dt_s": cum_dt,
                 "running_mph": running_mph,
+                "grid_seq_delta": (
+                    rec.seq - first_in_grid_seq
+                    if first_in_grid_seq is not None else None
+                ),
             }
         return states
 
@@ -373,9 +408,13 @@ class ClipRecorder:
         """
         if not clip.frames or self._size is None:
             return
-        # Encode fps = (N-1) / (last_ts - first_ts) so playback matches real
-        # capture time regardless of the configured camera rate.
-        if len(clip.frames) >= 2:
+        # Encode fps = the pass's measured received rate, so playback runs at
+        # true real-time speed. Fall back to the PTS span only when the rate
+        # was unavailable (stream warm-up) — the PTS span is approximately
+        # right over a multi-second clip even though per-frame PTS is not.
+        if (clip.rate_fps or 0) > 0:
+            fps = max(1, int(round(clip.rate_fps)))
+        elif len(clip.frames) >= 2:
             span = clip.frames[-1].ts - clip.frames[0].ts
             fps = int(round((len(clip.frames) - 1) / span)) if span > 0 else int(round(self._fps))
             fps = max(1, fps)
@@ -716,13 +755,22 @@ class ClipRecorder:
             else:
                 _stamp(img, line1, (lx, ly), _WHITE, scale=scale, thickness=thickness, bg=True)
 
-        # Single header line: per-frame PTS timestamp. The camera's burned-
-        # in wallclock OSD already lives at the bottom of the frame; the PTS
-        # gives us a stream-anchored monotonic clock that drift-calibration
-        # and offline analysis can key off of.
+        # Single header line: the cadence time base used for speed — the
+        # received-frame sequence number, frames since grid entry, and the
+        # pass's measured received rate. Reading two frames' seq values off
+        # the video gives the exact elapsed time: (seq2 - seq1) / R. The
+        # camera's PTS is untrustworthy for intervals and is no longer
+        # burned in (the raw ts remains in the per-pass jsonl, and the
+        # camera's own wallclock OSD stays at the top of the frame).
+        hdr = [f"seq={rec.seq}"]
+        k = states[i].get("grid_seq_delta") if states[i] else None
+        if k is not None:
+            hdr.append(f"grid+{k}")
+        if clip.rate_fps:
+            hdr.append(f"R={clip.rate_fps:.2f}fps")
         _stamp(
             img,
-            f"PTS time = {rec.ts:.3f}s",
+            "  ".join(hdr),
             (30, 60),
             _WHITE,
             scale=1.2,

@@ -107,6 +107,18 @@
       </section>
 
       <section class="settings-section">
+        <h3>Hub upload</h3>
+        <p class="muted-text">Upload finalized passes to the camwatch-web hub. Turn off while recalibrating or experimenting so provisional passes don't reach the hub; turn back on to resume (queued passes upload on the next poll). Requires hub credentials to be configured.</p>
+        <div class="setting-row">
+          <label class="checkbox">
+            <input type="checkbox" name="upload_enabled" value="true"
+                   {% if upload_enabled %}checked{% endif %}>
+            Upload passes to the hub
+          </label>
+        </div>
+      </section>
+
+      <section class="settings-section">
         <h3>Storage retention</h3>
         <p class="muted-text">Three phases, in order. <code>0</code> on any knob disables that phase. Typical layout: clips &lt; thumbnails &lt; pass records.</p>
         <div class="setting-row">
@@ -720,6 +732,89 @@
     }
 
     // ============================================================
+    // Shared speed-chart helpers (used by both the clip-player chart and the
+    // thumb-only chart). Mirror the capture worker's headline-speed guards so
+    // the chart stays consistent with what the backend stores — including for
+    // clips whose manifest predates the guards and still carries an inflated
+    // speed_mph.
+    // ============================================================
+    const SPEED_MAX_PLAUSIBLE_FPS = 35.0;      // matches capture_worker._MAX_PLAUSIBLE_FPS
+    const SPEED_MAX_ARC_DISP_RATIO = 1.4;      // matches capture_worker._MAX_ARC_DISPLACEMENT_RATIO
+    const SPEED_MAX_EXIT_DESCENT = 0.08;       // matches capture_worker._MAX_EXIT_DESCENT
+    const SPEED_MAX_PLAUSIBLE_MPH = 55.0;      // matches capture_worker._MAX_PLAUSIBLE_MPH
+    const SPEED_MIN_RUNNING_SAMPLES = 5;
+
+    // Re-derive whether the headline speed is trustworthy from the trajectory,
+    // applying the same guards the capture worker uses (timing compression,
+    // spatial jump, partial early burst). These detect suspicious shape; a
+    // shape problem only yields a *wrong* number when the headline is also
+    // implausibly fast, so a suspicious pass is flagged unreliable only when
+    // it exceeds the speed ceiling — plausible passes are kept either way.
+    // Returns {reliable, reason}.
+    // `method` is the manifest's speed_method. On the cadence path
+    // ('cadence_seq') the time base is reconstructed from received-frame
+    // sequence numbers, so the timing heuristics (compressed fps, exit
+    // descent) no longer apply — and the raw per-frame `ts` is the camera's
+    // untrustworthy PTS, which would misfire them. Only the geometric
+    // track-jump check remains, and it rejects on shape alone (a merged
+    // track corrupts the distance itself), mirroring the backend.
+    function speedReliability(samples, method) {
+      const cadence = method === "cadence_seq";
+      const pts = samples.filter(s => s.X != null && s.Y != null && s.ts != null);
+      const n = pts.length;
+      if (n < SPEED_MIN_RUNNING_SAMPLES) return { reliable: false, reason: "few samples" };
+      const span = pts[n - 1].ts - pts[0].ts;
+      if (!cadence && span <= 0) return { reliable: false, reason: "bad timing" };
+      const vr = samples.map(s => s.v_running_mph).filter(v => v != null && isFinite(v));
+      const headline = vr.length ? vr[vr.length - 1] : 0;
+      let reason = "";
+      if (!cadence && (n - 1) / span > SPEED_MAX_PLAUSIBLE_FPS) {
+        reason = "timing compressed";
+      } else {
+        let arc = 0;
+        for (let i = 1; i < n; i++) arc += Math.hypot(pts[i].X - pts[i - 1].X, pts[i].Y - pts[i - 1].Y);
+        const net = Math.hypot(pts[n - 1].X - pts[0].X, pts[n - 1].Y - pts[0].Y);
+        if (net > 0 && arc / net > SPEED_MAX_ARC_DISP_RATIO) {
+          if (cadence) return { reliable: false, reason: "track jump" };
+          reason = "track jump";
+        } else if (!cadence && vr.length >= 5 && vr[vr.length - 1] > 0
+            && vr[vr.length - 3] > vr[vr.length - 2] && vr[vr.length - 2] > vr[vr.length - 1]
+            && (vr[vr.length - 2] - vr[vr.length - 1]) / vr[vr.length - 1] > SPEED_MAX_EXIT_DESCENT) {
+          reason = "timing burst (not converged)";
+        }
+      }
+      if (reason && headline > SPEED_MAX_PLAUSIBLE_MPH) return { reliable: false, reason };
+      return { reliable: true, reason: "" };
+    }
+
+    // Robust Y-axis for the speed chart. The early running-average samples
+    // spike to hundreds of mph even on good passes (tiny cumulative dt over
+    // the first few frames), so a series percentile blows out the scale. When
+    // the headline is trustworthy, anchor to it (the converged exit value);
+    // when it is not (timing-compressed / track-jumped — the whole series is
+    // inflated), anchor to the series median so the bulk of the line fills the
+    // chart. Either way pick a gridline step that yields ~5-7 labels instead
+    // of cramming one every 10 mph. Outliers above the range clip to the top.
+    function speedAxis(samples, reliable, canonical) {
+      const runs = samples.map(s => s.v_running_mph).filter(v => v != null && isFinite(v));
+      let base;
+      if (reliable && canonical != null && isFinite(canonical) && canonical > 0) {
+        base = canonical;
+      } else if (runs.length) {
+        const sorted = [...runs].sort((a, b) => a - b);
+        base = sorted[Math.floor(sorted.length / 2)];
+      } else {
+        base = 30;
+      }
+      const anchor = Math.max(10, base) * 1.3;
+      const niceSteps = [5, 10, 20, 25, 50, 100, 200];
+      let step = niceSteps[niceSteps.length - 1];
+      for (const s of niceSteps) { if (anchor / s <= 6) { step = s; break; } }
+      const vMax = Math.max(2 * step, Math.ceil(anchor / step) * step);
+      return { vMax, step };
+    }
+
+    // ============================================================
     // Player package: <video> + custom bottom controls + speed-vs-position
     // chart with video-synced marker.
     //
@@ -905,23 +1000,18 @@
           legend.textContent = "(not enough samples)";
           return;
         }
-        // Y-axis is anchored to the canonical headline speed (the running
-        // average at exit) rather than any series max. Both v_inst AND the
-        // early running-average samples spike to hundreds of mph (tiny
-        // cumulative dt over the first few frames, PTS bursts, edge-of-frame
-        // detections); scaling to their max squashed the real signal into an
-        // unreadable sliver at the bottom. Anchor to ~1.6x the headline and
-        // clip anything above to the top edge so outliers stay visible
-        // without dictating the scale.
+        // Y-axis scales to the running-average signal (90th percentile), not
+        // the headline — a timing-compressed or track-jumped pass has an
+        // inflated headline that would blow out the scale and squash the real
+        // line. v_inst and early running spikes above the range still draw,
+        // clipped to the top edge. The gridline step adapts so the axis shows
+        // ~5-7 labels instead of cramming one every 10 mph.
+        const rel = speedReliability(samples, m.speed_method);
         const canonical = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
-        const vRunningVals = samples.map(s => s.v_running_mph).filter(v => v != null);
-        const anchor = (canonical != null && isFinite(canonical) && canonical > 0)
-          ? canonical * 1.6
-          : Math.max(...vRunningVals.filter(v => v < 100), 0);
+        const { vMax, step: vStep } = speedAxis(samples, rel.reliable, canonical);
         const uMin = 0;
         const uMax = (m.frame_size && m.frame_size[0]) || 2048;
         const vMin = 0;
-        const vMax = Math.max(40, Math.ceil(anchor / 10) * 10 + 5);
         chartGeo = { samples, padL, padR, padT, padB, chW, chH,
                      uMin, uMax, vMin, vMax, clipStart, clipDur };
 
@@ -933,11 +1023,11 @@
         ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + chH); ctx.lineTo(padL + chW, padT + chH);
         ctx.stroke();
 
-        // Dotted horizontal gridlines every 10 mph
+        // Dotted horizontal gridlines + tick labels at the adaptive step.
         ctx.save();
         ctx.setLineDash([2, 3]);
         ctx.strokeStyle = "#3a4150";
-        for (let v = 10; v < vMax; v += 10) {
+        for (let v = vStep; v < vMax; v += vStep) {
           const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
           ctx.beginPath();
           ctx.moveTo(padL, y); ctx.lineTo(padL + chW, y);
@@ -947,7 +1037,7 @@
 
         // Y-axis tick labels (mph)
         ctx.fillStyle = "#888";
-        for (let v = 0; v <= vMax; v += 10) {
+        for (let v = 0; v <= vMax; v += vStep) {
           const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
           ctx.beginPath(); ctx.moveTo(padL - 3, y); ctx.lineTo(padL, y); ctx.stroke();
           ctx.fillText(v.toString(), 4, y + 3);
@@ -1005,15 +1095,23 @@
         }
 
         // Legend. The canonical speed is the running average at exit (same
-        // value the manifest reports). v_homog_mph is kept for compat with
-        // legacy schema.
-        const canonicalSpeed = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
-        const speedStr = (canonicalSpeed != null && isFinite(canonicalSpeed))
-          ? `${canonicalSpeed.toFixed(2)} mph` : "—";
+        // value the manifest reports). `rel` (computed above) re-derives
+        // trustworthiness so a clip whose manifest predates the backend guards
+        // (and still carries an inflated speed_mph) is labelled honestly
+        // rather than echoing the stale number. v_homog_mph is kept for compat
+        // with legacy schema.
+        const speedStr = !rel.reliable
+          ? `unreliable (${rel.reason})`
+          : (canonical != null && isFinite(canonical))
+            ? `${canonical.toFixed(2)} mph` : "—";
         const speedMethod = m.speed_method;
-        const methodStr = (speedMethod === 'running_avg')
-          ? ` · running_avg over <b>${runningSeq.length}</b> samples`
-          : (speedMethod ? ` · ${speedMethod}` : "");
+        const methodStr = !rel.reliable ? ""
+          : (speedMethod === 'cadence_seq')
+            ? ` · cadence over <b>${runningSeq.length}</b> samples`
+              + (m.rate_fps ? ` @ ${m.rate_fps.toFixed(1)} fps` : "")
+          : (speedMethod === 'running_avg')
+            ? ` · running_avg over <b>${runningSeq.length}</b> samples`
+            : (speedMethod ? ` · ${speedMethod}` : "");
         legend.innerHTML = `pass <b>${m.pass_id}</b> ${m.direction}-bound · `
           + `speed=<b>${speedStr}</b>${methodStr} · `
           + `${m.n_frames} frames`;
@@ -1163,18 +1261,15 @@
           legend.textContent = "(not enough samples)";
           return;
         }
-        // Y-axis anchored to the canonical headline speed (see the player
-        // chart above for the rationale); both v_inst and early running-avg
-        // outliers are clipped to the top edge rather than blowing out scale.
+        // Y-axis scales to the headline (or series median when unreliable)
+        // with an adaptive label step (see the player chart above for the
+        // rationale); both v_inst and early running-avg outliers clip to top.
+        const rel = speedReliability(samples, m.speed_method);
         const canonical = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
-        const vRunningVals = samples.map(s => s.v_running_mph).filter(v => v != null);
-        const anchor = (canonical != null && isFinite(canonical) && canonical > 0)
-          ? canonical * 1.6
-          : Math.max(...vRunningVals.filter(v => v < 100), 0);
+        const { vMax, step: vStep } = speedAxis(samples, rel.reliable, canonical);
         const uMin = 0;
         const uMax = (m.frame_size && m.frame_size[0]) || 2048;
         const vMin = 0;
-        const vMax = Math.max(40, Math.ceil(anchor / 10) * 10 + 5);
         ctx.strokeStyle = "#444"; ctx.fillStyle = "#888";
         ctx.font = "10px system-ui";
         ctx.lineWidth = 1;
@@ -1184,7 +1279,7 @@
         ctx.save();
         ctx.setLineDash([2, 3]);
         ctx.strokeStyle = "#3a4150";
-        for (let v = 10; v < vMax; v += 10) {
+        for (let v = vStep; v < vMax; v += vStep) {
           const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
           ctx.beginPath();
           ctx.moveTo(padL, y); ctx.lineTo(padL + chW, y);
@@ -1192,7 +1287,7 @@
         }
         ctx.restore();
         ctx.fillStyle = "#888";
-        for (let v = 0; v <= vMax; v += 10) {
+        for (let v = 0; v <= vMax; v += vStep) {
           const y = padT + chH - (v - vMin) / (vMax - vMin) * chH;
           ctx.beginPath(); ctx.moveTo(padL - 3, y); ctx.lineTo(padL, y); ctx.stroke();
           ctx.fillText(v.toString(), 4, y + 3);
@@ -1234,13 +1329,19 @@
           ctx.arc(lx, ly, 4, 0, Math.PI * 2);
           ctx.fill();
         }
-        const canonicalSpeed = (m.speed_mph != null) ? m.speed_mph : m.v_homog_mph;
-        const speedStr = (canonicalSpeed != null && isFinite(canonicalSpeed))
-          ? `${canonicalSpeed.toFixed(2)} mph` : "—";
+        // `rel` and `canonical` computed above.
+        const speedStr = !rel.reliable
+          ? `unreliable (${rel.reason})`
+          : (canonical != null && isFinite(canonical))
+            ? `${canonical.toFixed(2)} mph` : "—";
         const speedMethod = m.speed_method;
-        const methodStr = (speedMethod === 'running_avg')
-          ? ` · running_avg over <b>${runningSeq.length}</b> samples`
-          : (speedMethod ? ` · ${speedMethod}` : "");
+        const methodStr = !rel.reliable ? ""
+          : (speedMethod === 'cadence_seq')
+            ? ` · cadence over <b>${runningSeq.length}</b> samples`
+              + (m.rate_fps ? ` @ ${m.rate_fps.toFixed(1)} fps` : "")
+          : (speedMethod === 'running_avg')
+            ? ` · running_avg over <b>${runningSeq.length}</b> samples`
+            : (speedMethod ? ` · ${speedMethod}` : "");
         legend.innerHTML = `pass <b>${m.pass_id}</b> ${m.direction}-bound · `
           + `speed=<b>${speedStr}</b>${methodStr} · `
           + `${m.n_frames} frames`;

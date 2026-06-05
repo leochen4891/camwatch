@@ -31,6 +31,7 @@ class Detector:
         iou: float = 0.5,
         tracker: str = "botsort.yaml",
         roi: tuple[int, int, int, int] | None = None,
+        conf_per_class: dict[str, float] | None = None,
     ) -> None:
         self._model = YOLO(weights)
         self._device = device
@@ -40,9 +41,13 @@ class Detector:
         self._tracker = tracker
         self._roi = roi
         self._names = self._model.names
+        # Per-class confidence minimums by class name. YOLO runs at the
+        # global `conf`; detections of a listed class are dropped post-hoc
+        # when below their class threshold, so values <= `conf` are no-ops.
+        self._conf_per_class = dict(conf_per_class or {})
         log.info(
-            "detector: weights=%s device=%s classes=%s tracker=%s roi=%s",
-            weights, device, classes, tracker, roi,
+            "detector: weights=%s device=%s classes=%s tracker=%s roi=%s conf_per_class=%s",
+            weights, device, classes, tracker, roi, self._conf_per_class,
         )
 
     def track(self, frame: np.ndarray) -> list[Track]:
@@ -81,6 +86,10 @@ class Detector:
 
         out: list[Track] = []
         for i in range(len(ids)):
+            cls_name = self._names.get(int(cls[i]), str(int(cls[i])))
+            min_conf = self._conf_per_class.get(cls_name)
+            if min_conf is not None and float(conf[i]) < min_conf:
+                continue
             cx1, cy1, cx2, cy2 = (float(v) for v in xyxy[i])
             x1 = cx1 + ox
             y1 = cy1 + oy
@@ -91,7 +100,7 @@ class Detector:
                 Track(
                     track_id=int(ids[i]),
                     cls_idx=int(cls[i]),
-                    cls_name=self._names.get(int(cls[i]), str(int(cls[i]))),
+                    cls_name=cls_name,
                     bbox=(x1, y1, x2, y2),
                     conf=float(conf[i]),
                     ground_point=ground,

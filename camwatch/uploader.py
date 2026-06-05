@@ -42,14 +42,34 @@ class Uploader:
         config: Config,
         cloud_url: str,
         api_key: str,
+        enabled: bool = True,
     ) -> None:
         self.db = db
         self.config = config
         self.cloud_url = cloud_url.rstrip("/")
         self.api_key = api_key
         self._stop = threading.Event()
+        # When clear, the poll loop idles without scanning or POSTing. Lets the
+        # /settings switch pause/resume hub uploads live, without a restart.
+        self._enabled = threading.Event()
+        if enabled:
+            self._enabled.set()
         self._thread: threading.Thread | None = None
         self._ensure_columns()
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Flip hub uploading on/off at runtime (called from /settings)."""
+        if enabled == self._enabled.is_set():
+            return
+        if enabled:
+            self._enabled.set()
+        else:
+            self._enabled.clear()
+        log.info("uploader %s", "resumed" if enabled else "paused")
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled.is_set()
 
     def _ensure_columns(self) -> None:
         with self.db.connect() as conn:
@@ -66,7 +86,11 @@ class Uploader:
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name="uploader")
         self._thread.start()
-        log.info("uploader started -> %s", self.cloud_url)
+        log.info(
+            "uploader thread started -> %s (%s)",
+            self.cloud_url,
+            "active" if self._enabled.is_set() else "paused",
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -74,9 +98,19 @@ class Uploader:
             self._thread.join(timeout=10)
 
     def _run(self) -> None:
-        self._fix_missing_media()
+        fixed_media = False
         while not self._stop.is_set():
+            if not self._enabled.is_set():
+                # Paused via the /settings switch: idle without scanning the DB
+                # or POSTing. Re-check after the poll interval.
+                self._stop.wait(POLL_INTERVAL_S)
+                continue
             try:
+                # Runs the first time uploading is active — at startup if
+                # enabled, otherwise the first poll after being switched on.
+                if not fixed_media:
+                    self._fix_missing_media()
+                    fixed_media = True
                 uploaded = self._upload_batch()
                 synced = self._sync_enrichment_batch()
                 if uploaded == 0 and synced == 0:
