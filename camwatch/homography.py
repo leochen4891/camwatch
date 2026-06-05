@@ -1,11 +1,13 @@
 """Homography-based pixel→ground-plane projection and trajectory speed.
 
-Loads the 3×3 matrix from `config/homography.yaml` (built by
-`scripts/build_homography_from_marks.py`). The matrix maps main-stream
-pixel coordinates (resolution depends on the camera; recorded in the
-yaml's `frame_size`) to road-plane meters in a coordinate system whose
-origin is at "point 6" (the east curb directly across
-from the camera) with +Y running along the road toward "point 1"
+Loads the 3×3 matrix from the elected main camera's registry profile
+(`camwatch-cameras`, ADR-015) via `Homography.from_profile()` — the same
+H / K / D / frame_size fields this module previously read from
+`config/homography.yaml` (`Homography.load()`, kept for legacy tooling).
+The matrix maps main-stream pixel coordinates (resolution depends on the
+camera; recorded in the artifact's `frame_size`) to road-plane meters in
+a coordinate system whose origin is at "point 6" (the east curb directly
+across from the camera) with +Y running along the road toward "point 1"
 (north-ish).
 
 Speed = |slope of Y(t)| from a linear regression over the projected
@@ -45,15 +47,7 @@ class Homography:
     D: np.ndarray | None = None
 
     @classmethod
-    def load(cls, path: Path | str) -> "Homography | None":
-        try:
-            data = yaml.safe_load(Path(path).read_text())["homography"]
-        except FileNotFoundError:
-            log.warning("homography file not found at %s; speed-by-homography disabled", path)
-            return None
-        except Exception as e:  # noqa: BLE001
-            log.warning("failed to load homography from %s: %s; speed-by-homography disabled", path, e)
-            return None
+    def _from_doc(cls, data: dict) -> "Homography":
         H = np.array(data["H"], dtype=np.float64)
         K = np.array(data["K"], dtype=np.float64) if "K" in data else None
         D = np.array(data["D"], dtype=np.float64).reshape(-1) if "D" in data else None
@@ -66,6 +60,44 @@ class Homography:
             K=K,
             D=D,
         )
+
+    @classmethod
+    def from_profile(cls, profile) -> "Homography | None":
+        """Build from a camwatch-cameras CameraProfile (ADR-015).
+
+        The registry's calibration artifact carries the same H / K / D /
+        frame_size fields this class previously read from
+        config/homography.yaml (the cx810 artifact was migrated verbatim),
+        so projection — and therefore speed — is unchanged by the move;
+        only the owner of the facts moved. Undistortion stays in this
+        class's cv2 pipeline; the profile's own px_to_world() is the
+        registry's equivalent route.
+        """
+        try:
+            data = profile.calibration()
+        except Exception as e:  # noqa: BLE001 — CalibrationMissing or a bad artifact
+            log.warning(
+                "no calibrated homography for camera %s: %s; "
+                "speed-by-homography disabled",
+                getattr(profile, "camera_id", "?"), e,
+            )
+            return None
+        return cls._from_doc(data)
+
+    @classmethod
+    def load(cls, path: Path | str) -> "Homography | None":
+        """Legacy file loader (config/homography.yaml era). The runtime now
+        builds from the registry profile via from_profile(); this stays for
+        offline tooling pointed at historical artifacts."""
+        try:
+            data = yaml.safe_load(Path(path).read_text())["homography"]
+        except FileNotFoundError:
+            log.warning("homography file not found at %s; speed-by-homography disabled", path)
+            return None
+        except Exception as e:  # noqa: BLE001
+            log.warning("failed to load homography from %s: %s; speed-by-homography disabled", path, e)
+            return None
+        return cls._from_doc(data)
 
     def project(self, u: float, v: float) -> tuple[float, float]:
         """Main-stream pixel (u, v) → road-plane meters (X, Y).

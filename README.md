@@ -65,11 +65,24 @@ cp config/config.example.yaml config/config.yaml
 uv run python scripts/test_stream.py      # smoke test: ~10-25 fps to /tmp/
 ```
 
-Prerequisites: a Reolink camera with RTSP enabled, Python 3.12, and an NVIDIA GPU for inference. Currently tested on Linux + CUDA on an RTX 3060. `device: auto` resolves to CUDA at startup, with CPU as a fallback for non-GPU dev boxes.
+Prerequisites: a Reolink camera with RTSP enabled, Python 3.12, and an NVIDIA GPU for inference. Currently tested on Linux + CUDA on an RTX 3060. `device: auto` resolves to CUDA at startup, with CPU as a fallback for non-GPU dev boxes. Camera facts (homography, measured cadence, RTSP/FTP access) come from the private `camwatch-cameras` registry, consumed as a `uv` path dependency — clone it as a sibling of this repo (`../camwatch-cameras`) before `uv sync`.
 
 ## Calibration
 
-The runtime needs one artifact: `config/homography.yaml`. It holds three matrices: `K` (camera intrinsics), `D` (5-coefficient lens distortion), and `H` (homography from *undistorted* pixels to road-plane meters). A wide-angle lens (the CX410W's ~89° HFOV) introduces enough barrel distortion that a homography alone can't absorb it — running with H-only gave mean reprojection error of 63 cm; the joint `K + D + H` fit drops that to ~6 cm.
+> **Camera facts moved to the registry (ADR-015).** The runtime now loads the
+> homography (`K`/`D`/`H` + calibration resolution), the measured cadence, and
+> the RTSP URL template from the elected main camera's profile in the private
+> `camwatch-cameras` repo — `config/homography.yaml` and the calibration
+> scripts below are superseded and kept only until the loader path has proven
+> itself in production. New calibrations happen with the registry repo's
+> self-contained tooling, on a live main-stream frame at full resolution;
+> consumers pick the result up with a dependency bump. Which camera is elected
+> main lives in this repo's `config/config.yaml` (`camera.main_id`) — election
+> refuses a camera whose profile lacks a calibrated speed capability.
+
+The section below documents the original in-repo workflow (CX410W era) and the calibration's design; the *method* still applies inside the registry repo.
+
+The calibration artifact holds three matrices: `K` (camera intrinsics), `D` (5-coefficient lens distortion), and `H` (homography from *undistorted* pixels to road-plane meters). A wide-angle lens (the CX410W's ~89° HFOV) introduces enough barrel distortion that a homography alone can't absorb it — running with H-only gave mean reprojection error of 63 cm; the joint `K + D + H` fit drops that to ~6 cm.
 
 `K + D` come from **scene-constrained self-calibration**, not a chessboard. The same 17 painted anchors that constrain the homography also constrain the lens distortion (14 dots must be colinear in world; 3 west-curb dots must be colinear and parallel; spacing must be 5 ft). `scipy.optimize.least_squares` solves for `(fx, k1..k3, p1, p2, H)` jointly. See `scripts/fit_distortion_from_scene.py` for the math.
 
@@ -162,8 +175,9 @@ camwatch/
 │                       to monotonic time at first frame of each session.
 ├── detect.py           YOLO11 + BotSORT wrapper. Weights and device are
 │                       read from config; default is yolo11l.pt on CUDA.
-├── homography.py       Loads K + D + H from config/homography.yaml. project()
-│                       runs cv2.undistortPoints first, then the 3×3 matmul.
+├── homography.py       Builds K + D + H from the elected camera's registry
+│                       profile (Homography.from_profile). project() runs
+│                       cv2.undistortPoints first, then the 3×3 matmul.
 │                       Exposes running_avg_speed() (canonical speed) and
 │                       world_to_pixel() (distortion-aware overlay rendering).
 ├── grid_crossing.py    "Pass" = track enters the grid then exits (or ages
@@ -199,7 +213,8 @@ Three things make the speed measurement work:
 `config/config.yaml`:
 
 ```yaml
-camera:        { host, port, path, static_frame_path? }   # path = main stream
+camera:        { main_id: cx810, static_frame_path? }   # elected main camera (ADR-013);
+                                                        # facts come from its registry profile
 model:         { weights: yolo11l.pt, device: auto, conf: 0.35 }
 alert:         { threshold_mph: 40 }
 speed:         { max_track_age_s: 5.0 }
@@ -218,15 +233,20 @@ Most are also editable in-app. Camera credentials in `.env` (`REOLINK_USER`, `RE
 ```
 camwatch/                 # runtime source (modules above)
 config/                   # config.yaml, calibration.yaml (gitignored);
-                          # marked_points.yaml + homography.yaml (tracked)
-scripts/                  # mark_points.py             initial 17-dot click
-                          # fit_distortion_from_scene.py  K+D+H joint fit
-                          # inspect_homography.py      interactive drag + refit
-                          # build_homography_from_marks.py  legacy H-only fit
-                          # render_homography_overlay.py    static PNG render
-                          # camwatch-tick.sh           hourly babysitter cron
-                          # enrich_apply.py            vehicle make/model fill
-                          # test_stream.py, timing diagnostics
+                          # marked_points.yaml + homography.yaml (tracked,
+                          # superseded by camwatch-cameras — removal pending
+                          # the loader path proving out in production)
+scripts/                  # calibration tooling, superseded by the registry
+                          # repo's self-contained equivalents:
+                          #   mark_points.py             initial 17-dot click
+                          #   fit_distortion_from_scene.py  K+D+H joint fit
+                          #   inspect_homography.py      interactive drag + refit
+                          #   build_homography_from_marks.py  legacy H-only fit
+                          #   render_homography_overlay.py    static PNG render
+                          # still current:
+                          #   camwatch-tick.sh           hourly babysitter cron
+                          #   enrich_apply.py            vehicle make/model fill
+                          #   test_stream.py, timing diagnostics
 docs/images/              # README screenshots
 ```
 

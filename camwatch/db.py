@@ -101,6 +101,10 @@ class Pass:
     enrich_local_status: str | None = None  # 'high' | 'medium' | 'low' | 'no_match' | None
     enrich_local_topk: str | None = None    # JSON debug payload
     deleted_at: str | None = None
+    # Camera provenance (ADR-013): the registry camera_id of the elected main
+    # camera that produced this pass. NULL on rows from before the column —
+    # those all predate multi-camera and are cx810's.
+    camera: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Pass:
@@ -139,6 +143,7 @@ class Pass:
             enrich_local_status=row["enrich_local_status"] if "enrich_local_status" in keys else None,
             enrich_local_topk=row["enrich_local_topk"] if "enrich_local_topk" in keys else None,
             deleted_at=row["deleted_at"] if "deleted_at" in keys else None,
+            camera=row["camera"] if "camera" in keys else None,
         )
 
 
@@ -179,6 +184,7 @@ class Database:
                     ("enrich_local_status", "TEXT"),
                     ("enrich_local_topk", "TEXT"),
                     ("deleted_at", "TEXT"),
+                    ("camera", "TEXT"),
                 ]:
                     try:
                         conn.execute(f"ALTER TABLE passes ADD COLUMN {col} {decl}")
@@ -217,19 +223,20 @@ class Database:
         clip_path: str | None,
         speed_mph: float | None = None,
         speed_method: str | None = None,
+        camera: str | None = None,
     ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO passes
                     (captured_at, track_id, cls_name, direction, elapsed_s,
-                     clip_path, speed_mph, speed_method)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     clip_path, speed_mph, speed_method, camera)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (captured_at, int(track_id), cls_name, direction,
                  float(elapsed_s), clip_path,
                  None if speed_mph is None else float(speed_mph),
-                 speed_method),
+                 speed_method, camera),
             )
             return int(cur.lastrowid)
 

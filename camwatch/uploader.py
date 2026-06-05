@@ -229,8 +229,9 @@ class Uploader:
 
         return count
 
-    def _upload_pass(self, p: Pass) -> bool:
-        metadata = {
+    def _pass_metadata(self, p: Pass) -> dict:
+        """The ingest `metadata` JSON for one pass (split out for tests)."""
+        return {
             "captured_at": p.captured_at,
             "engine_pass_id": p.id,
             "track_id": p.track_id,
@@ -239,6 +240,13 @@ class Uploader:
             "elapsed_s": p.elapsed_s,
             "speed_mph": p.speed_mph,
             "speed_method": p.speed_method,
+            # Camera provenance (ADR-013): the registry camera_id that
+            # produced this pass; with speed_method it seeds the hub's
+            # initial pass_speeds measurement (ADR-014). Rows from before
+            # the local column all predate multi-camera and are cx810's.
+            # The hub ignores unknown metadata fields until its migration
+            # ships, so sending this early is harmless.
+            "camera": p.camera or "cx810",
             "known_mph": p.known_mph,
             "is_alarm": p.speed_mph is not None and p.speed_mph >= self.config.alert_threshold_mph and p.known_mph is None,
             "threshold_mph": self.config.alert_threshold_mph,
@@ -247,6 +255,9 @@ class Uploader:
             "vehicle_color": p.vehicle_color,
             "vehicle_confidence": p.vehicle_confidence,
         }
+
+    def _upload_pass(self, p: Pass) -> bool:
+        metadata = self._pass_metadata(p)
 
         files: dict[str, tuple[str | None, bytes | io.IOBase, str]] = {
             "metadata": (None, json.dumps(metadata).encode(), "application/json"),

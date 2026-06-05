@@ -72,6 +72,7 @@ source = { editable = "." }
 dependencies = [
     { name = "astral" },
     { name = "av" },
+    { name = "camwatch-cameras" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -95,6 +96,7 @@ dev = [
 requires-dist = [
     { name = "astral", specifier = ">=3.2" },
     { name = "av", specifier = ">=17.0.1" },
+    { name = "camwatch-cameras", directory = "../camwatch-cameras" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1" },
@@ -111,6 +113,30 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "httpx", specifier = ">=0.28.1" }]
+
+[[package]]
+name = "camwatch-cameras"
+version = "0.1.0"
+source = { directory = "../camwatch-cameras" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "av", marker = "extra == 'calib'", specifier = ">=12" },
+    { name = "numpy", specifier = ">=1.24" },
+    { name = "opencv-python", marker = "extra == 'calib'", specifier = ">=4.8" },
+    { name = "pillow", marker = "extra == 'calib'", specifier = ">=10" },
+    { name = "python-dotenv", marker = "extra == 'calib'", specifier = ">=1" },
+    { name = "pyyaml", specifier = ">=6" },
+    { name = "scipy", marker = "extra == 'calib'", specifier = ">=1.11" },
+]
+provides-extras = ["calib"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "certifi"
