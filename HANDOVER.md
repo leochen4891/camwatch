@@ -46,3 +46,15 @@
 Item 1 can start now. Item 3's hub side lands with `camwatch-web`'s
 migration; sending the extra field early is harmless if the hub ignores
 unknown fields — verify before relying on that.
+
+## Coordination channel
+
+Your line to the system coordinator is `../camwatch-comms/camwatch.md`
+(sibling of this repo; a plain folder, **not** a git repo — never commit
+it). Append-only entries
+(`### <YYYY-MM-DD HH:MM TZ> · <sender> → <recipient>`); **check the tail**
+at session start, before asking the human a contract question the
+coordinator could answer, and after finishing an item — the coordinator
+posts there when the hub's ingest change ships. Durable conclusions get
+promoted into `camwatch-system` docs by the coordinator. Full protocol:
+`camwatch-system/COORDINATION.md`.
