@@ -120,7 +120,17 @@ class Uploader:
                 self._stop.wait(POLL_INTERVAL_S)
 
     def _fix_missing_media(self) -> None:
-        """Re-upload passes that were sent before their thumbnail existed."""
+        """Verified media sweep, run once per upload activation.
+
+        Asks the hub which recently-uploaded passes actually lack media
+        (`has_thumb` / `has_clip` in the GET /api/passes list contract) and
+        re-uploads only those — and only when the local media file still
+        exists. The original sweep re-sent the latest 200 uploaded passes
+        unconditionally; with the thumbnail-wait invariant in
+        _upload_batch (passes wait for the .jpg before first upload) it
+        healed nothing and starved fresh uploads for ~45 min after every
+        service restart. Against a healthy hub this now re-uploads zero.
+        """
         with self.db.connect() as conn:
             rows = conn.execute(
                 """SELECT * FROM passes
@@ -131,20 +141,68 @@ class Uploader:
                    LIMIT 200""",
                 (MIN_PASS_ID,),
             ).fetchall()
+        candidates = [Pass.from_row(r) for r in rows]
+        if not candidates:
+            return
 
-        count = 0
-        for row in rows:
-            p = Pass.from_row(row)
-            if not p.clip_path:
+        hub = self._hub_media_index(min(p.captured_at for p in candidates))
+        if hub is None:
+            # Hub unreachable: skip the sweep entirely — never block fresh
+            # uploads (or boot) on it. The next restart tries again.
+            log.warning("media verify: hub list unavailable; sweep skipped")
+            return
+
+        checked = 0
+        fixed = 0
+        for p in candidates:
+            entry = hub.get(p.id)
+            if entry is None:
+                # Outside the hub's list window or deleted on the hub —
+                # neither is a media gap; never blind-resend (a re-upload
+                # would resurrect hub-side deletions).
                 continue
-            thumb_path = Path(p.clip_path).with_suffix(".jpg")
-            if not thumb_path.exists():
+            checked += 1
+            clip = Path(p.clip_path)
+            thumb = clip.with_suffix(".jpg")
+            needs = (
+                (not entry.get("has_thumb") and thumb.exists())
+                or (not entry.get("has_clip") and clip.exists())
+            )
+            if not needs:
                 continue
             if self._upload_pass(p):
-                count += 1
-                log.info("re-uploaded pass %d (media fix)", p.id)
-        if count:
-            log.info("fixed media for %d passes", count)
+                fixed += 1
+                log.info("re-uploaded pass %d (media verify)", p.id)
+        log.info("media verify: %d checked, %d re-uploaded", checked, fixed)
+
+    def _hub_media_index(self, since: str) -> dict[int, dict] | None:
+        """engine_pass_id → hub list row (with has_thumb / has_clip), for
+        the window starting at `since` (clamped server-side to the Bearer
+        tier's 30d range cap). Returns None when the hub can't be queried,
+        so the caller skips the sweep instead of guessing.
+
+        The list carries only the elected headline speed fields (ADR-014);
+        gate exclusively on has_thumb / has_clip here.
+        """
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.get(
+                    f"{self.cloud_url}/api/passes",
+                    params={"range": "30d", "since": since},
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+            if resp.status_code != 200:
+                log.warning("media verify: hub list HTTP %d", resp.status_code)
+                return None
+            passes = resp.json().get("passes") or []
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("media verify: hub list fetch failed: %s", e)
+            return None
+        return {
+            int(row["engine_pass_id"]): row
+            for row in passes
+            if row.get("engine_pass_id") is not None
+        }
 
     def _upload_batch(self) -> int:
         with self.db.connect() as conn:
