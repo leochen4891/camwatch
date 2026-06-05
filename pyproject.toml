@@ -31,6 +31,11 @@ dependencies = [
     # (ADR-015). The repo is private because profiles carry placement and
     # LAN details — never vendor a profile into this (public) repo.
     "camwatch-cameras",
+    # torch/torchvision are ultralytics' runtime, declared directly so the
+    # per-platform index pin below applies (uv sources only cover direct
+    # dependencies). See the pytorch-cu121 note at [tool.uv.sources].
+    "torch",
+    "torchvision",
 ]
 
 # Sibling checkout for now (lei-ubuntu: ~/git/camwatch-cameras next to
@@ -39,6 +44,18 @@ dependencies = [
 #   camwatch-cameras = { git = "ssh://git@github.com/leochen4891/camwatch-cameras", rev = "<pin>" }
 [tool.uv.sources]
 camwatch-cameras = { path = "../camwatch-cameras" }
+# Production (lei-ubuntu) runs NVIDIA driver 535 (CUDA 12.2 max): PyPI's
+# default torch builds (cu13x) import fine but report cuda.is_available()
+# = False, silently pushing YOLO onto CPU. Pin Linux to the cu121 wheel
+# index — the pairing proven in production (torch 2.5.1+cu121). Bump only
+# together with a driver upgrade. macOS dev boxes keep PyPI torch.
+torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

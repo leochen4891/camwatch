@@ -158,10 +158,11 @@ uv run python -m camwatch serve --profile             # log per-stage timings
 For remote access: Tailscale for personal use, Cloudflare Tunnel + Access for shareable URLs. The UI has no built-in auth.
 
 > **Production deploy note (lei-ubuntu):** the systemd unit runs the service
-> from `~/camwatch-probe/.venv`, **not** the repo's `.venv` — after a
-> dependency change (`pyproject.toml` / `uv.lock`), install into that venv
-> too or the service crash-loops on the missing import (observed during the
-> 2026-06-05 registry-adoption cutover).
+> from the repo's own `.venv` (`~/git/camwatch/.venv`; migrated 2026-06-05
+> off a leftover `~/camwatch-probe/.venv`), so a deploy is `git pull` +
+> `uv sync` + restart. The Linux torch build is pinned to the cu121 wheel
+> index in `pyproject.toml` — driver 535 silently loses CUDA on PyPI's
+> default cu13x builds; bump the pin only together with a driver upgrade.
 
 `uv run python -m camwatch.calibrate pick-roi` opens an interactive window to drag-adjust the YOLO region-of-interest rectangle whenever the camera is re-aimed.
 
