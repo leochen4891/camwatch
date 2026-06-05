@@ -120,6 +120,10 @@ class Homography:
         self,
         samples: Sequence[tuple[float, float, float]],
         min_samples: int = 5,
+        max_plausible_fps: float | None = None,
+        max_arc_displacement_ratio: float | None = None,
+        max_exit_descent: float | None = None,
+        max_plausible_mph: float | None = None,
     ) -> tuple[float, list[float], int]:
         """Cumulative-distance / cumulative-time speed from the first sample.
 
@@ -133,11 +137,47 @@ class Homography:
         a per-frame v_inst chart, where the same burst produces 100-600 mph
         spikes.)
 
+        That robustness only holds when the time base and the focus track are
+        sound. Two failure modes corrupt the headline itself, and the optional
+        guards below reject them (returning NaN — "speed unknown") rather than
+        emitting a fabricated over-speed:
+
+        * `max_plausible_fps` — if the trajectory's frames imply a frame rate
+          above this, the presentation timestamps are bunched (variable-frame-
+          rate source, or a decode burst), so the whole `t_last - t_0` span is
+          compressed and `cum_dist / span` inflates. Not a brief mid-trajectory
+          cluster — the entire denominator is wrong, which the running average
+          cannot recover from.
+        * `max_arc_displacement_ratio` — if cumulative arc length exceeds the
+          straight-line displacement by more than this factor, the track
+          doubled back (e.g. the focus box merged with an oncoming vehicle),
+          inflating distance. A clean crossing stays within ~1.03.
+        * `max_exit_descent` — catches a *partial* early burst that the global
+          fps guard misses: a cluster of bunched-PTS frames at track
+          acquisition followed by a normally-timed tail. The early frames
+          contribute distance with almost no time, so the running average
+          starts high and is still descending at grid exit — it never
+          converged. A real vehicle can't lose this fraction of its speed in
+          the final inter-frame interval, so a still-descending exit means the
+          headline is a timing artifact. Rejected only when the tail is
+          consistently descending (guards against a single noisy final frame).
+
+        `max_plausible_mph` gates all three checks: a suspicious-shape pass is
+        rejected only when its headline also exceeds this ceiling. Most
+        acquisition bursts and track wobbles leave a *plausible* speed (the
+        residential traffic here runs well under it) and are kept; only a
+        reading that is both suspicious and implausibly fast — a phantom
+        over-speed — is discarded. A clean high reading (a real speeder, no
+        suspicious shape) is never rejected. When None, the checks reject on
+        suspicious shape alone.
+
         Returns:
             (final_mph, per_frame_running, n_samples).
-            `final_mph` is NaN if fewer than `min_samples` samples or the
-            cumulative dt never becomes positive. `per_frame_running[i]` is
-            NaN until enough samples have accumulated.
+            `final_mph` is NaN if fewer than `min_samples` samples, the
+            cumulative dt never becomes positive, or a guard rejects the
+            trajectory. `per_frame_running[i]` is NaN until enough samples have
+            accumulated, and is left intact even when a guard rejects the
+            headline (the diagnostic chart still renders the raw series).
         """
         n = len(samples)
         per_frame: list[float] = [float("nan")] * n
@@ -159,5 +199,47 @@ class Homography:
                 mph = (cum_dist / cum_dt) * MPH_PER_MPS
                 per_frame[i] = mph
                 last_valid = mph
+
+        # Trustworthiness guards on the headline (per_frame is left intact).
+        span = projected[-1][0] - t0
+        if span <= 0:
+            return float("nan"), per_frame, n
+
+        # The three checks below detect *suspicious shape* (corrupted timing or
+        # a track jump). On their own they also fire on plenty of plausible
+        # passes — e.g. a brief acquisition burst leaves a 25 mph headline
+        # mildly non-converged. A high frame rate or a doubled-back path only
+        # produces a *wrong* speed when the result is also implausibly high, so
+        # `max_plausible_mph` gates them: a suspicious pass is rejected only
+        # when its headline exceeds the ceiling. A clean high reading (real
+        # speeder) is kept; a plausible reading is kept even if its shape is
+        # suspicious. When `max_plausible_mph` is None the checks reject on
+        # suspicion alone (legacy behavior).
+        suspicious = False
+        if max_plausible_fps is not None and (n - 1) / span > max_plausible_fps:
+            suspicious = True
+        if max_arc_displacement_ratio is not None:
+            net = (
+                (projected[-1][1] - projected[0][1]) ** 2
+                + (projected[-1][2] - projected[0][2]) ** 2
+            ) ** 0.5
+            if net > 0 and cum_dist / net > max_arc_displacement_ratio:
+                suspicious = True
+        if max_exit_descent is not None:
+            vr = [v for v in per_frame if v == v]  # drop NaNs
+            # Need a settled tail to distinguish "still paying off an early
+            # burst" (high → descending) from a clean pass converging up from
+            # below; require a consistently descending final pair.
+            if (
+                len(vr) >= 5
+                and vr[-1] > 0
+                and vr[-3] > vr[-2] > vr[-1]
+                and (vr[-2] - vr[-1]) / vr[-1] > max_exit_descent
+            ):
+                suspicious = True
+        if suspicious and (
+            max_plausible_mph is None or last_valid > max_plausible_mph
+        ):
+            return float("nan"), per_frame, n
         return last_valid, per_frame, n
 
