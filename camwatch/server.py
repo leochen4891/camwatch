@@ -381,16 +381,17 @@ def make_app(
 
     @app.get("/api/homography")
     async def get_homography():
-        """Current homography matrix + frame size. Used by the client to
+        """Current homography matrix + frame size, from the elected main
+        camera's registry profile (ADR-015). Used by the client to
         project meter grid → main-stream pixel for the video canvas
         overlay. Also returns the raw clicked anchor positions so the
         client can draw the calibration grid through the actual white
         marks rather than through the H matrix's least-squares fit
         (which has small per-point residuals)."""
-        path = Path("config/homography.yaml")
-        if not path.exists():
+        try:
+            data = cfg.camera.profile.calibration()
+        except Exception:  # noqa: BLE001 — CalibrationMissing or a bad artifact
             raise HTTPException(status_code=404, detail="homography not calibrated")
-        data = yaml.safe_load(path.read_text())["homography"]
         return JSONResponse({
             "H": data["H"],
             "frame_size": data.get("frame_size", [2048, 1536]),
@@ -1209,7 +1210,7 @@ def _render_index(request: Request, cfg: Config, db: Database):
             "upload_enabled": cfg.upload_enabled,
             "running": True,
             "paused_night": _is_paused_night(request, cfg),
-            **_load_homography_meta(),
+            **_load_homography_meta(cfg),
             "histogram": histogram,
             "histogram_total": hist_total,
             "histogram_all_default": hist_all_default,
@@ -1391,18 +1392,15 @@ def _is_paused_night(request: Request, cfg: Config) -> bool:
     return bool(cfg.pause_at_night and worker.is_night_mode())
 
 
-def _load_homography_meta() -> dict:
-    """Best-effort read of the active homography YAML's metadata fields for
-    display in the header. Returns empty dict if no homography is calibrated."""
-    path = Path("config/homography.yaml")
-    if not path.exists():
-        return {}
+def _load_homography_meta(cfg: Config) -> dict:
+    """Best-effort read of the elected main camera's calibration metadata
+    (registry profile, ADR-015) for display in the header. Returns empty
+    dict if no homography is calibrated."""
     try:
-        with path.open() as f:
-            data = (yaml.safe_load(f) or {}).get("homography", {}) or {}
-    except Exception:  # noqa: BLE001
+        data = cfg.camera.profile.calibration()
+    except Exception:  # noqa: BLE001 — CalibrationMissing or a bad artifact
         return {}
-    n_pts = len(data.get("pixel_pts_sub") or [])
+    n_pts = len(data.get("pixel_pts") or data.get("pixel_pts_sub") or [])
     mean_m = float(data.get("mean_reprojection_error_m") or 0.0)
     return {
         "homog_n_pts": n_pts,
@@ -1417,7 +1415,7 @@ def _render_status_panel(request: Request, cfg: Config, db: Database):
         {
             "threshold": cfg.alert_threshold_mph,
             "running": True,
-            **_load_homography_meta(),
+            **_load_homography_meta(cfg),
         },
     )
 

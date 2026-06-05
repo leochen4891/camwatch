@@ -4,9 +4,9 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote
 
 import yaml
+from camwatch_cameras import CalibrationMissing, CameraProfile, load_camera
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
@@ -14,9 +14,13 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class CameraConfig:
-    host: str
-    port: int
-    path: str                       # main-stream RTSP path on the camera
+    # Elected main camera (ADR-013): the registry camera that creates passes.
+    # Camera *facts* (RTSP host/port/path, homography + K/D, measured cadence)
+    # come from the camwatch-cameras registry profile (ADR-015); this config
+    # holds only the *usage* side — which camera is elected, and credentials
+    # (env). Switching = config change + service restart; no hot-swap.
+    main_id: str
+    profile: CameraProfile
     user: str
     password: str
     # When set, the capture worker reads frames from this JPEG (looped at the
@@ -26,9 +30,8 @@ class CameraConfig:
 
     @property
     def rtsp_url(self) -> str:
-        u = quote(self.user, safe="")
-        p = quote(self.password, safe="")
-        return f"rtsp://{u}:{p}@{self.host}:{self.port}{self.path}"
+        # The profile owns the URL shape (and percent-quotes the creds).
+        return self.profile.rtsp_url(self.user, self.password)
 
 
 @dataclass
@@ -120,6 +123,36 @@ class Config:
         )
 
 
+def elect_main_camera(main_id: str) -> CameraProfile:
+    """Load and capability-gate the elected main camera (ADR-013).
+
+    The main camera creates passes, so it must be electable
+    (`capabilities.pass_creation`) and speed-calibrated — a homography and a
+    *measured* cadence in its registry profile (the loader raises
+    CalibrationMissing when a gate is open). A camera that fails any gate is
+    refused at startup rather than producing passes with unreliable speeds.
+    """
+    try:
+        profile = load_camera(main_id)
+    except FileNotFoundError as e:
+        raise SystemExit(f"camera.main_id: {e}") from e
+    caps = profile.raw.get("capabilities") or {}
+    if not caps.get("pass_creation"):
+        raise SystemExit(
+            f"camera.main_id: {main_id!r} is not electable as main camera "
+            "(capabilities.pass_creation is not set in its registry profile)"
+        )
+    try:
+        profile.calibration()
+        profile.cadence_fps()
+    except CalibrationMissing as e:
+        raise SystemExit(
+            f"camera.main_id: {main_id!r} lacks a calibrated speed "
+            f"capability and cannot create passes: {e}"
+        ) from e
+    return profile
+
+
 def _resolve_device(requested: str | None) -> str:
     """Return a concrete torch device string from a config value.
 
@@ -169,7 +202,17 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
     with cfg_path.open() as f:
         raw = yaml.safe_load(f)
 
-    cam = raw["camera"]
+    cam = raw.get("camera") or {}
+    legacy_cam_keys = [k for k in ("host", "port", "path") if k in cam]
+    if legacy_cam_keys:
+        log.info(
+            "config camera.%s superseded by the camwatch-cameras registry "
+            "profile (ADR-015) and ignored",
+            "/".join(legacy_cam_keys),
+        )
+    main_id = str(cam.get("main_id", "cx810"))
+    profile = elect_main_camera(main_id)
+    log.info("main camera elected: %s (%s)", main_id, profile.model)
     mdl = raw["model"]
     device_requested = mdl.get("device")
     device_resolved = _resolve_device(device_requested)
@@ -177,9 +220,8 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         log.info("model.device=%s resolved to %s", device_requested or "auto", device_resolved)
     return Config(
         camera=CameraConfig(
-            host=cam["host"],
-            port=int(cam["port"]),
-            path=cam["path"],
+            main_id=main_id,
+            profile=profile,
             static_frame_path=cam.get("static_frame_path"),
             user=user,
             password=pw,

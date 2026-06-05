@@ -340,18 +340,26 @@ class CaptureWorker(threading.Thread):
         # handlers (e.g., the live status badge endpoint). Booleans are
         # atomic in CPython, so no lock is needed.
         self._night_mode: bool = False
-        # Homography-based parallel speed measurement. Loaded from
-        # config/homography.yaml; if missing, the parallel speed is silently
-        # skipped (the existing 2-line method continues unaffected).
-        self._homog: Homography | None = Homography.load(
-            Path("config/homography.yaml")
+        # Homography for projection + speed, from the elected main camera's
+        # registry profile (ADR-015 — camera facts live in camwatch-cameras,
+        # not in this repo). Election already gated on a calibrated speed
+        # capability, so this only fails on a corrupt artifact; the worker
+        # then runs without speed, as before.
+        self._homog: Homography | None = Homography.from_profile(
+            cfg.camera.profile
         )
         if self._homog is not None:
             log.info(
-                "homography loaded for parallel speed (mean reproj err=%.1fcm, max=%.1fcm)",
+                "homography loaded for %s (mean reproj err=%.1fcm, max=%.1fcm)",
+                cfg.camera.main_id,
                 self._homog.mean_reproj_err_m * 100,
                 self._homog.max_reproj_err_m * 100,
             )
+        # Registry-measured cadence (ADR-010: measured, never nominal). The
+        # time-base fallback when the live received-frame rate isn't
+        # available — stream warm-up and the ~30s after a reconnect — where
+        # the previous behavior was "speed unknown".
+        self._registry_cadence_fps: float = cfg.camera.profile.cadence_fps()
         # Per-track ground-point trajectory: track_id → deque of
         # (ts, ground_u, ground_v, (bbox_x1, bbox_y1, bbox_x2, bbox_y2),
         # frame_seq, stream_epoch). `frame_seq` is the stream's received-frame
@@ -528,6 +536,7 @@ class CaptureWorker(threading.Thread):
         speed_mph: float | None,
         speed_method: str | None = None,
         rate_fps: float | None = None,
+        rate_source: str | None = None,
     ) -> None:
         """Write per-frame trajectory to events/pass_<pid>.jsonl.
 
@@ -642,7 +651,10 @@ class CaptureWorker(threading.Thread):
             "speed_mph": speed_mph,
             "speed_method": speed_method,  # 'cadence_seq' | 'running_avg' | None
             # Cadence time-base diagnostics (None / 0 on the legacy path).
+            # rate_source: 'received' (live rolling rate) | 'registry'
+            # (camwatch-cameras measured cadence — warm-up fallback) | None.
             "rate_fps": rate_fps,
+            "rate_source": rate_source,
             "seq_first": seq0,
             "seq_last": projected[-1][6],
             "epoch_span": epoch_span,
@@ -703,7 +715,8 @@ class CaptureWorker(threading.Thread):
         if self._homog is None:
             log.error(
                 "homography missing; grid-based trigger cannot run. "
-                "Build it with scripts/build_homography_from_marks.py."
+                "Calibrate the camera in the camwatch-cameras registry "
+                "(its self-contained tooling) and bump the dependency."
             )
             return
         crossing = GridCrossingDetector(
@@ -994,6 +1007,15 @@ class CaptureWorker(threading.Thread):
                         self._stream.received_fps()
                         if self._stream is not None else None
                     )
+                    rate_source = "received"
+                    if rate_fps is None:
+                        # Stream warm-up / post-reconnect: the rolling window
+                        # has <30s of coverage, so no live rate yet. Fall back
+                        # to the registry's measured cadence (ADR-015) instead
+                        # of reporting the speed unknown — same camera, same
+                        # quantity, measured offline from clean FTP clips.
+                        rate_fps = self._registry_cadence_fps
+                        rate_source = "registry"
                     traj_for_speed = list(self._trajectories.get(ev.track_id, ()))
                     if self._homog is not None:
                         speed_mph, n_speed_samples = _cadence_speed(
@@ -1082,6 +1104,10 @@ class CaptureWorker(threading.Thread):
                         clip_path=clip_path or None,
                         speed_mph=speed_mph,
                         speed_method=speed_method,
+                        # Camera provenance (ADR-013): the elected main camera
+                        # produced this pass. Stored per row so passes captured
+                        # before a main-camera switch keep the right camera.
+                        camera=self._cfg.camera.main_id,
                     )
                     # Hand off to the local enrichment service (non-blocking).
                     # High-confidence local matches will UPDATE the row before
@@ -1097,12 +1123,12 @@ class CaptureWorker(threading.Thread):
                         speed_str = (
                             f"{speed_mph:.2f} mph "
                             f"(cadence_seq over {n_speed_samples} samples"
-                            f" @ {rate_fps:.2f} fps)"
+                            f" @ {rate_fps:.2f} fps [{rate_source}])"
                         )
                     else:
                         speed_str = (
-                            "speed unavailable (too few samples, stream "
-                            "warm-up/reconnect, or trajectory rejected as "
+                            "speed unavailable (too few samples, pass spans "
+                            "a reconnect, or trajectory rejected as "
                             "spatially jumped)"
                         )
                     log.info(
@@ -1122,6 +1148,7 @@ class CaptureWorker(threading.Thread):
                                 speed_mph=speed_mph,
                                 speed_method=speed_method,
                                 rate_fps=rate_fps,
+                                rate_source=rate_source,
                             )
                         except Exception as e:  # noqa: BLE001
                             log.warning(

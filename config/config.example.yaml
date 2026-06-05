@@ -1,9 +1,11 @@
 camera:
-  host: 192.168.0.227
-  port: 554
-  path: /h264Preview_01_main          # main stream (2048x1536). Single-stream
-                                      # pipeline: YOLO + tracking + thumbnails
-                                      # all come from this one source.
+  main_id: cx810
+  #   The elected main camera (ADR-013): the registry camera that creates
+  #   passes. Camera facts — RTSP host/port/path, homography + lens model,
+  #   measured cadence — come from its camwatch-cameras profile (ADR-015);
+  #   only the election lives here. The camera must be electable
+  #   (pass_creation) and speed-calibrated, or startup refuses. Switching
+  #   cameras = change this key + restart the service.
   # static_frame_path: calibration_main_frame.jpg
   #   Optional dev/test mode. When set, the capture worker loops this JPEG
   #   at the camera's nominal rate instead of opening RTSP. Useful when the
