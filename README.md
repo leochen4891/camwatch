@@ -229,11 +229,32 @@ retention:     { recordings_days: 7, thumbs_days: 30, passes_days: 365 }
 clip:          { margin_s: 0.5, capture_min_mph: 0, capture_max_mph: 999 }
 preview:       { show_grid: true }
 capture:       { pause_at_night: true }
+metrics:       { endpoint: http://localhost:8428, interval_s: 15 }  # optional; omit to disable
 ```
 
 `device: auto` probes for CUDA, then falls back to CPU. `static_frame_path` (optional) loops a JPEG instead of opening RTSP, useful for dev/test when the live camera is in use elsewhere. Retention runs as three independent phases: clips (`.mp4`) age out first, then thumbnails (`.jpg`), then the pass-record rows themselves — so you can keep a year of speed data without keeping a year of video.
 
 Most are also editable in-app. Camera credentials in `.env` (`REOLINK_USER`, `REOLINK_PASS`).
+
+## Observability
+
+When `metrics.endpoint` names a VictoriaMetrics instance, a background
+pusher (`camwatch/metrics_push.py`) renders the in-process registry in
+Prometheus text format and POSTs it to `<endpoint>/api/v1/import/prometheus`
+every `interval_s` seconds. Emission is fail-open by design: a down or slow
+VM logs one warning and never blocks or breaks the capture path, and with no
+endpoint configured the push layer stays off entirely.
+
+Series are prefixed `camwatch_engine_` and carry the elected main camera as
+a `camera` label. The headline set: frame counters per stream (`rate()` =
+fps), YOLO inference and frame-lag histograms, queue depth, pass counters by
+direction/method, a pass-speed histogram (p95 speed is the dashboard's
+speeding indicator), RTSP reconnect causes, hub upload outcomes/latency/
+backlog, enrichment outcomes, and night-pause state.
+
+`dashboards/camwatch-engine.json` is the matching Grafana dashboard
+(file-provisioned on the production box; references its datasource through
+a dashboard variable, so it binds to any Prometheus-type datasource).
 
 ## Project layout
 
@@ -254,6 +275,7 @@ scripts/                  # calibration tooling, superseded by the registry
                           #   camwatch-tick.sh           hourly babysitter cron
                           #   enrich_apply.py            vehicle make/model fill
                           #   test_stream.py, timing diagnostics
+dashboards/               # Grafana dashboard JSON (file-provisioned in prod)
 docs/images/              # README screenshots
 ```
 

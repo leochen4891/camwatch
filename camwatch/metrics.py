@@ -30,6 +30,8 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from . import metrics_push as mp
+
 if TYPE_CHECKING:
     from .db import Database
 
@@ -91,6 +93,7 @@ class MetricsCollector:
 
     def record_frame(self, label: str) -> None:
         """One decoded frame on the named stream ('sub', 'main', 'yolo')."""
+        mp.FRAMES.inc(stream=label)
         with self._lock:
             b = self._bucket()
             b.frame_counts[label] = b.frame_counts.get(label, 0) + 1
@@ -98,12 +101,15 @@ class MetricsCollector:
     def record_stage(self, name: str, dt_s: float) -> None:
         """A per-frame stage duration ('yolo' is the one we surface; others
         are accepted but currently ignored by the flush)."""
+        if name == "yolo":
+            mp.INFERENCE.observe(dt_s)
         with self._lock:
             b = self._bucket()
             b.stage_durations_ms.setdefault(name, []).append(dt_s * 1000.0)
 
     def record_lag(self, dt_s: float) -> None:
         """now - frame.ts at the moment the consumer picked it up."""
+        mp.FRAME_LAG.observe(dt_s)
         with self._lock:
             b = self._bucket()
             b.lag_ms.append(dt_s * 1000.0)
@@ -112,9 +118,16 @@ class MetricsCollector:
         """Reader→consumer queue occupancy at drain time, per stream.
         Emitted as `queue_depth_<label>` so main and sub can be charted
         side-by-side."""
+        mp.QUEUE_DEPTH.set(depth, queue=label)
         with self._lock:
             b = self._bucket()
             b.queue_depths.setdefault(label, []).append(int(depth))
+
+    def record_reconnect(self, reason: str) -> None:
+        """An RTSP session reopen, by bounded cause ('open_failed',
+        'decode_failures', 'demux_error'). Push-registry only — the SQLite
+        buckets never carried this and the UI doesn't read it."""
+        mp.RTSP_RECONNECTS.inc(reason=reason)
 
     def record_buffer_lag(self, dt_s: float) -> None:
         """Legacy: was written by the dual-stream main-stream buffer (now
@@ -129,6 +142,7 @@ class MetricsCollector:
         We keep only the MAX per bucket — that's the burstiness signal: a
         healthy stream maxes out near its frame interval, a stalled-then-burst
         stream spikes to multi-second values."""
+        mp.FRAME_GAP.observe(dt_s, stream=label)
         ms = dt_s * 1000.0
         with self._lock:
             b = self._bucket()

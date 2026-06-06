@@ -103,6 +103,11 @@ class Config:
     # boundary. Set both to 0 for the original "anchor at grid edge" behavior.
     recorder_south_anchor_inset_ft: float = 0.0  # north of Y_MIN
     recorder_north_anchor_inset_ft: float = 0.0  # south of Y_MAX
+    # Observability contract: push metrics to VictoriaMetrics at this base
+    # URL (the pusher appends /api/v1/import/prometheus). None/empty
+    # disables the push entirely; in-memory collection still runs.
+    metrics_endpoint: str | None = None
+    metrics_interval_s: float = 15.0
 
     def load_calibration(self) -> CalibrationConfig | None:
         if not self.calibration_path.exists():
@@ -258,4 +263,6 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         recorder_north_anchor_inset_ft=float(
             ((raw.get("recorder") or {}).get("anchor_inset_ft") or {}).get("north", 0.0) or 0.0
         ),
+        metrics_endpoint=(raw.get("metrics") or {}).get("endpoint") or None,
+        metrics_interval_s=float((raw.get("metrics") or {}).get("interval_s", 15.0) or 15.0),
     )

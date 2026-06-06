@@ -64,3 +64,11 @@ recorder:
   anchor_inset_ft:
     south: 0               # north of Y_MIN; 0 keeps anchor at the grid south edge
     north: 0               # south of Y_MAX; 0 keeps anchor at the grid north edge
+
+metrics:
+  # Observability push (fail-open: a down VM never affects capture).
+  # Base URL of the VictoriaMetrics instance; the service POSTs Prometheus
+  # text to <endpoint>/api/v1/import/prometheus every interval_s seconds.
+  # Omit or leave empty to disable the push entirely.
+  endpoint: http://localhost:8428
+  interval_s: 15

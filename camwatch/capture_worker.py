@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from . import metrics_push as mp
 from .capture import open_frame_source
 from .config import Config
 from .db import Database
@@ -477,6 +478,7 @@ class CaptureWorker(threading.Thread):
                 buffer_hours=_DAYLIGHT_BUFFER_HOURS_DEFAULT,
             ):
                 log.info("enrich pass=%d skipped: outside daylight window", pass_id)
+                mp.ENRICHMENT.inc(status="skipped_night")
                 return
         except Exception as e:  # noqa: BLE001
             log.warning("daylight check failed for pass=%d: %s (proceeding anyway)",
@@ -517,9 +519,11 @@ class CaptureWorker(threading.Thread):
                         data.get("make"), data.get("model"),
                         float(data.get("top_sim") or 0.0),
                     )
+                    mp.ENRICHMENT.inc(status="ok")
                     return
         except Exception as e:  # noqa: BLE001
             log.warning("enrich pass=%d failed: %s", pass_id, e)
+            mp.ENRICHMENT.inc(status="error")
 
     def _save_pass_trajectory_jsonl(
         self,
@@ -882,7 +886,9 @@ class CaptureWorker(threading.Thread):
                 # active, skip YOLO/trigger/recorder for this frame and
                 # update the preview with the raw IR feed (no annotations).
                 self._night_mode = night_detector.update(fr.image)
-                if self._night_mode and self._cfg.pause_at_night:
+                paused = self._night_mode and self._cfg.pause_at_night
+                mp.CAPTURE_PAUSED.set(1.0 if paused else 0.0)
+                if paused:
                     if self._preview is not None:
                         self._preview.update(fr.image, [])
                     last_loop_t = loop_t
@@ -1109,6 +1115,15 @@ class CaptureWorker(threading.Thread):
                         # before a main-camera switch keep the right camera.
                         camera=self._cfg.camera.main_id,
                     )
+                    # Observability: pass counters + speed distribution. The
+                    # dashboard derives passes/hour and p95 speed from these.
+                    mp.PASSES.inc(
+                        direction=str(ev.direction), method=speed_method or "none",
+                    )
+                    if speed_mph is not None:
+                        mp.PASS_SPEED.observe(speed_mph, direction=str(ev.direction))
+                        if speed_mph >= self._cfg.alert_threshold_mph:
+                            mp.ALARMS.inc(direction=str(ev.direction))
                     # Hand off to the local enrichment service (non-blocking).
                     # High-confidence local matches will UPDATE the row before
                     # the user ever sees it; low-confidence ones leave the

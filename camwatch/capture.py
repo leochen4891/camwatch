@@ -192,6 +192,8 @@ class RtspStream:
                     "stream %s: open failed, retrying in %.1fs (%s)",
                     self._log_label, self._reconnect_delay_s, e,
                 )
+                if self._metrics is not None:
+                    self._metrics.record_reconnect("open_failed")
                 time.sleep(self._reconnect_delay_s)
                 continue
             container = self._container
@@ -252,6 +254,8 @@ class RtspStream:
                                     "reconnecting (%s)",
                                     self._log_label, reader_failures[0], e,
                                 )
+                                if self._metrics is not None:
+                                    self._metrics.record_reconnect("decode_failures")
                                 return
                             continue
                         for frame in decoded:
@@ -324,6 +328,8 @@ class RtspStream:
                         "stream %s: demux/decode error, reconnecting (%s)",
                         self._log_label, e,
                     )
+                    if self._metrics is not None:
+                        self._metrics.record_reconnect("demux_error")
 
             reader_thread = threading.Thread(target=reader, name="rtsp-reader", daemon=True)
             reader_thread.start()

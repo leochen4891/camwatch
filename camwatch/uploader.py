@@ -24,6 +24,7 @@ from pathlib import Path
 
 import httpx
 
+from . import metrics_push as mp
 from .config import Config
 from .db import Database, Pass
 
@@ -206,6 +207,14 @@ class Uploader:
 
     def _upload_batch(self) -> int:
         with self.db.connect() as conn:
+            pending = conn.execute(
+                """SELECT COUNT(*) FROM passes
+                   WHERE deleted = 0
+                     AND uploaded_at IS NULL
+                     AND clip_path IS NOT NULL
+                     AND id >= ?""",
+                (MIN_PASS_ID,),
+            ).fetchone()[0]
             rows = conn.execute(
                 """SELECT * FROM passes
                    WHERE deleted = 0
@@ -216,6 +225,7 @@ class Uploader:
                    LIMIT ?""",
                 (MIN_PASS_ID, BATCH_SIZE),
             ).fetchall()
+        mp.UPLOAD_PENDING.set(pending)
 
         count = 0
         for row in rows:
@@ -343,6 +353,7 @@ class Uploader:
             except httpx.HTTPError:
                 pass
 
+        t0 = time.monotonic()
         try:
             with httpx.Client(timeout=60.0) as client:
                 resp = client.post(
@@ -351,9 +362,13 @@ class Uploader:
                     files=files,
                 )
                 if resp.status_code in (200, 201):
+                    mp.UPLOADS.inc(status="ok")
+                    mp.UPLOAD_SECONDS.observe(time.monotonic() - t0)
                     return True
                 log.warning("upload pass %d failed: %d %s", p.id, resp.status_code, resp.text[:200])
+                mp.UPLOADS.inc(status="http_error")
                 return False
         except httpx.HTTPError as e:
             log.warning("upload pass %d network error: %s", p.id, e)
+            mp.UPLOADS.inc(status="network_error")
             return False

@@ -28,6 +28,7 @@ from .capture_worker import CaptureWorker
 from .config import Config, load_config
 from .db import Database, Pass
 from .metrics import BUCKET_S as METRICS_BUCKET_S, MetricsCollector
+from .metrics_push import MetricsPusher
 from .preview import PreviewBuffer
 
 log = logging.getLogger(__name__)
@@ -234,6 +235,17 @@ def make_app(
     async def lifespan(app: FastAPI):
         metrics = MetricsCollector(db)
         metrics.start()
+        # Observability push (fail-open): only runs when config names a
+        # VictoriaMetrics endpoint. The in-memory registry is populated
+        # either way — instrumentation costs the same with or without it.
+        pusher = None
+        if cfg.metrics_endpoint:
+            pusher = MetricsPusher(
+                cfg.metrics_endpoint,
+                camera=cfg.camera.main_id,
+                interval_s=cfg.metrics_interval_s,
+            )
+            pusher.start()
         worker = CaptureWorker(
             cfg, db, preview=preview, profile=profile, metrics=metrics,
         )
@@ -266,6 +278,8 @@ def make_app(
             worker.stop()
             worker.join(timeout=10)
             metrics.stop()
+            if pusher:
+                pusher.stop()
 
     app = FastAPI(lifespan=lifespan, title="camwatch")
     if STATIC_DIR.exists():
