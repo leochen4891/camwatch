@@ -276,6 +276,12 @@ ENRICHMENT = _counter(
     "Local enricher handoffs by outcome (ok / error / skipped_night).",
     ("status",),
 )
+STAMP_CORRECTION = _histogram(
+    "camwatch_engine_stamp_correction_seconds",
+    "Per-pass captured_at correction (now - grid-entry frame ts): transit "
+    "plus processing staleness. Uptime-stable small values = stamp fix OK.",
+    (1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0),
+)
 CAPTURE_PAUSED = _gauge(
     "camwatch_engine_capture_paused",
     "1 while detection is paused (night/IR mode), else 0.",
