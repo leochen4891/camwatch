@@ -106,7 +106,7 @@ class RtspStream:
         # frame loss given the 3060 Ti's headroom; if the queue ever fills
         # up it means processing is genuinely behind, not just bursty —
         # the warning log surfaces that.
-        queue_size: int = 150,
+        queue_size: int = 40,
         # Backlog-depth warning fires when drained depth stays above
         # `warn_threshold * queue_size` for `warn_sustain_s` consecutive
         # consumer cycles. Defaults: half the queue, sustained 5s. A
