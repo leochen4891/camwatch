@@ -145,34 +145,34 @@ _MAX_PLAUSIBLE_MPH = 55.0
 
 
 def _stamp_captured_at(
-    entry_ts: float,
+    exit_ts: float,
     now_mono: float,
     now_wall: datetime,
 ) -> "tuple[datetime, float]":
-    """Wall-clock stamp for a pass, anchored to the grid-entry frame.
+    """Wall-clock stamp for a pass, anchored to the grid-exit frame.
 
-    `entry_ts` is the entry frame's stream-timeline timestamp (PTS
+    `exit_ts` is the exit frame's stream-timeline timestamp (PTS
     re-anchored to time.monotonic() at session start — the same timeline
-    as `now_mono`), so `now_mono - entry_ts` is how long ago the vehicle
-    entered the grid: in-grid transit plus however stale the processing
-    loop is running. Subtracting it from the current wall clock stamps
-    the pass at road time, not processing time.
+    as `now_mono`), so `now_mono - exit_ts` is how stale the processing
+    loop was running when it emitted the event. Subtracting it from the
+    current wall clock stamps the pass at road time, not processing time.
 
-    SEMANTICS (cutover documented in the pass log + manifest):
-    `captured_at` = the moment the vehicle ENTERED the measurement grid.
-    Before this change it was wall clock at event processing — grid exit
-    plus an uptime-dependent staleness term measured at 0-18 s (frames
-    queue behind the RTSP reader; lag_ms_p50 grew ~1 s/h of uptime and
-    reset on restart). Consumers that anchored on captured_at - elapsed_s
-    should anchor on captured_at directly once their window contract is
-    updated (coordinated via DATA-CONTRACTS, not here).
+    SEMANTICS (DATA-CONTRACTS rule 7 cutover note): `captured_at` = the
+    moment the vehicle EXITED the measurement grid, which is what the
+    old stamp always approximated — minus the uptime-dependent staleness
+    term measured at 0-18 s (frames queue behind the RTSP reader;
+    lag_ms_p50 grew ~1 s/h of uptime and reset on restart). Exit
+    anchoring keeps every consumer formula valid as-is: captured_at -
+    elapsed_s remains grid entry, now exactly instead of approximately.
+    (Entry anchoring was considered and rejected — it would have made
+    that standing anchor double-subtract.)
 
     The correction is clamped at 0 so a pathological timeline can only
     leave the old behavior, never stamp into the future. Returns
     (stamp, correction_s) — the correction is logged per pass and is the
     live evidence that the staleness term is gone.
     """
-    correction_s = max(0.0, now_mono - entry_ts)
+    correction_s = max(0.0, now_mono - exit_ts)
     return now_wall - timedelta(seconds=correction_s), correction_s
 
 
@@ -693,11 +693,12 @@ class CaptureWorker(threading.Thread):
             "rate_fps": rate_fps,
             "rate_source": rate_source,
             # captured_at semantics (cutover at this field's introduction):
-            # stamped at grid ENTRY (wall clock minus stamp_correction_s,
-            # where the correction = now - entry frame ts at emission).
-            # Rows whose manifest lacks this field used processing-time
-            # stamps (grid exit + 0-18s uptime-dependent staleness).
-            "stamp_source": "grid_entry_pts",
+            # stamped at grid EXIT (wall clock minus stamp_correction_s,
+            # where the correction = now - exit frame ts at emission), so
+            # captured_at - elapsed_s = grid entry exactly (DATA-CONTRACTS
+            # rule 7). Rows whose manifest lacks this field used
+            # processing-time stamps (exit + 0-18s uptime staleness).
+            "stamp_source": "grid_exit_pts",
             "stamp_correction_s": stamp_correction_s,
             "seq_first": seq0,
             "seq_last": projected[-1][6],
@@ -1035,7 +1036,7 @@ class CaptureWorker(threading.Thread):
                         self._trajectories.pop(ev.track_id, None)
                         continue
                     captured_at, stamp_correction_s = _stamp_captured_at(
-                        ev.t_a, time.monotonic(), datetime.now().astimezone(),
+                        ev.t_b, time.monotonic(), datetime.now().astimezone(),
                     )
                     stamp = captured_at.strftime("%Y%m%dT%H%M%S")
                     mp.STAMP_CORRECTION.observe(stamp_correction_s)
@@ -1191,7 +1192,7 @@ class CaptureWorker(threading.Thread):
                         )
                     log.info(
                         "pass id=%d track=%d %s %s %s  elapsed=%.3fs  clip=%s  "
-                        "stamp=grid_entry-%.2fs",
+                        "stamp=grid_exit-%.2fs",
                         pid, ev.track_id, ev.cls_name, ev.direction,
                         speed_str, ev.elapsed_s, clip_name, stamp_correction_s,
                     )

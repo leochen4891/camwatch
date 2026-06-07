@@ -278,9 +278,9 @@ ENRICHMENT = _counter(
 )
 STAMP_CORRECTION = _histogram(
     "camwatch_engine_stamp_correction_seconds",
-    "Per-pass captured_at correction (now - grid-entry frame ts): transit "
-    "plus processing staleness. Uptime-stable small values = stamp fix OK.",
-    (1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0),
+    "Per-pass captured_at correction (now - grid-exit frame ts): processing "
+    "staleness at emission. Uptime-stable small values = stamp fix OK.",
+    (0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0),
 )
 CAPTURE_PAUSED = _gauge(
     "camwatch_engine_capture_paused",
