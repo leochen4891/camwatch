@@ -264,7 +264,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "95th percentile recorded speed over 24h \u2014 the speeding-situation indicator. Red at/above the 40 mph alert threshold.",
+      "description": "95th percentile recorded speed over 24h — the speeding-situation indicator. Red at/above the 40 mph alert threshold.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1098,6 +1098,177 @@
       ],
       "title": "Enrichment per hour",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Service cgroup memory as a percent of its MemoryMax cap (cgroup-v2 memory.current / memory.max). Red >90% = pre-OOM; this is the signal behind the camwatch-engine-mem-high alert.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 36
+      },
+      "id": 17,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "100 * camwatch_engine_memory_bytes{camera=~\"$camera\"} / camwatch_engine_memory_limit_bytes{camera=~\"$camera\"}",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Memory % of cap",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Service cgroup memory used vs configured cap (cgroup-v2 memory.current vs memory.max). Headroom is the gap between the two lines.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cap"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 20,
+        "x": 4,
+        "y": 36
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "camwatch_engine_memory_bytes{camera=~\"$camera\"}",
+          "legendFormat": "used",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "camwatch_engine_memory_limit_bytes{camera=~\"$camera\"}",
+          "legendFormat": "cap",
+          "refId": "B"
+        }
+      ],
+      "title": "Memory used vs cap",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -1151,5 +1322,5 @@
   "timezone": "browser",
   "title": "CamWatch Engine",
   "uid": "camwatch-engine",
-  "version": 1
+  "version": 2
 }

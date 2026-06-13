@@ -32,6 +32,7 @@ module-level objects; call sites import and update them directly, e.g.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -290,6 +291,70 @@ START_TIME = _gauge(
     "camwatch_engine_start_time_seconds",
     "Unix time the capture service started (uptime = time() - this).",
 )
+MEMORY_BYTES = _gauge(
+    "camwatch_engine_memory_bytes",
+    "Resident memory of the capture-service cgroup (cgroup-v2 memory.current): "
+    "threads + child decoders + page cache — the figure systemd's MemoryMax "
+    "bounds and the OOM killer watches, not a single process's RSS.",
+)
+MEMORY_LIMIT_BYTES = _gauge(
+    "camwatch_engine_memory_limit_bytes",
+    "Configured cgroup memory cap (cgroup-v2 memory.max / unit MemoryMax); "
+    "unset when unlimited. Headroom = 1 - memory_bytes / memory_limit_bytes.",
+)
+
+
+# ---------- self-memory sampling (cgroup v2) ----------
+
+_CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _cgroup_dir() -> str | None:
+    """This process's own cgroup-v2 directory, or None on v1/unknown.
+
+    cgroup v2 exposes a single `0::<path>` line; under systemd that path is
+    the service's own slice (e.g. ``/system.slice/camwatch.service``), so the
+    service can read its own ``memory.current``/``memory.max`` from inside.
+    """
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[0] == "0":
+                    return _CGROUP_ROOT + parts[2]
+    except OSError:
+        pass
+    return None
+
+
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def sample_memory() -> None:
+    """Refresh the memory gauges from the service cgroup. Fail-open: any
+    read error (cgroup v1, missing files, permissions) leaves the gauges at
+    their prior value rather than raising into the push loop."""
+    d = _cgroup_dir()
+    if d is None:
+        return
+    cur = _read_int(os.path.join(d, "memory.current"))
+    if cur is not None:
+        MEMORY_BYTES.set(cur)
+    try:
+        with open(os.path.join(d, "memory.max")) as f:
+            raw = f.read().strip()
+    except OSError:
+        raw = ""
+    if raw and raw != "max":
+        try:
+            MEMORY_LIMIT_BYTES.set(int(raw))
+        except ValueError:
+            pass
 
 
 # ---------- the pusher ----------
@@ -344,6 +409,7 @@ class MetricsPusher:
     def push_once(self) -> bool:
         """One render+POST. Never raises; returns success for tests/logs."""
         try:
+            sample_memory()
             body = self._registry.render(self._base_labels)
             with httpx.Client(timeout=5.0) as client:
                 resp = client.post(

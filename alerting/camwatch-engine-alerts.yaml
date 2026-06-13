@@ -1,0 +1,56 @@
+# Grafana alert rules for the camwatch capture engine (file-provisioned).
+#
+# Provisioned on lei-ubuntu at
+#   /etc/grafana/provisioning/alerting/camwatch-engine-alerts.yaml
+# (committed here as code per the observability contract; copy this file to
+# that path and reload Grafana to apply). Datasource uid P4169E866C3094E38
+# is the local VictoriaMetrics datasource, same as host-alerts.yaml.
+#
+# Added 2026-06-13 (mem-cap-and-alert): the engine cgroup sat at ~99% of its
+# MemoryMax for 18h, surviving only by swap reclaim. This fires before an
+# actual cgroup OOM so the cap can be raised (or a leak investigated) rather
+# than discovered from a capture gap.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: camwatch-engine
+    folder: CamWatch
+    interval: 1m
+    rules:
+      - uid: camwatch-engine-mem-high
+        title: CamWatch engine memory near cap
+        condition: C
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            camwatch.service cgroup memory has been above 90% of its
+            MemoryMax for 5 minutes (camwatch_engine_memory_bytes /
+            camwatch_engine_memory_limit_bytes). Pre-OOM: check the
+            "Memory used vs cap" panel on the CamWatch Engine dashboard,
+            then raise MemoryMax in
+            /etc/systemd/system/camwatch.service.d/memory-limit.conf or
+            investigate a leak. RestartSec=30 will auto-restart on an
+            actual OOM kill, but capture drops during the gap.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: P4169E866C3094E38
+            model:
+              expr: 100 * camwatch_engine_memory_bytes / camwatch_engine_memory_limit_bytes
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: C
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              refId: C
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [90]}

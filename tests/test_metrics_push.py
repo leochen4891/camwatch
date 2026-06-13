@@ -176,6 +176,49 @@ def test_collector_feeds_push_registry(tmp_path):
     assert 'camwatch_engine_frame_gap_seconds_bucket{camera="cx810",le="0.1",stream="pytest_stream"} 1' in out
 
 
+# ---------- cgroup memory sampling ----------
+
+def test_sample_memory_reads_cgroup(tmp_path, monkeypatch):
+    """sample_memory reads memory.current/.max from the process's own
+    cgroup-v2 dir and sets the gauges (bytes, unlabeled)."""
+    cg = tmp_path / "system.slice" / "camwatch.service"
+    cg.mkdir(parents=True)
+    (cg / "memory.current").write_text("7000000000\n")
+    (cg / "memory.max").write_text("8589934592\n")  # 8G
+    monkeypatch.setattr(mp, "_cgroup_dir", lambda: str(cg))
+
+    mp.MEMORY_BYTES.set(0)
+    mp.MEMORY_LIMIT_BYTES.set(0)
+    mp.sample_memory()
+    out = mp.REGISTRY.render({"camera": "cx810"})
+    assert 'camwatch_engine_memory_bytes{camera="cx810"} 7000000000' in out
+    assert 'camwatch_engine_memory_limit_bytes{camera="cx810"} 8589934592' in out
+
+
+def test_sample_memory_is_fail_open(monkeypatch):
+    """A missing/unreadable cgroup must never raise into the push loop."""
+    monkeypatch.setattr(mp, "_cgroup_dir", lambda: None)
+    mp.sample_memory()  # no cgroup → no-op, no exception
+
+    monkeypatch.setattr(mp, "_cgroup_dir", lambda: "/nonexistent/cgroup/path")
+    mp.sample_memory()  # files absent → no-op, no exception
+
+
+def test_sample_memory_ignores_unlimited_max(tmp_path, monkeypatch):
+    """memory.max == 'max' (unlimited) leaves the limit gauge untouched."""
+    cg = tmp_path / "slice"
+    cg.mkdir()
+    (cg / "memory.current").write_text("1234\n")
+    (cg / "memory.max").write_text("max\n")
+    monkeypatch.setattr(mp, "_cgroup_dir", lambda: str(cg))
+
+    mp.MEMORY_LIMIT_BYTES.set(999)
+    mp.sample_memory()
+    out = mp.REGISTRY.render({"camera": "cx810"})
+    assert 'camwatch_engine_memory_bytes{camera="cx810"} 1234' in out
+    assert 'camwatch_engine_memory_limit_bytes{camera="cx810"} 999' in out  # unchanged
+
+
 def test_default_config_disables_push():
     """No `metrics:` section in config = no endpoint = the server never
     starts a pusher (Config default is None)."""
