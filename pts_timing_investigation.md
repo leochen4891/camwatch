@@ -2,7 +2,7 @@
 
 **Date:** June 3, 2026 (Wednesday)
 **Camera under investigation:** Reolink CX810, 4K main stream, the active CamWatch producer
-**Status:** Investigation complete. Root cause settled. Fix direction decided; implementation pending.
+**Status:** Investigation complete. Root cause settled. **Fix implemented and deployed the same evening** (commit `8fbbce7` on `fix/speed-trustworthiness-guards`): `speed_method = cadence_seq`, the seq-delta variant of section 9, with `received_fps()` requiring 30 s of coverage to ride out the post-restart catch-up burst. First live passes verified at +1.4 to +2.7 mph against camera-native truth.
 
 ---
 
@@ -189,22 +189,43 @@ The guards (PR #2) remain useful as a stopgap for extreme inflation but are stru
 
 ## 9. The fix
 
-### Decided direction
+### Decided direction (empirically verified, see below): fully standalone
 
-Compute speed from the reliable signal (geometry) against the measured cadence, ignoring RTSP timestamps:
+Compute speed from the reliable signal (geometry) against a live-measured cadence, ignoring RTSP timestamps. No external dependency (no FTP at runtime), no hardcoded constant:
 
 ```
-speed = median(per-frame displacement) x measured_cadence_fps x 2.2369
+R_live    = rolling mean of received-frame rate (~60 s window, desktop clock)
+speed_mph = total_trajectory_distance_m / ((n_frames - 1) / R_live) x 2.2369
 ```
 
-- The median absorbs both detection jitter and genuinely dropped frames (a dropped frame doubles one step, which the median discards). Displacement-based drop detection (a step that is a clean multiple of the local median) can refine the time base if needed.
-- `measured_cadence_fps` is **13.8** for the CX810 today, confirmed by three independent methods (burn-in counting, FTP container PTS, and consistency across 4+ clips). It must be a measured value, re-checked when camera settings change, never the nominal setting.
-- The FTP recordings remain flowing and act as a continuous validation oracle: camera-native timestamps are exact, so any drift between the geometry method and FTP-derived speeds flags a cadence change.
+- Plain total-distance over total-inferred-time. The full averaging over ~20 steps gives the lowest error; a single order statistic (median step) throws away averaging power, and explicit drop correction makes things worse (verified below).
+- `R_live` is the decoder's received-frame rate, already measured by the reader thread against the desktop's own clock (the `raw read fps` 10 s samples / `fps_main` metric). Around validated passes it reads 13.84-13.90 at the "15 fps" setting, matching the implied cadence (13.84) and the FTP container rate (13.75-13.79). An earlier concern that the decoded rate runs ~6% above the trajectory cadence turned out to be a measurement artifact: the 14.7 figure was a 2-day p50 contaminated by the deliberate 12/20/25 fps experiment windows. Use a short rolling window around the pass, never a long mixed-settings average, and never the nominal camera setting.
+- Optional robustness upgrade: store the received-frame sequence number (`Frame.seq` already exists in capture.py) on each trajectory point and divide by the seq delta instead of (n_frames - 1). This makes the time base immune to YOLO detection misses inside a pass. In validation, misses were zero and both variants gave identical results; the seq version is insurance for harder conditions (small/distant cars, worse light).
+- Under pipeline overload (queue dropping frames before YOLO), the relevant rate is the tracker-input rate (`fps_yolo`); at healthy load it equals `fps_main`.
+- The FTP recordings are demoted to a development-time measuring stick and optional offline audit/refiner; the runtime path has no dependency on them.
 
-### Open design questions (for the implementation discussion)
+### Empirical verification (same day, 10 matched pass/FTP pairs)
 
-1. Estimator detail: median-step times cadence vs total-distance over (frame-count/cadence); behavior for accelerating or very slow vehicles (e.g. pass 13007 at ~5 mph over 90 frames).
-2. Where the cadence constant lives (config value vs periodically measured) and how a camera-settings change invalidates it.
+Ground truth was computed independently per pair by running YOLO plus the same homography over the camera-native FTP clip and dividing path length by the honest camera timestamps. Errors of each candidate against that truth:
+
+| estimator | MAE (mph) | bias | worst |
+|---|---|---|---|
+| stored PTS headline (current system) | 6.2 | -5.9 | -13.0 |
+| median step x 13.8 | 1.0 | -0.2 | -2.3 |
+| **naive sum: distance / ((n-1)/13.8)** | **0.7** | **-0.1** | **+1.7** |
+| drop-corrected sum (median classifies 1 vs 2 periods) | 1.5 | -1.3 | -4.1 |
+
+Findings:
+
+- The naive sum wins (about 2.5% typical error). The drop-corrected variant over-fires: it misclassifies legitimately large steps (speed variation, perspective, detection jitter) as dropped frames and systematically under-reports. True drops are too rare (about 2.3% of steps; about 23% of passes contain at least one, measured by a displacement audit over 1,480 passes) for the correction to pay for its false positives. Keep the 2x-step signature as an anomaly flag only, never as a time adjustment.
+- Implied cadence across the pairs (the value that makes the naive estimator match truth): median about 13.84, agreeing with the FTP container rate (13.75-13.79), the burn-in count (mode 14), and the journal's live received-fps around the same passes (13.84-13.90). The 14.7 reader-thread figure quoted earlier was a 2-day p50 contaminated by the experiment windows, not a real gap.
+- Frame-loss audit over the past days: pts advance 1.00x (no systemic upstream loss); backlog warnings and `fps_yolo < fps_main` buckets occur only during the deliberate 20-25 fps overload experiments; residual drops are camera-side and invisible to logs, detectable only via displacement.
+- Second round (standalone live-rate variant, emulated via the camwatch clips as the received-frame record plus journal `raw read fps` as `R_live`): pass 13065 truth 27.2 vs 27.2 (-0.0); pass 13073 truth 34.4 vs 36.3 (+1.9, 5.5%). The seq-delta and detected-count variants were identical on both (zero in-pass detection misses), and since `R_live` ~= 13.85 ~= the calibrated 13.8, the 10-pair shoot-out above validates the live variant by equivalence. Both rounds land well inside the project's stated 10% accuracy requirement (an offline FTP-based refiner can recover exact timing later if ever needed).
+
+### Remaining design questions (for the implementation discussion)
+
+1. Behavior for accelerating or very slow vehicles (for example pass 13007 at ~5 mph over 90 frames); the total-distance estimator handles average speed correctly, but entry/exit detection jitter matters more at low speed.
+2. Rolling-window details for `R_live` (window length ~60 s; switch to `fps_yolo` under queue overload; behavior across stream reconnects), and adding `Frame.seq` to trajectory points for the seq-delta variant.
 3. Validity in low light: auto-exposure can lengthen integration time and change the true cadence (out of scope for v1 daytime use, but should fail loudly, not silently).
 4. Whether to recompute historical passes (the per-era cadence for E1/CX410W eras is unknown) or fix forward only.
 5. Disposition of the shape guards once geometry-speed ships (retire vs keep as anomaly flags).
@@ -244,7 +265,9 @@ Compute consecutive deltas; healthy is a tight cluster at 1/fps, corrupted shows
 
 ## Appendix B: Key reference numbers (June 3, 2026)
 
-- CX810 true cadence: **~13.8 fps** (recording PTS 13.75-13.79; burn-in mode 14; nominal setting 15).
+- CX810 true cadence: **~13.8 fps** (recording PTS 13.75-13.79; burn-in mode 14; shoot-out implied median 13.84; nominal setting 15; reader-thread decoded rate ~14.7 is NOT the trajectory cadence).
+- Estimator shoot-out vs camera-native truth (10 pairs): naive sum MAE 0.7 mph; median x cadence 1.0; drop-corrected 1.5 (rejected); stored PTS 6.2.
+- Within-pass dropped frames: ~2.3% of steps (1-frame signature), ~0.7% (2+), ~23% of passes affected (displacement audit, 1,480 passes).
 - CX810 recording dt quantization: ~45.5 ms units (4096 ticks at 90 kHz); observed dt values 25/45/91/137 ms.
 - CX810 camera settings at time of measurement: Clear 3840x2160, 15 fps, 6144 kbps, H.265; Fluent 640x360, 10 fps, H.264; Frame Rate Mode Constant.
 - Guards: implied-fps 35, arc ratio 1.4, exit descent 8%, magnitude ceiling 55 mph, min samples 5.
