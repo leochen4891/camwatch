@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 from collections import deque
 from collections.abc import Iterator
@@ -226,6 +227,11 @@ class Candidate:
     exit_path: str | None = None
     trajectory_path: str | None = None
     skipped_reason: str | None = None
+    # Set only on the --commit path: the real camwatch.db row id assigned by
+    # insert_pass (this is the engine_pass_id the hub keys on), and the hub
+    # upload outcome ("uploaded" | "already_present" | "failed: ...").
+    committed_pass_id: int | None = None
+    upload_status: str | None = None
 
 
 def _existing_pass_nearby(
@@ -262,6 +268,36 @@ def _existing_pass_nearby(
     return f"pass #{row['id']} @ {row['captured_at']}"
 
 
+def _hub_has_pass(
+    cloud_url: str, api_key: str, engine_pass_id: int, captured_at: datetime,
+) -> bool:
+    """True if the hub already serves a pass with this engine_pass_id.
+
+    Hub-side idempotency: lets a re-run that re-reaches a pass whose DB row
+    exists but whose upload previously failed (uploaded_at still NULL) avoid
+    a redundant POST. We query GET /api/passes over a tight window around the
+    candidate's captured_at (the list is keyed by engine_pass_id == id) and
+    look for the id. On any error we return False (fail-open: prefer a
+    harmless re-POST, which the hub upserts on engine_pass_id, over skipping).
+    """
+    import httpx
+
+    since = (captured_at - timedelta(minutes=5)).astimezone(timezone.utc)
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                f"{cloud_url.rstrip('/')}/api/passes",
+                params={"range": "30d", "since": since.isoformat(timespec="seconds")},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if resp.status_code != 200:
+            return False
+        passes = resp.json().get("passes") or []
+    except (httpx.HTTPError, ValueError):
+        return False
+    return any(int(p.get("id", -1)) == int(engine_pass_id) for p in passes)
+
+
 class _CaptureWorkerShim(CaptureWorker):
     """A CaptureWorker we instantiate ONLY to borrow its instance methods
     (`_save_pass_trajectory_jsonl`, the anchor-inset picker logic) without
@@ -287,6 +323,10 @@ def reprocess_clip(
     gap_start: datetime,
     gap_end: datetime,
     dedup_window_s: float,
+    commit: bool = False,
+    uploader=None,
+    cloud_url: str | None = None,
+    api_key: str | None = None,
 ) -> list[Candidate]:
     """Run the full detect/grid/trajectory/speed/anchor pipeline over one
     clip. Returns the candidate passes (deduped, gap-bounded). This mirrors
@@ -448,30 +488,52 @@ def reprocess_clip(
                 rate_fps=rate_fps,
             )
 
-            # Assign a synthetic, deterministic pass id for the jsonl name so
-            # the dry-run artifacts are stable + inspectable and never collide
-            # with real positive ids. Negative, derived from captured_at.
-            synthetic_pid = -int(captured_at.timestamp())
-            try:
-                worker._save_pass_trajectory_jsonl(
-                    pid=synthetic_pid, ev=ev, traj=traj_for_speed,
-                    speed_mph=speed_mph, speed_method=speed_method,
-                    rate_fps=rate_fps, rate_source=rate_source,
-                    stamp_correction_s=0.0,
-                )
-                cand.trajectory_path = str(
-                    cfg.events_dir / f"pass_{synthetic_pid}.jsonl"
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("  trajectory jsonl failed for %s: %s", clip_name, e)
-
             base = str(recorder._dir / clip_name)[:-4]
             cand.thumb_path = base + ".jpg"
             cand.entry_path = base + ".entry.jpg"
             cand.exit_path = base + ".exit.jpg"
 
+            # The trajectory jsonl is keyed by pass id. In commit mode we
+            # INSERT first so the jsonl (and the loopback thumb/anchor lookup)
+            # use the REAL camwatch.db row id — exactly what the live engine
+            # does. In dry-run we use a deterministic synthetic NEGATIVE id so
+            # the scratch artifacts are stable, inspectable, and never collide
+            # with real positive ids.
+            if commit:
+                # Native row: looks exactly like a live cx810 pass. clip_path
+                # is the recorder's .mp4 base (whether or not a video was
+                # written, like _run); the loopback API strips .mp4 -> .jpg /
+                # .entry.jpg / .exit.jpg, and "has clip" is the .mp4's
+                # existence on disk.
+                pid = db.insert_pass(
+                    captured_at=captured_at.isoformat(timespec="seconds"),
+                    track_id=ev.track_id,
+                    cls_name=ev.cls_name,
+                    direction=ev.direction,
+                    elapsed_s=ev.elapsed_s,
+                    clip_path=str(recorder._dir / clip_name),
+                    speed_mph=speed_mph,
+                    speed_method=speed_method,
+                    camera=cfg.camera.main_id,
+                )
+                cand.committed_pass_id = pid
+            else:
+                pid = -int(captured_at.timestamp())
+
+            try:
+                worker._save_pass_trajectory_jsonl(
+                    pid=pid, ev=ev, traj=traj_for_speed,
+                    speed_mph=speed_mph, speed_method=speed_method,
+                    rate_fps=rate_fps, rate_source=rate_source,
+                    stamp_correction_s=0.0,
+                )
+                cand.trajectory_path = str(cfg.events_dir / f"pass_{pid}.jsonl")
+            except Exception as e:  # noqa: BLE001
+                log.warning("  trajectory jsonl failed for %s: %s", clip_name, e)
+
             log.info(
-                "  PASS %s -> %s %s %.1f mph  elapsed=%.2fs  (%d samples @ %.2f fps [%s])",
+                "  PASS%s %s -> %s %s %.1f mph  elapsed=%.2fs  (%d samples @ %.2f fps [%s])",
+                f" id={cand.committed_pass_id}" if commit else "",
                 clip_path.name,
                 captured_at.isoformat(timespec="seconds"),
                 ev.direction,
@@ -483,9 +545,61 @@ def reprocess_clip(
             entered_strict.pop(ev.track_id, None)
 
     # Flush the recorder so any still-active clip (and its thumb/anchors)
-    # gets finalized for this clip before we move on.
+    # gets finalized for this clip before we move on. After this returns, the
+    # .jpg / .entry.jpg / .exit.jpg for every emitted pass are on disk.
     recorder.flush()
+
+    # --- hub upload (commit only) ---------------------------------------
+    # Done AFTER flush so the loopback API (which the uploader's multipart
+    # reads anchors from) serves finalized images. We reuse the engine's own
+    # Uploader._upload_pass — the exact backfill multipart set (engine_pass_id
+    # + thumb + thumb_entry + thumb_exit + trajectory + clip) — then stamp
+    # uploaded_at so the live uploader never re-sends and re-runs skip.
+    if commit and uploader is not None:
+        from .db import Pass
+        for cand in candidates:
+            if cand.skipped_reason is not None or cand.committed_pass_id is None:
+                continue
+            pid = cand.committed_pass_id
+            # Hub-side idempotency: if this engine_pass_id is already served,
+            # don't re-POST — just stamp uploaded_at so it's marked done.
+            if cloud_url and api_key and _hub_has_pass(
+                cloud_url, api_key, pid, cand.captured_at
+            ):
+                cand.upload_status = "already_present"
+                _stamp_uploaded(db, pid)
+                log.info("  HUB pass %d already present; skipped POST", pid)
+                continue
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM passes WHERE id = ?", (pid,)
+                ).fetchone()
+            try:
+                ok = uploader._upload_pass(Pass.from_row(row))
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                log.warning("  HUB pass %d upload raised: %s", pid, e)
+            if ok:
+                cand.upload_status = "uploaded"
+                _stamp_uploaded(db, pid)
+                log.info("  HUB pass %d uploaded", pid)
+            else:
+                cand.upload_status = "failed"
+                log.warning("  HUB pass %d upload FAILED (uploaded_at left NULL "
+                            "for retry)", pid)
+
     return candidates
+
+
+def _stamp_uploaded(db: Database, pid: int) -> None:
+    """Mark a pass uploaded so the live uploader thread won't re-send it and
+    a re-run of this job treats it as done."""
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE passes SET uploaded_at = datetime('now') WHERE id = ?",
+            (pid,),
+        )
+        conn.commit()
 
 
 def _in_grid_track(t, homog: Homography) -> bool:
@@ -570,22 +684,24 @@ def main() -> None:
     )
     ap.add_argument(
         "--commit", action="store_true",
-        help="DANGER: actually write passes to camwatch.db (OFF by default). "
-             "This phase: leave OFF. Hub upload is a separate later step.",
+        help="Write recovered passes for real: INSERT into camwatch.db with "
+             "camera='cx810', place media into the live recordings/ + events/ "
+             "trees, and upload each to the hub via POST /api/ingest. Additive "
+             "and idempotent (DB +-dedup-window-s dedup + uploaded_at stamp + "
+             "hub-presence check). OFF by default (dry-run).",
+    )
+    ap.add_argument(
+        "--recordings-dir", default="recordings",
+        help="live recorder storage dir for --commit (default: recordings, "
+             "relative to the engine cwd; events/ is its sibling)",
     )
     ap.add_argument("--config", default="config/config.yaml")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
-    if args.commit:
-        raise SystemExit(
-            "--commit is intentionally NOT supported in this phase. DB inserts "
-            "and hub uploads are gated off pending review. Remove --commit."
-        )
-
     cfg = load_config(args.config)
-    db = Database()  # read-only use here (dedup query only); no inserts.
+    db = Database()
     homog = Homography.from_profile(cfg.camera.profile)
     if homog is None:
         raise SystemExit("cx810 homography failed to load; cannot reprocess")
@@ -593,16 +709,46 @@ def main() -> None:
     gap_start = datetime.fromisoformat(args.gap_start)
     gap_end = datetime.fromisoformat(args.gap_end)
 
-    # Artifacts land under the scratch dir so nothing touches the live
-    # recordings/ or events/ trees.
-    scratch = Path(args.scratch)
-    rec_dir = scratch / "recordings"
-    events_dir = scratch / "events"
-    rec_dir.mkdir(parents=True, exist_ok=True)
-    events_dir.mkdir(parents=True, exist_ok=True)
-    # Point the borrowed worker + recorder at the scratch dirs. The worker's
-    # _save_pass_trajectory_jsonl writes to recordings_dir.parent / "events".
-    cfg.events_dir = events_dir  # used only for our Candidate bookkeeping
+    uploader = None
+    cloud_url = None
+    api_key = None
+    if args.commit:
+        # Commit mode: write into the LIVE recordings/ + events/ trees so the
+        # loopback API + uploader + web serve the recovered passes exactly as
+        # native ones. events/ is the recorder dir's sibling (matches the live
+        # _save_pass_trajectory_jsonl convention and cfg.events_dir).
+        rec_dir = Path(args.recordings_dir)
+        events_dir = rec_dir.parent / "events"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        events_dir.mkdir(parents=True, exist_ok=True)
+        cfg.events_dir = events_dir
+        scratch = None
+
+        cloud_url = os.environ.get("CAMWATCH_CLOUD_URL")
+        api_key = os.environ.get("CAMWATCH_CLOUD_KEY")
+        if not cloud_url or not api_key:
+            raise SystemExit(
+                "--commit needs CAMWATCH_CLOUD_URL + CAMWATCH_CLOUD_KEY in the "
+                "environment (loaded from the repo .env by load_config) to "
+                "upload to the hub."
+            )
+        from .uploader import Uploader
+        # Constructed but NOT started: we drive _upload_pass directly, never
+        # the polling thread. Its constructor runs _ensure_columns so
+        # uploaded_at exists. enabled flag is irrelevant for direct calls.
+        uploader = Uploader(db, cfg, cloud_url, api_key, enabled=False)
+    else:
+        # Artifacts land under the scratch dir so nothing touches the live
+        # recordings/ or events/ trees.
+        scratch = Path(args.scratch)
+        rec_dir = scratch / "recordings"
+        events_dir = scratch / "events"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        events_dir.mkdir(parents=True, exist_ok=True)
+        # Point the borrowed worker + recorder at the scratch dirs. The
+        # worker's _save_pass_trajectory_jsonl writes to
+        # recordings_dir.parent / "events".
+        cfg.events_dir = events_dir  # used only for our Candidate bookkeeping
 
     cal = cfg.load_calibration()
     if cal is None:
@@ -617,8 +763,10 @@ def main() -> None:
 
     clips = discover_clips(Path(args.clips_root), args.days)[: args.limit]
     log.info(
-        "DRY-RUN: %d clip(s); recovery window (%s, %s); scratch=%s",
-        len(clips), gap_start.isoformat(), gap_end.isoformat(), scratch.resolve(),
+        "%s: %d clip(s); recovery window (%s, %s); recordings=%s events=%s",
+        "COMMIT" if args.commit else "DRY-RUN",
+        len(clips), gap_start.isoformat(), gap_end.isoformat(),
+        rec_dir.resolve(), events_dir.resolve(),
     )
 
     all_cands: list[Candidate] = []
@@ -629,6 +777,8 @@ def main() -> None:
                 clip, cfg, db, worker, rec_dir, detector, homog,
                 gap_start=gap_start, gap_end=gap_end,
                 dedup_window_s=args.dedup_window_s,
+                commit=args.commit, uploader=uploader,
+                cloud_url=cloud_url, api_key=api_key,
             )
         except Exception as e:  # noqa: BLE001
             log.exception("clip %s failed: %s", clip.name, e)
@@ -638,7 +788,8 @@ def main() -> None:
     emitted = [c for c in all_cands if c.skipped_reason is None]
     skipped = [c for c in all_cands if c.skipped_reason is not None]
 
-    print("\n==================== DRY-RUN SUMMARY ====================")
+    banner = "COMMIT SUMMARY" if args.commit else "DRY-RUN SUMMARY"
+    print(f"\n==================== {banner} ====================")
     print(f"clips processed : {len(clips)}")
     print(f"passes emitted  : {len(emitted)}")
     print(f"events skipped  : {len(skipped)} "
@@ -654,24 +805,45 @@ def main() -> None:
                 f"mean={sum(speeds)/len(speeds):.1f} max={max(speeds):.1f} "
                 f"(n_with_speed={len(speeds)}/{len(emitted)})"
             )
-    print("\nclip -> captured_at | dir | mph | elapsed_s")
-    for c in emitted:
-        print(
-            f"  {c.clip} -> {c.captured_at.isoformat(timespec='seconds')} | "
-            f"{c.direction} | "
-            f"{('%.1f' % c.speed_mph) if c.speed_mph is not None else 'None':>6} | "
-            f"{c.elapsed_s:.2f}"
-        )
-    print(f"\nartifacts under: {scratch.resolve()}")
-    print("  recordings/<clip>.jpg / .entry.jpg / .exit.jpg   (thumb + 3 anchors)")
-    print("  events/pass_<negid>.jsonl                        (speed-chart trajectory)")
-    print("\nNOTHING written to camwatch.db; NOTHING uploaded to the hub.")
+    if args.commit:
+        up_ok = sum(1 for c in emitted if c.upload_status in ("uploaded", "already_present"))
+        up_fail = sum(1 for c in emitted if c.upload_status == "failed")
+        print(f"hub uploaded    : {up_ok} (incl. already-present); failed: {up_fail}")
+        print("\npass_id | clip -> captured_at | dir | mph | elapsed_s | upload")
+        for c in emitted:
+            print(
+                f"  {c.committed_pass_id} | {c.clip} -> "
+                f"{c.captured_at.isoformat(timespec='seconds')} | "
+                f"{c.direction} | "
+                f"{('%.1f' % c.speed_mph) if c.speed_mph is not None else 'None':>6} | "
+                f"{c.elapsed_s:.2f} | {c.upload_status}"
+            )
+        print(f"\nmedia written into : {rec_dir.resolve()} (+ {events_dir.resolve()})")
+        print("camwatch.db rows INSERTED (camera='cx810'); each uploaded "
+              "to the hub /api/ingest and stamped uploaded_at.")
+    else:
+        print("\nclip -> captured_at | dir | mph | elapsed_s")
+        for c in emitted:
+            print(
+                f"  {c.clip} -> {c.captured_at.isoformat(timespec='seconds')} | "
+                f"{c.direction} | "
+                f"{('%.1f' % c.speed_mph) if c.speed_mph is not None else 'None':>6} | "
+                f"{c.elapsed_s:.2f}"
+            )
+        print(f"\nartifacts under: {scratch.resolve()}")
+        print("  recordings/<clip>.jpg / .entry.jpg / .exit.jpg   (thumb + 3 anchors)")
+        print("  events/pass_<negid>.jsonl                        (speed-chart trajectory)")
+        print("\nNOTHING written to camwatch.db; NOTHING uploaded to the hub.")
 
-    # Machine-readable manifest of the dry-run for review tooling.
-    manifest = scratch / "dry_run_manifest.json"
+    # Machine-readable manifest for review tooling.
+    manifest_dir = events_dir if args.commit else scratch
+    manifest = manifest_dir / (
+        "commit_manifest.json" if args.commit else "dry_run_manifest.json"
+    )
     manifest.write_text(json.dumps(
         [
             {
+                "committed_pass_id": c.committed_pass_id,
                 "clip": c.clip,
                 "captured_at": c.captured_at.isoformat(timespec="seconds"),
                 "direction": c.direction,
@@ -685,6 +857,7 @@ def main() -> None:
                 "entry_path": c.entry_path,
                 "exit_path": c.exit_path,
                 "trajectory_path": c.trajectory_path,
+                "upload_status": c.upload_status,
                 "skipped_reason": c.skipped_reason,
             }
             for c in all_cands
