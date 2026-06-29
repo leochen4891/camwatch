@@ -275,14 +275,20 @@ def _hub_has_pass(
 
     Hub-side idempotency: lets a re-run that re-reaches a pass whose DB row
     exists but whose upload previously failed (uploaded_at still NULL) avoid
-    a redundant POST. We query GET /api/passes over a tight window around the
-    candidate's captured_at (the list is keyed by engine_pass_id == id) and
-    look for the id. On any error we return False (fail-open: prefer a
+    a redundant POST. We query GET /api/passes with `since` a few minutes
+    before captured_at and look for the candidate's engine_pass_id (the hub
+    keys ingest upserts on engine_pass_id; its list `id` is the hub's own row
+    id and is distinct). On any error we return False (fail-open: prefer a
     harmless re-POST, which the hub upserts on engine_pass_id, over skipping).
+
+    `since` is sent as a naive local (no offset) timestamp: that is the form
+    the hub list filter compares against the stored local captured_at, so it
+    pages correctly into the candidate's region (an offset-suffixed `since`
+    is interpreted differently and skips the window).
     """
     import httpx
 
-    since = (captured_at - timedelta(minutes=5)).astimezone(timezone.utc)
+    since = (captured_at - timedelta(minutes=5)).replace(tzinfo=None)
     try:
         with httpx.Client(timeout=15.0) as client:
             resp = client.get(
@@ -295,7 +301,9 @@ def _hub_has_pass(
         passes = resp.json().get("passes") or []
     except (httpx.HTTPError, ValueError):
         return False
-    return any(int(p.get("id", -1)) == int(engine_pass_id) for p in passes)
+    return any(
+        int(p.get("engine_pass_id", -1)) == int(engine_pass_id) for p in passes
+    )
 
 
 class _CaptureWorkerShim(CaptureWorker):
