@@ -38,6 +38,8 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+
+from camwatch_cameras import CameraNotFound
 from typing import TYPE_CHECKING
 
 import av
@@ -114,10 +116,18 @@ class RtspStream:
         # investigating before we lose anything.
         warn_threshold: float = 0.5,
         warn_sustain_s: float = 5.0,
+        # ADR-023: after this many consecutive open failures (a DHCP move
+        # presents as repeated "No route to host"), call `reresolve()` to
+        # re-find the camera by MAC; it returns the current RTSP URL.
+        reresolve: "Callable[[], str] | None" = None,
+        reresolve_after: int = 3,
     ) -> None:
         if queue_size < 1:
             raise ValueError("queue_size must be >= 1")
         self._url = url
+        self._reresolve = reresolve
+        self._reresolve_after = max(1, int(reresolve_after))
+        self._open_failures = 0
         self._reconnect_delay_s = reconnect_delay_s
         self._max_failures = max_consecutive_read_failures
         self._stop = False
@@ -188,14 +198,27 @@ class RtspStream:
                 # ~02:00). Without this, the exception propagates up
                 # through capture_worker.run() and kills the worker for
                 # the rest of the day. Sleep and retry the open instead.
+                self._open_failures += 1
                 log.warning(
                     "stream %s: open failed, retrying in %.1fs (%s)",
                     self._log_label, self._reconnect_delay_s, e,
                 )
                 if self._metrics is not None:
                     self._metrics.record_reconnect("open_failed")
+                if (self._reresolve is not None
+                        and self._open_failures % self._reresolve_after == 0):
+                    try:
+                        new_url = self._reresolve()
+                    except Exception:  # noqa: BLE001 — never let resolve kill the loop
+                        log.exception("stream %s: MAC re-resolve raised", self._log_label)
+                        new_url = None
+                    if new_url and new_url != self._url:
+                        self._url = new_url
+                        log.warning("stream %s: re-resolved camera -> %s",
+                                    self._log_label, _redact_url(new_url))
                 time.sleep(self._reconnect_delay_s)
                 continue
+            self._open_failures = 0
             container = self._container
             assert container is not None
             vstream = container.streams.video[0]
@@ -509,8 +532,27 @@ def open_frame_source(
             log_label="main",
             metrics=metrics,
         )
+    prof = cfg.camera.profile
+    ip_cache = Path.home() / ".cache" / "camwatch" / "camera_ips.json"
+
+    def _resolve() -> str:
+        """ADR-023 best-effort MAC resolution: confirm/discover the camera's
+        current IP and return the live RTSP URL. On failure, fall back to the
+        registry hint URL — the reconnect loop retries and re-resolves."""
+        try:
+            res = prof.resolve_ip(
+                user=cfg.camera.user, password=cfg.camera.password,
+                ip_cache=str(ip_cache), logger=log)
+            log.info("camera %s resolved to %s (source=%s, confirmed_by=%s, moved=%s)",
+                     prof.camera_id, res.ip, res.source, res.confirmed_by, res.moved)
+        except CameraNotFound as e:
+            log.warning("camera %s MAC resolve failed (%s); using hint %s",
+                        prof.camera_id, e, prof.lan_ip)
+        return cfg.camera.rtsp_url
+
     return RtspStream(
-        cfg.camera.rtsp_url,
+        _resolve(),
         log_label="main",
         metrics=metrics,
+        reresolve=_resolve,
     )
