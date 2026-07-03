@@ -20,6 +20,7 @@ import logging
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -34,6 +35,25 @@ POLL_INTERVAL_S = 30
 BATCH_SIZE = 10
 LOCAL_SERVER = "http://127.0.0.1:8000"
 MIN_PASS_ID = 8651
+# After this many consecutive *client-side* delivery rejections (HTTP 4xx: the
+# hub understood the request and refused it — a poison pass, not an outage) a
+# pending pass is dead-lettered so it stops holding the head of the id-ordered
+# batch. Transient failures (network errors, 5xx) never count toward this — an
+# outage must not quarantine deliverable passes; they retry indefinitely.
+MAX_UPLOAD_ATTEMPTS = 20
+
+
+@dataclass
+class _Outcome:
+    """Result of one delivery attempt. Truthy iff the hub accepted it, so
+    existing `if self._upload_pass(p):` callers keep working unchanged."""
+
+    ok: bool
+    status: int | None = None   # HTTP status, or None if no response arrived
+    transient: bool = False     # network error / 5xx — retry, never dead-letter
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 class Uploader:
@@ -77,6 +97,13 @@ class Uploader:
             for col, decl in [
                 ("uploaded_at", "TEXT"),
                 ("enrichment_synced_at", "TEXT"),
+                # Dead-letter / retry bookkeeping (undeliverable-pass handling).
+                # upload_state: NULL = deliverable/pending, 'dead_letter' =
+                # quarantined (undeliverable, NEVER marked uploaded).
+                ("upload_state", "TEXT"),
+                ("upload_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("upload_error", "TEXT"),
+                ("upload_last_attempt_at", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE passes ADD COLUMN {col} {decl}")
@@ -206,11 +233,20 @@ class Uploader:
         }
 
     def _upload_batch(self) -> int:
+        # Dead-lettered passes (upload_state IS NOT NULL) are excluded so an
+        # undeliverable pass can never re-fill the head of the id-ordered window
+        # and freeze the queue. Historically that freeze was "unblocked" by
+        # manually stamping uploaded_at — which silently dropped real passes
+        # from the hub. The batch now resolves every head pass to one of exactly
+        # two honest outcomes: delivered (uploaded_at set) or dead-lettered
+        # (quarantined, uploaded_at still NULL). It is never marked uploaded
+        # without a confirmed hub accept.
         with self.db.connect() as conn:
             pending = conn.execute(
                 """SELECT COUNT(*) FROM passes
                    WHERE deleted = 0
                      AND uploaded_at IS NULL
+                     AND upload_state IS NULL
                      AND clip_path IS NOT NULL
                      AND id >= ?""",
                 (MIN_PASS_ID,),
@@ -219,6 +255,7 @@ class Uploader:
                 """SELECT * FROM passes
                    WHERE deleted = 0
                      AND uploaded_at IS NULL
+                     AND upload_state IS NULL
                      AND clip_path IS NOT NULL
                      AND id >= ?
                    ORDER BY id ASC
@@ -230,21 +267,131 @@ class Uploader:
         count = 0
         for row in rows:
             p = Pass.from_row(row)
+            # A pass needs its thumbnail to upload. A thumbnail-less pass used to
+            # be skipped forever and jam the queue; instead, regenerate the
+            # thumbnail from the clip when the .mp4 is still on disk. If it
+            # can't be produced (clip gone or undecodable) the pass is genuinely
+            # undeliverable — dead-letter it (never uploaded) so the window
+            # slides to the next deliverable pass in this same batch.
             if p.clip_path:
-                thumb_path = Path(p.clip_path).with_suffix(".jpg")
-                if not thumb_path.exists():
+                clip_path = Path(p.clip_path)
+                thumb_path = clip_path.with_suffix(".jpg")
+                if not thumb_path.exists() and not self._regenerate_thumbnail(clip_path):
+                    self._dead_letter(
+                        p.id,
+                        "no thumbnail and clip missing/undecodable — cannot "
+                        "regenerate; quarantined (NOT marked uploaded)",
+                    )
                     continue
-            if self._upload_pass(p):
+
+            outcome = self._deliver(p)
+            if outcome.ok:
                 with self.db.connect() as conn:
                     conn.execute(
-                        "UPDATE passes SET uploaded_at = datetime('now') WHERE id = ?",
+                        "UPDATE passes SET uploaded_at = datetime('now'), "
+                        "upload_attempts = 0, upload_error = NULL WHERE id = ?",
                         (p.id,),
                     )
                     conn.commit()
                 count += 1
                 log.info("uploaded pass %d", p.id)
+            elif not outcome.transient:
+                # Client-side rejection (4xx): count it; a persistently-rejected
+                # poison pass eventually dead-letters so it stops blocking.
+                self._record_failed_attempt(p.id, outcome.status)
+            # Transient (network / 5xx): leave pending, retry next poll. Never
+            # counted, never dead-lettered — an outage must not drop passes.
 
+        self._refresh_dead_letter_gauge()
         return count
+
+    def _regenerate_thumbnail(self, clip_path: Path) -> bool:
+        """Best-effort: write the sibling `.jpg` the uploader + hub expect by
+        extracting a representative (mid-clip) frame from the recorder's `.mp4`.
+
+        Returns True if the thumbnail exists afterward (already present, or
+        regenerated), False if it can't be produced (clip gone/undecodable) —
+        the caller then dead-letters the pass. Matches the recorder's output
+        format (width<=800, JPEG q85). av/cv2 are imported lazily so the
+        uploader stays light when no repair is needed."""
+        thumb = clip_path.with_suffix(".jpg")
+        if thumb.exists():
+            return True
+        if not clip_path.exists():
+            return False
+        try:
+            import av
+            import cv2
+
+            # Two passes so we never hold every decoded frame in memory: count
+            # cheaply, then decode again and convert only the middle frame.
+            with av.open(str(clip_path)) as container:
+                stream = container.streams.video[0]
+                n = stream.frames or sum(1 for _ in container.decode(stream))
+            if n <= 0:
+                return False
+            target = n // 2
+            img = None
+            with av.open(str(clip_path)) as container:
+                stream = container.streams.video[0]
+                for i, frame in enumerate(container.decode(stream)):
+                    if i == target:
+                        img = frame.to_ndarray(format="bgr24")
+                        break
+            if img is None:
+                return False
+            h, w = img.shape[:2]
+            if w > 800:
+                img = cv2.resize(img, (800, max(1, round(h * 800 / w))))
+            cv2.imwrite(str(thumb), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            ok = thumb.exists()
+            if ok:
+                log.info("regenerated thumbnail from clip: %s", thumb.name)
+            return ok
+        except Exception:  # noqa: BLE001 — any decode/encode failure = undeliverable
+            log.exception("thumbnail regen failed for %s", clip_path)
+            return False
+
+    def _dead_letter(self, pass_id: int, reason: str) -> None:
+        """Quarantine an undeliverable pass: it leaves the pending window but is
+        NEVER marked uploaded (uploaded_at stays NULL), so the hub-missing state
+        is honest and the pass remains findable for a future restore."""
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE passes SET upload_state = 'dead_letter', upload_error = ?, "
+                "upload_last_attempt_at = datetime('now') WHERE id = ?",
+                (reason, pass_id),
+            )
+            conn.commit()
+        log.warning("upload dead-letter pass %d: %s", pass_id, reason)
+
+    def _record_failed_attempt(self, pass_id: int, status: int | None) -> None:
+        """Count a client-side (4xx) delivery rejection; dead-letter once a pass
+        has been rejected MAX_UPLOAD_ATTEMPTS times in a row."""
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE passes SET upload_attempts = upload_attempts + 1, "
+                "upload_error = ?, upload_last_attempt_at = datetime('now') "
+                "WHERE id = ?",
+                (f"HTTP {status}" if status is not None else "client error", pass_id),
+            )
+            attempts = conn.execute(
+                "SELECT upload_attempts FROM passes WHERE id = ?", (pass_id,)
+            ).fetchone()[0]
+            conn.commit()
+        if attempts >= MAX_UPLOAD_ATTEMPTS:
+            self._dead_letter(
+                pass_id,
+                f"{attempts} consecutive client-side rejections "
+                f"(last HTTP {status}) — quarantined (NOT marked uploaded)",
+            )
+
+    def _refresh_dead_letter_gauge(self) -> None:
+        with self.db.connect() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM passes WHERE upload_state = 'dead_letter'"
+            ).fetchone()[0]
+        mp.UPLOAD_DEAD_LETTER.set(n)
 
     def _sync_enrichment_batch(self) -> int:
         with self.db.connect() as conn:
@@ -325,6 +472,12 @@ class Uploader:
         }
 
     def _upload_pass(self, p: Pass) -> bool:
+        """Deliver one pass; True iff the hub accepted it. Thin bool wrapper
+        over `_deliver` for external callers (the media-verify sweep and the
+        offline reprocessor) that only care whether it landed."""
+        return self._deliver(p).ok
+
+    def _deliver(self, p: Pass) -> _Outcome:
         metadata = self._pass_metadata(p)
 
         files: dict[str, tuple[str | None, bytes | io.IOBase, str]] = {
@@ -364,11 +517,14 @@ class Uploader:
                 if resp.status_code in (200, 201):
                     mp.UPLOADS.inc(status="ok")
                     mp.UPLOAD_SECONDS.observe(time.monotonic() - t0)
-                    return True
+                    return _Outcome(ok=True, status=resp.status_code)
                 log.warning("upload pass %d failed: %d %s", p.id, resp.status_code, resp.text[:200])
                 mp.UPLOADS.inc(status="http_error")
-                return False
+                # 5xx = hub-side/transient (retry, never dead-letter); 4xx =
+                # client-side rejection (a poison pass — count toward dead-letter).
+                return _Outcome(ok=False, status=resp.status_code,
+                                transient=resp.status_code >= 500)
         except httpx.HTTPError as e:
             log.warning("upload pass %d network error: %s", p.id, e)
             mp.UPLOADS.inc(status="network_error")
-            return False
+            return _Outcome(ok=False, status=None, transient=True)

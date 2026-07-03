@@ -272,6 +272,12 @@ UPLOAD_PENDING = _gauge(
     "camwatch_engine_upload_pending",
     "Passes awaiting first upload to the hub.",
 )
+UPLOAD_DEAD_LETTER = _gauge(
+    "camwatch_engine_upload_dead_letter",
+    "Passes quarantined as undeliverable (no thumbnail regenerable, or "
+    "persistent client-side rejection). Never marked uploaded — the hub is "
+    "genuinely missing these, so they stay findable for restore.",
+)
 ENRICHMENT = _counter(
     "camwatch_engine_enrichment_total",
     "Local enricher handoffs by outcome (ok / error / skipped_night).",
