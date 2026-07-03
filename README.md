@@ -158,7 +158,7 @@ uv run python -m camwatch serve --profile             # log per-stage timings
 For remote access: Tailscale for personal use, Cloudflare Tunnel + Access for shareable URLs. The UI has no built-in auth.
 
 > **Production deploy note (lei-ubuntu):** the systemd unit runs the service
-> from the repo's own `.venv` (`~/git/camwatch/.venv`; migrated 2026-06-05
+> from the repo's own `.venv` (`~/github/camwatch/.venv`; migrated 2026-06-05
 > off a leftover `~/camwatch-probe/.venv`), so a deploy is `git pull` +
 > `uv sync` + restart. The Linux torch build is pinned to the cu121 wheel
 > index in `pyproject.toml` — driver 535 silently loses CUDA on PyPI's

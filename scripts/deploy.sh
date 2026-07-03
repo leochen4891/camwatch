@@ -6,7 +6,7 @@
 # Hardcoded target, no arguments, no environment knobs:
 #
 #   ssh lei-ubuntu →
-#     git pull --ff-only on main in ~/git/camwatch
+#     git pull --ff-only on main in ~/github/camwatch
 #     uv sync (the repo .venv the systemd unit runs from)
 #     sudo systemctl restart camwatch.service   (this unit ONLY)
 #     health check: is-active + UI HTTP 200 on 127.0.0.1:8000
@@ -25,7 +25,7 @@ set -eu
 # Single SSH session; the remote script re-asserts every invariant rather
 # than trusting local state. `sh -e` aborts on the first failed step.
 ssh lei-ubuntu /bin/sh -e <<'REMOTE'
-cd "$HOME/git/camwatch"
+cd "$HOME/github/camwatch"
 
 branch=$(git rev-parse --abbrev-ref HEAD)
 [ "$branch" = "main" ] || {

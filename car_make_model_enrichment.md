@@ -228,7 +228,7 @@ inspect without writing.
 
 ## Steps for a fresh Claude session
 
-1. `cd ~/git/camwatch`
+1. `cd ~/github/camwatch`
 2. Count pending: `vehicle_enriched_at IS NULL` rows that have a
    `.jpg` on disk
 3. First pass: batches of 10–12, fire 4–6 parallel Opus sub-agents per

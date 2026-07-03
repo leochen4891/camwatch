@@ -6,11 +6,11 @@
 # spec writes to ~/.claude/camwatch-check-status.md.
 #
 # Schedule (cron, hourly with jitter):
-#   0 * * * * sleep $(shuf -i 900-2700 -n 1) && /home/lchen/git/camwatch/scripts/camwatch-tick.sh
+#   0 * * * * sleep $(shuf -i 900-2700 -n 1) && /home/lchen/github/camwatch/scripts/camwatch-tick.sh
 #   (the sleep spreads the run 15-45 min past the top of the hour)
 #
 # Manual dry run:
-#   /home/lchen/git/camwatch/scripts/camwatch-tick.sh
+#   /home/lchen/github/camwatch/scripts/camwatch-tick.sh
 #   tail -f ~/.claude/camwatch-tick.log
 
 set -euo pipefail
@@ -19,7 +19,7 @@ set -euo pipefail
 # lives) and the standard tool dirs are reachable.
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
-REPO_DIR="/home/lchen/git/camwatch"
+REPO_DIR="/home/lchen/github/camwatch"
 SPEC_PATH="/home/lchen/.claude/commands/camwatch-check.md"
 TICK_LOG="$HOME/.claude/camwatch-tick.log"
 MAX_LOG_BYTES=$((5 * 1024 * 1024))  # 5 MB

@@ -38,8 +38,8 @@ dependencies = [
     "torchvision",
 ]
 
-# Sibling checkout for now (lei-ubuntu: ~/git/camwatch-cameras next to
-# ~/git/camwatch). Switch to a pinned git rev — the ADR-015 ceremony —
+# Sibling checkout for now (lei-ubuntu: ~/github/camwatch-cameras next to
+# ~/github/camwatch). Switch to a pinned git rev — the ADR-015 ceremony —
 # once the registry repo's main is pushed:
 #   camwatch-cameras = { git = "ssh://git@github.com/leochen4891/camwatch-cameras", rev = "<pin>" }
 [tool.uv.sources]
