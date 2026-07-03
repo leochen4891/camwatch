@@ -125,7 +125,7 @@ dev = [{ name = "httpx", specifier = ">=0.28.1" }]
 
 [[package]]
 name = "camwatch-cameras"
-version = "0.1.0"
+version = "0.1.1"
 source = { directory = "../camwatch-cameras" }
 dependencies = [
     { name = "numpy" },
