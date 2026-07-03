@@ -236,6 +236,26 @@ metrics:       { endpoint: http://localhost:8428, interval_s: 15 }  # optional; 
 
 Most are also editable in-app. Camera credentials in `.env` (`REOLINK_USER`, `REOLINK_PASS`).
 
+### Retention & the cold archive (ADR-024)
+
+On the production box, hot-media deletion is owned by the **gated retention
+sweep** (`camwatch/retention_sweep.py`, run daily by
+`systemd/camwatch-retention-sweep.timer`), not by the three-phase config
+retention above. The sweep deletes a media file (clip/thumb/entry/exit/
+trajectory) for passes older than **90 days** only when the cold archive's
+ledger (`/srv/camwatch/archive.db`, `archive_files`) records a
+**read-back-verified** sha256 for that exact `(engine_pass_id, kind)` — the
+delete-gate contract in `/srv/camwatch/SCHEMA.md`. Clips are additionally
+sha256-compared against the ledger before unlinking. DB rows are never
+deleted by the sweep.
+
+The in-engine phases are **ungated** and therefore must be kept far above
+the sweep's window (production runs `clips_days/thumbs_days/passes_days:
+3650`): they act only as a distant backstop, never as the primary deleter.
+Dry-run is the sweep's default; real deletion requires `--delete`, supplied
+in production via `SWEEP_ARGS` in `/etc/camwatch/retention-sweep.env`
+(created only after owner sign-off).
+
 ## Observability
 
 When `metrics.endpoint` names a VictoriaMetrics instance, a background

@@ -40,6 +40,13 @@ speed:
 retention:
   # Three-phase retention. Set any phase to 0 to disable it; typical layout
   # is clips_days < thumbs_days < passes_days.
+  #
+  # PRODUCTION NOTE (ADR-024): on a box with the cold archive, media
+  # deletion is owned by the gated sweep (`python -m camwatch.retention_sweep`
+  # via systemd/camwatch-retention-sweep.timer), which deletes a file only
+  # after the archive ledger holds a read-back-verified copy. These phases
+  # are UNGATED — keep them >> the sweep's 90d (e.g. 3650) so they never
+  # delete something the archive has not verified.
   clips_days: 14           # delete .mp4 only; thumbnail + DB row stay so the
                            # list still shows the still image and stats.
   thumbs_days: 90          # delete .jpg too; clip_path is NULLed so the UI

@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily camwatch gated retention sweep (ADR-024)
+
+[Timer]
+# Night-time, jittered; local-data's exporter chain is hourly so there is
+# no fixed ordering to respect — the gate query makes ordering irrelevant.
+OnCalendar=*-*-* 04:12:00
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

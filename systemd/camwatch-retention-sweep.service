@@ -1,0 +1,26 @@
+# ADR-024 gated 90-day hot-media retention sweep (dry-run by default).
+#
+# Real deletion is enabled ONLY via /etc/camwatch/retention-sweep.env
+# containing SWEEP_ARGS=--delete — created after owner sign-off, never
+# committed. Without that file the timer runs a nightly dry-run that logs
+# would-delete counts to the journal.
+#
+# Install:
+#   sudo cp systemd/camwatch-retention-sweep.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now camwatch-retention-sweep.timer
+[Unit]
+Description=camwatch gated hot-media retention sweep (ADR-024)
+# The gate lives on the archive disk; without it the sweep aborts anyway,
+# but don't even start if the mount is absent.
+RequiresMountsFor=/srv/camwatch
+
+[Service]
+Type=oneshot
+User=lchen
+WorkingDirectory=/home/lchen/github/camwatch
+EnvironmentFile=-/etc/camwatch/retention-sweep.env
+ExecStart=/home/lchen/github/camwatch/.venv/bin/python -m camwatch.retention_sweep --age-days 90 $SWEEP_ARGS
+# Idle-IO per the ticket: never compete with capture or the exporter.
+IOSchedulingClass=idle
+Nice=19
