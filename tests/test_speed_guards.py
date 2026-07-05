@@ -26,6 +26,7 @@ from camwatch.capture_worker import (
     _MAX_PLAUSIBLE_MPH,
     _MIN_RUNNING_SAMPLES,
     _cadence_speed,
+    _trim_stationary_dwell,
 )
 from camwatch.homography import MPH_PER_MPS, Homography
 
@@ -213,6 +214,79 @@ def test_cadence_track_merge_rejected_on_shape_alone():
 def test_cadence_too_few_samples_returns_none():
     mps = 30.0 / MPH_PER_MPS
     traj = _cadence_traj(_MIN_RUNNING_SAMPLES - 1, rate=14.0, mps=mps)
+    assert _cadence_speed(traj, 14.0, _homog())[0] is None
+
+
+# ---------------------------------------------------------------------------
+# Stationary-dwell trim. A track acquired (or lost) while parked inside the grid
+# leaves a run of near-motionless samples that add elapsed time but no distance,
+# dragging the cumulative-average headline below the true crossing speed (the
+# engine-cadence-underreport pass 26256: a ~1.5 s dwell pulled a ~45 mph
+# crossing down to 19). `_cadence_speed` trims such a run before averaging.
+
+
+def _cadence_dwell_then_cross(dwell_n, move_n, rate, mps, *, seq0=100, epoch=3):
+    """A track parked at Y=0 for `dwell_n` frames, then a straight crossing for
+    `move_n` frames at constant `mps`. Seq is contiguous throughout (the vehicle
+    was tracked the whole time), so the dwell frames sit inside the measured
+    span exactly as they did for pass 26256."""
+    out = []
+    seq = seq0
+    for _ in range(dwell_n):  # confined within the stationary box at the origin
+        out.append((999.0, 0.0, 0.0, (0.0, 0.0, 1.0, 1.0), seq, epoch))
+        seq += 1
+    for i in range(move_n):   # straight crossing, Y advancing each frame
+        out.append((999.0, 0.0, mps * (i + 1) / rate,
+                    (0.0, 0.0, 1.0, 1.0), seq, epoch))
+        seq += 1
+    return out
+
+
+def test_cadence_stationary_lead_in_trimmed():
+    # 20 parked frames then a 12-frame 40 mph crossing. Untrimmed, the ~1.4 s of
+    # dwell time would pull the headline to ~15; the trim recovers ~40.
+    mps = 40.0 / MPH_PER_MPS
+    traj = _cadence_dwell_then_cross(dwell_n=20, move_n=12, rate=14.0, mps=mps)
+    mph, n = _cadence_speed(traj, 14.0, _homog())
+    assert mph is not None
+    assert abs(mph - 40.0) < 1.0
+    assert n == 12  # only the moving core is measured
+
+
+def test_cadence_stationary_tail_trimmed():
+    # Mirror image: the crossing happens first, then the vehicle stops inside
+    # the grid (waiting to turn) and is tracked stationary for 20 frames.
+    mps = 35.0 / MPH_PER_MPS
+    cross = _cadence_dwell_then_cross(dwell_n=0, move_n=12, rate=14.0, mps=mps)
+    last_y = cross[-1][2]
+    seq = cross[-1][4] + 1
+    tail = [(999.0, 0.0, last_y, (0.0, 0.0, 1.0, 1.0), seq + i, 3)
+            for i in range(20)]
+    mph, n = _cadence_speed(cross + tail, 14.0, _homog())
+    assert mph is not None
+    assert abs(mph - 35.0) < 1.0
+    # The 20 stationary tail frames (and the arrival frame that shares their Y)
+    # are cut; only the moving core is measured, far short of the 32 total.
+    assert 10 <= n <= 12
+
+
+def test_cadence_short_lead_in_not_trimmed():
+    # A confined run shorter than the dwell floor (the ordinary frame or two a
+    # moving car spends near its start) is left alone: a clean uniform pass is
+    # returned whole, unchanged in speed and sample count.
+    mps = 30.0 / MPH_PER_MPS
+    traj = _cadence_traj(12, rate=14.0, mps=mps)
+    trimmed = _trim_stationary_dwell(
+        [((s[4] - traj[0][4]) / 14.0, s[1], s[2]) for s in traj], _homog())
+    assert len(trimmed) == 12  # nothing trimmed
+    mph, n = _cadence_speed(traj, 14.0, _homog())
+    assert abs(mph - 30.0) < 0.5 and n == 12
+
+
+def test_cadence_all_dwell_returns_none():
+    # A track that never moves (curb-parked, bbox jitter only) has no moving
+    # core to measure: speed is unknown, not a fabricated crawl.
+    traj = [(999.0, 0.0, 0.0, (0.0, 0.0, 1.0, 1.0), 100 + i, 3) for i in range(30)]
     assert _cadence_speed(traj, 14.0, _homog())[0] is None
 
 

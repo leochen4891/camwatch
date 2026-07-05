@@ -101,6 +101,22 @@ _STATIONARY_SPREAD_M = 0.5
 # to be useful even as a "current" reading).
 _MIN_RUNNING_SAMPLES = 5
 
+# Stationary-dwell trim for the cadence headline. A vehicle first tracked while
+# stopped inside the grid — waiting at the curb, creeping off a stop sign — and
+# then accelerating through it leaves a run of near-motionless samples at the
+# start (symmetrically, the end) of its in-grid trajectory. Those frames add
+# elapsed time to the cumulative-average denominator without contributing
+# distance, so the headline reads far below the true crossing speed (pass 26256:
+# a ~1.5 s south-edge dwell pulled a ~45 mph crossing down to a reported 19).
+# We trim a leading/trailing run only when it is a genuine dwell: at least this
+# many consecutive samples confined within _STATIONARY_SPREAD_M of the run's
+# anchor point. The ordinary frame or two a moving car spends within 0.5 m of
+# its first/last point falls below the floor and is left alone, so normal fast
+# and slow passes are untouched; only a real stop is cut. Even a 5 mph vehicle
+# clears the 0.5 m box in ~3 frames, so a 5-frame confined run is genuinely
+# near-stationary (same physics as the _STATIONARY_SPREAD_M gate above).
+_DWELL_MIN_FRAMES = 5
+
 # Trustworthiness guards on the headline speed. The running average is only
 # meaningful when the trajectory's time base and the focus track are sound;
 # two failure modes corrupt it and produce phantom over-speeds:
@@ -176,6 +192,57 @@ def _stamp_captured_at(
     return now_wall - timedelta(seconds=correction_s), correction_s
 
 
+def _trim_stationary_dwell(
+    samples,
+    homog,
+    *,
+    spread: float = _STATIONARY_SPREAD_M,
+    min_run: int = _DWELL_MIN_FRAMES,
+):
+    """Drop a leading and/or trailing stationary dwell from a cadence sample list.
+
+    `samples` is a list of (t, u, v) tuples (t already on the cadence time base).
+    A dwell is a run of >= `min_run` consecutive samples whose projected ground
+    points all fall within `spread` metres of the run's anchor (its first point
+    for the leading run, its last for the trailing one). Such a run is where the
+    vehicle was tracked but not moving; it contributes elapsed time but no
+    distance, dragging the cumulative-average headline below the true crossing
+    speed. Trimming it is inert on a uniform-motion pass — removing colinear,
+    uniformly-timed points from an end preserves total-distance / total-time —
+    and only fires on a genuine stop.
+
+    The launch/arrival step at the box edge is dropped with the dwell (the
+    leading slice starts at the first sample outside the box, so the large
+    acquisition-jump step that lands the track on the road is not counted).
+    Returns the original list unchanged when neither end holds a dwell, and the
+    (possibly short) slice otherwise — the caller's min-samples check decides
+    whether the moving remainder is enough to report a speed.
+    """
+    n = len(samples)
+    if homog is None or n < min_run:
+        return samples
+    proj = [homog.project(u, v) for _t, u, v in samples]
+
+    def _confined_run(order) -> int:
+        ax, ay = proj[order[0]]
+        count = 0
+        for idx in order:
+            x, y = proj[idx]
+            if ((x - ax) ** 2 + (y - ay) ** 2) ** 0.5 <= spread:
+                count += 1
+            else:
+                break
+        return count
+
+    lead = _confined_run(range(n))
+    trail = _confined_run(range(n - 1, -1, -1))
+    start = lead if lead >= min_run else 0
+    stop = (n - trail) if trail >= min_run else n
+    if start >= stop:
+        return []  # all dwell — nothing moving to measure
+    return samples[start:stop]
+
+
 def _cadence_speed(
     traj,
     rate_fps: "float | None",
@@ -199,9 +266,15 @@ def _cadence_speed(
       - the pass spans an RTSP reconnect (epoch changed; seq spacing is not
         meaningful across sessions)
       - non-increasing seq span
+      - fewer than `min_samples` samples survive the stationary-dwell trim
+        (the track was parked inside the grid for all but a handful of frames)
       - the spatial-jump guard fires (arc length far beyond the net
         displacement: a track merge corrupted the distance, so the speed is
         unknown at any magnitude)
+
+    A stationary lead-in/tail is trimmed before the cumulative average (see
+    `_trim_stationary_dwell`); `n_samples` is the moving-core count actually
+    measured, which is <= len(traj).
     """
     n = len(traj)
     if homog is None or rate_fps is None or rate_fps <= 0 or n < min_samples:
@@ -214,6 +287,12 @@ def _cadence_speed(
         ((seq - seq0) / rate_fps, u, v)
         for (_ts, u, v, _bb, seq, _epoch) in traj
     ]
+    # Cut any stationary lead-in/tail (track acquired or lost while parked
+    # inside the grid) before the cumulative average, so the headline reflects
+    # the crossing rather than the dwell time. See _trim_stationary_dwell.
+    samples = _trim_stationary_dwell(samples, homog)
+    if len(samples) < min_samples:
+        return None, len(samples)
     final_mph, _per_frame, n_used = homog.running_avg_speed(
         samples, min_samples=min_samples,
         max_plausible_fps=None,          # timing is trustworthy by construction
